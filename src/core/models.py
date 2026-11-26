@@ -233,6 +233,21 @@ class DedupPreview:
 
 
 @dataclass
+class ChecklistEntry:
+    """Single target-list item verification status for dual-list coverage comparison."""
+
+    order_index: int  # 1-based position in Target List B
+    canonical_code: str
+    status: str  # "matched" | "missing" | "unrecognized"
+    target_text: str
+    target_item: Optional[ParseResult] = None
+    matched_a_count: int = 0
+    matched_a_names: list[str] = field(default_factory=list)
+    matched_a_tags: str = ""
+    matched_a_items: list[ParseResult] = field(default_factory=list)
+
+
+@dataclass
 class CompareResult:
     """Comparison output for DB check (non-mutating) or A-vs-B cross-comparison."""
 
@@ -248,6 +263,27 @@ class CompareResult:
     intersection_b: list[ParseResult] = field(default_factory=list)
     only_in_a: list[ParseResult] = field(default_factory=list)
     only_in_b: list[ParseResult] = field(default_factory=list)
+    # Dual-list coverage & checklist fields (v1.3.0)
+    match_mode: str = "smart_code"  # "smart_code" | "exact_line"
+    target_checklist: list[ChecklistEntry] = field(default_factory=list)
+    unique_a_count: int = 0
+    unique_b_count: int = 0
+    hit_b_count: int = 0
+    missing_b_count: int = 0
+    missing_b_codes: list[str] = field(default_factory=list)
+    matched_b_codes: list[str] = field(default_factory=list)
+
+    @property
+    def coverage_rate(self) -> float:
+        """Percentage (0.0..100.0) of unique Target List B items covered by Base List A."""
+        if self.unique_b_count <= 0:
+            return 0.0
+        return (100.0 * self.hit_b_count) / self.unique_b_count
+
+    @property
+    def is_fully_covered(self) -> bool:
+        """Return True when Target List B has at least one unique item and zero missing items."""
+        return self.unique_b_count > 0 and self.missing_b_count == 0
 
 
 @dataclass

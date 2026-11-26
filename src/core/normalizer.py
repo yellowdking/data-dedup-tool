@@ -196,6 +196,30 @@ FALSE_POSITIVE_CODES: frozenset[str] = frozenset(
         "DISC2",
         "DISK1",
         "DISK2",
+        "TOP10",
+        "TOP20",
+        "TOP50",
+        "TOP100",
+        "TOP200",
+        "TOP250",
+        "TOP500",
+        "TOP1000",
+        "TOP-10",
+        "TOP-20",
+        "TOP-50",
+        "TOP-100",
+        "TOP-200",
+        "TOP-250",
+        "TOP-500",
+        "TOP-1000",
+        "ITEM01",
+        "ITEM02",
+        "ITEM03",
+        "ITEM04",
+        "ITEM05",
+        "ITEM10",
+        "ITEM12",
+        "PAGE12",
     }
 )
 
@@ -283,6 +307,8 @@ FALSE_POSITIVE_PREFIXES: frozenset[str] = frozenset(
         "FAX",
         "QQ",
         "NO",
+        "RANK",
+        "PAGE",
     }
 )
 
@@ -345,6 +371,9 @@ NON_SEGMENT_TOKENS: frozenset[str] = frozenset(
         "HOME",
         "USER",
         "SAVE",
+        "RANK",
+        "PAGE",
+        "NO",
     }
 )
 
@@ -603,8 +632,12 @@ def is_companion_extension(
     return norm in normalize_companion_extensions(companion_exts)
 
 
+_RE_RANKING_MIXED_PREFIX = re.compile(r"^(?:TOP|RANK|PAGE|NO|ITEM)\d+$")
+_RE_COMPACT_ITEM_TOKEN = re.compile(r"^ITEM\d+$")
+
+
 def is_false_positive(prefix: str, number: str, raw_token: str = "") -> bool:
-    """Determine whether a candidate `(prefix, number)` is technical noise."""
+    """Determine whether a candidate ``(prefix, number)`` is technical or ranking-list noise."""
     p_up = prefix.upper().strip("-_ ")
     n_up = number.upper().strip("-_ ")
     raw_up = raw_token.upper().strip()
@@ -615,9 +648,37 @@ def is_false_positive(prefix: str, number: str, raw_token: str = "") -> bool:
         return True
     if p_up in FALSE_POSITIVE_PREFIXES:
         return True
-    # Catch leading digits + tech suffix like 60FPS, 10BIT, 1080P.
+    # Block ranking/list tokens such as TOP250, TOP100, TOP10, Top 01, TOP.005 while
+    # preserving explicit hyphenated catalog codes like TOP-001 (unless in FALSE_POSITIVE_CODES).
+    if p_up == "TOP" and (not raw_up or ("-" not in raw_up and "_" not in raw_up)):
+        return True
+    # Block compact/short numbered list tokens like ITEM01, ITEM001, ITEM-01 while
+    # preserving separated 3+ digit catalog codes like `ITEM 123` / `ITEM-123`.
+    if p_up == "ITEM" and (
+        bool(_RE_COMPACT_ITEM_TOKEN.match(raw_up)) or (n_up.isdigit() and len(n_up) <= 2)
+    ):
+        return True
+    # Block mixed-alnum ranking prefixes like `TOP250-001` or `RANK05-123`.
+    if _RE_RANKING_MIXED_PREFIX.match(p_up):
+        return True
+    # Catch leading digits + tech/ranking suffix like 60FPS, 10BIT, 1080P, 12RANK, 12NO.
     alpha_tail = re.sub(r"^\d+", "", p_up)
-    if alpha_tail and alpha_tail in {"FPS", "BIT", "KHZ", "KBPS", "MBPS", "GB", "MB", "KB", "TB"}:
+    if alpha_tail and alpha_tail in {
+        "FPS",
+        "BIT",
+        "KHZ",
+        "KBPS",
+        "MBPS",
+        "GB",
+        "MB",
+        "KB",
+        "TB",
+        "RANK",
+        "PAGE",
+        "NO",
+    }:
+        return True
+    if alpha_tail == "TOP" and ("-" not in raw_up and "_" not in raw_up):
         return True
     return False
 
