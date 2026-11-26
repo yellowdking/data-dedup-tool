@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QModelIndex, Qt
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -23,11 +24,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from src.core.exporter import ExportError
 from src.core.table_data import (
     DataTable,
     TableDedupConfig,
     TableDedupReport,
+    TableRowRef,
     generate_table_id,
 )
 from src.core.table_engine import run_multi_table_dedup
@@ -42,7 +43,7 @@ from src.ui.tables_widgets import (
     _PerTableKeyDialog,
     _format_row_summary,
 )
-from src.ui.widgets import ScrollableDetailDialog, WorkerThread
+from src.ui.widgets import ScrollableDetailDialog
 
 
 class TablesDedupTabMixin:
@@ -61,7 +62,7 @@ class TablesDedupTabMixin:
         cfg_layout.setContentsMargins(12, 10, 12, 10)
         cfg_layout.setSpacing(8)
 
-        # Row 1: Mode toggle + primary button
+        # Row 1: Mode toggle + progress + cancel + primary CTA
         row1 = QHBoxLayout()
         row1.setSpacing(8)
 
@@ -94,10 +95,17 @@ class TablesDedupTabMixin:
         self._dedup_progress.setVisible(False)
         row1.addWidget(self._dedup_progress)
 
+        self._btn_cancel_dedup = QPushButton("取消")
+        self._btn_cancel_dedup.setProperty("compact", True)
+        self._btn_cancel_dedup.setProperty("variant", "danger")
+        self._btn_cancel_dedup.setVisible(False)
+        self._btn_cancel_dedup.clicked.connect(self._cancel_dedup)
+        row1.addWidget(self._btn_cancel_dedup)
+
         self._btn_run_dedup = QPushButton("▶ 开始多表查重")
         self._btn_run_dedup.setToolTip("执行多表跨表/表内查重分析")
         self._btn_run_dedup.setProperty("variant", "primary")
-        self._btn_run_dedup.setStyleSheet("padding: 5px 12px;")
+        self._btn_run_dedup.setProperty("compact", True)
         self._btn_run_dedup.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_run_dedup.clicked.connect(self.run_dedup)
         row1.addWidget(self._btn_run_dedup)
@@ -119,10 +127,25 @@ class TablesDedupTabMixin:
         col_row.addWidget(self._dedup_col_combo)
 
         self._btn_dedup_per_table = QPushButton("按表指定")
-        self._btn_dedup_per_table.setStyleSheet("padding: 4px 10px; font-size: 12px;")
-        self._btn_dedup_per_table.setToolTip("为不同表分别选择关键列或组合多列键")
+        self._btn_dedup_per_table.setProperty("compact", True)
+        self._btn_dedup_per_table.setToolTip("为不同表分别配置有序关键列或组合多列键")
         self._btn_dedup_per_table.clicked.connect(self._open_dedup_key_dialog)
         col_row.addWidget(self._btn_dedup_per_table)
+
+        self._dedup_custom_key_badge = QLabel("已覆盖下拉框")
+        self._dedup_custom_key_badge.setProperty("badge", "warning")
+        self._dedup_custom_key_badge.setToolTip("已启用按表自定义关键列配置，将优先于左侧统一关键列下拉框")
+        self._dedup_custom_key_badge.setVisible(False)
+        col_row.addWidget(self._dedup_custom_key_badge)
+
+        self._btn_dedup_clear_keys = QPushButton("恢复默认")
+        self._btn_dedup_clear_keys.setProperty("compact", True)
+        self._btn_dedup_clear_keys.setProperty("variant", "ghost")
+        self._btn_dedup_clear_keys.setToolTip("清除按表自定义关键列配置")
+        self._btn_dedup_clear_keys.setVisible(False)
+        self._btn_dedup_clear_keys.clicked.connect(self._clear_dedup_custom_keys)
+        col_row.addWidget(self._btn_dedup_clear_keys)
+
         col_row.addStretch()
         cfg_layout.addWidget(self._dedup_col_row_widget)
 
@@ -165,14 +188,16 @@ class TablesDedupTabMixin:
         self._card_d_intra = _CompactMetricCard("表内重复组", "0", "#7C3AED")
         self._card_d_inter = _CompactMetricCard("全表交集数", "0", "#0891B2")
 
-        for card in (
+        self._dedup_metric_cards = [
             self._card_d_tables,
             self._card_d_rows,
             self._card_d_unique,
             self._card_d_cross,
             self._card_d_intra,
             self._card_d_inter,
-        ):
+        ]
+        for card in self._dedup_metric_cards:
+            card.apply_theme(self.ctx.config.theme)
             metrics_row.addWidget(card, 1)
         layout.addLayout(metrics_row)
 
@@ -181,50 +206,68 @@ class TablesDedupTabMixin:
         action_row.setSpacing(6)
 
         self._dedup_search = QLineEdit()
-        self._dedup_search.setPlaceholderText("🔍 筛选当前查重结果...")
+        self._dedup_search.setPlaceholderText("🔍 筛选当前查重结果（双击结果行可定位原表）...")
         self._dedup_search.setClearButtonEnabled(True)
-        self._dedup_search.setMinimumWidth(130)
+        self._dedup_search.setMinimumWidth(140)
         self._dedup_search.textChanged.connect(lambda _: self._dedup_search_timer.start())
         action_row.addWidget(self._dedup_search, 1)
+
+        self._dedup_filter_lbl = QLabel("0 行")
+        self._dedup_filter_lbl.setProperty("role", "muted")
+        action_row.addWidget(self._dedup_filter_lbl)
 
         self._btn_dedup_export_xlsx = QPushButton("Excel 报告")
         self._btn_dedup_export_xlsx.setToolTip("导出完整多 Sheet Excel 查重报告 (.xlsx)")
         self._btn_dedup_export_xlsx.setProperty("variant", "primary")
-        self._btn_dedup_export_xlsx.setStyleSheet("padding: 5px 10px; font-size: 12px;")
+        self._btn_dedup_export_xlsx.setProperty("compact", True)
         self._btn_dedup_export_xlsx.setEnabled(False)
         self._btn_dedup_export_xlsx.clicked.connect(self._export_dedup_excel)
         action_row.addWidget(self._btn_dedup_export_xlsx)
 
         self._btn_dedup_export_docx = QPushButton("Word 报告")
         self._btn_dedup_export_docx.setToolTip("导出格式化 Word 查重报告 (.docx)")
-        self._btn_dedup_export_docx.setStyleSheet("padding: 5px 10px; font-size: 12px;")
+        self._btn_dedup_export_docx.setProperty("compact", True)
         self._btn_dedup_export_docx.setEnabled(False)
         self._btn_dedup_export_docx.clicked.connect(self._export_dedup_word)
         action_row.addWidget(self._btn_dedup_export_docx)
 
         self._btn_dedup_export_csv = QPushButton("视图 CSV")
         self._btn_dedup_export_csv.setToolTip("导出当前标签页筛选后的 CSV 数据")
-        self._btn_dedup_export_csv.setStyleSheet("padding: 5px 10px; font-size: 12px;")
+        self._btn_dedup_export_csv.setProperty("compact", True)
         self._btn_dedup_export_csv.setEnabled(False)
         self._btn_dedup_export_csv.clicked.connect(self._export_dedup_current_csv)
         action_row.addWidget(self._btn_dedup_export_csv)
 
         layout.addLayout(action_row)
 
-        # 5 Result sub-tabs
+        # 5 Result sub-tabs (compact subtab styling + lazy population + double-click jump)
         self._dedup_result_tabs = QTabWidget()
+        self._dedup_result_tabs.setProperty("subtabs", True)
+
         self._tv_dedup_cross = self._make_table_view(self._dedup_cross_model)
         self._tv_dedup_intra = self._make_table_view(self._dedup_intra_model)
         self._tv_dedup_inter = self._make_table_view(self._dedup_inter_model)
         self._tv_dedup_unique = self._make_table_view(self._dedup_unique_model)
         self._tv_dedup_unrec = self._make_table_view(self._dedup_unrec_model)
 
+        self._dedup_views = [
+            self._tv_dedup_cross,
+            self._tv_dedup_intra,
+            self._tv_dedup_inter,
+            self._tv_dedup_unique,
+            self._tv_dedup_unrec,
+        ]
+        for tab_idx, tv in enumerate(self._dedup_views):
+            tv.doubleClicked.connect(
+                lambda index, tidx=tab_idx: self._on_dedup_row_double_clicked(tidx, index)
+            )
+
         self._dedup_result_tabs.addTab(self._tv_dedup_cross, "跨表重复明细 (0)")
         self._dedup_result_tabs.addTab(self._tv_dedup_intra, "表内重复明细 (0)")
         self._dedup_result_tabs.addTab(self._tv_dedup_inter, "全表共有交集 (0)")
         self._dedup_result_tabs.addTab(self._tv_dedup_unique, "各表独有差集 (0)")
         self._dedup_result_tabs.addTab(self._tv_dedup_unrec, "未识别行 (0)")
-        self._dedup_result_tabs.currentChanged.connect(lambda _: self._apply_dedup_filter())
+        self._dedup_result_tabs.currentChanged.connect(self._on_dedup_subtab_changed)
 
         layout.addWidget(self._dedup_result_tabs, 1)
         return tab
@@ -234,6 +277,10 @@ class TablesDedupTabMixin:
         self._chk_dedup_scan_all.setVisible(is_smart)
         show_col = (not is_smart) or (not self._chk_dedup_scan_all.isChecked())
         self._dedup_col_row_widget.setVisible(show_col)
+
+        # Hide options that have no effect in smart_code mode
+        self._chk_dedup_ignore_case.setVisible(not is_smart)
+        self._chk_dedup_strip.setVisible(not is_smart)
         self._chk_dedup_ignore_punct.setVisible(not is_smart)
 
     def _open_dedup_key_dialog(self) -> None:
@@ -241,19 +288,76 @@ class TablesDedupTabMixin:
         if not tables:
             self.ctx.notify("请先在左侧勾选至少 1 张表格", "warning")
             return
-        dlg = _PerTableKeyDialog(tables, self._dedup_custom_keys, parent=self)
+        default_col = str(self._dedup_col_combo.currentData() or "")
+        dlg = _PerTableKeyDialog(
+            tables,
+            self._dedup_custom_keys,
+            parent=self,
+            default_column=default_col,
+        )
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._dedup_custom_keys.update(dlg.get_key_mapping())
-            self._update_custom_key_button_labels()
-            self.ctx.notify("已更新各表查重关键列配置", "success")
+            if dlg.was_cleared:
+                self._dedup_custom_keys.clear()
+                self._update_custom_key_button_labels()
+                self.ctx.notify("已清除查重按表关键列配置，恢复使用统一关键列", "info")
+            else:
+                self._dedup_custom_keys.update(dlg.get_key_mapping())
+                self._update_custom_key_button_labels()
+                self.ctx.notify("已更新各表查重关键列配置", "success")
 
-    def _build_dedup_config(self, tables: list[DataTable]) -> TableDedupConfig:
+    def _clear_dedup_custom_keys(self) -> None:
+        self._dedup_custom_keys.clear()
+        self._update_custom_key_button_labels()
+        self.ctx.notify("已恢复默认查重关键列", "info")
+
+    def _validate_dedup_key_columns(self, tables: list[DataTable]) -> bool:
+        """Warn if a participating table lacks the selected key column and has no custom override."""
+        mode = "smart_code" if self._rb_smart_code.isChecked() else "column_value"
+        scan_all = self._chk_dedup_scan_all.isChecked()
+        if mode == "smart_code" and scan_all:
+            return True
+
+        selected_col = str(self._dedup_col_combo.currentData() or "")
+        missing_tables: list[str] = []
+        for tbl in tables:
+            custom = [c for c in self._dedup_custom_keys.get(tbl.table_id, []) if c in tbl.headers]
+            if custom:
+                continue
+            if selected_col and selected_col not in tbl.headers:
+                missing_tables.append(tbl.name)
+
+        if not missing_tables:
+            return True
+
+        detail_lines = [
+            f"当前选择的关键列「{selected_col}」在以下表格中不存在：",
+            *[f"• {name}" for name in missing_tables],
+            "",
+            "若继续执行，缺失该列的表格将默认回退到第 1 列进行比对。",
+            "建议先通过「列管理」重命名列名，或点击「按表指定」为各表分别映射关键列。",
+        ]
+        dlg = ScrollableDetailDialog(
+            title="部分表格缺少所选关键列",
+            summary=f"有 {len(missing_tables)} 张参与表不包含列「{selected_col}」，是否继续执行查重？",
+            detail_text="\n".join(detail_lines),
+            confirm_mode=True,
+            confirm_label="仍要继续",
+            parent=self,
+        )
+        return dlg.exec() == QDialog.DialogCode.Accepted
+
+    def _build_dedup_config(
+        self,
+        tables: list[DataTable],
+        *,
+        force_intra: bool = False,
+    ) -> TableDedupConfig:
         mode = "smart_code" if self._rb_smart_code.isChecked() else "column_value"
         scan_all = self._chk_dedup_scan_all.isChecked()
         key_columns: dict[str, list[str]] = {}
 
         if mode == "column_value" or not scan_all:
-            selected_col = self._dedup_col_combo.currentData() or ""
+            selected_col = str(self._dedup_col_combo.currentData() or "")
             for tbl in tables:
                 custom = [c for c in self._dedup_custom_keys.get(tbl.table_id, []) if c in tbl.headers]
                 if custom:
@@ -269,7 +373,7 @@ class TablesDedupTabMixin:
             ignore_case=self._chk_dedup_ignore_case.isChecked(),
             strip_whitespace=self._chk_dedup_strip.isChecked(),
             ignore_punctuation=self._chk_dedup_ignore_punct.isChecked(),
-            include_intra_table=self._chk_dedup_intra.isChecked(),
+            include_intra_table=True if force_intra else self._chk_dedup_intra.isChecked(),
             include_cross_table=True,
             scan_all_columns_for_code=scan_all if mode == "smart_code" else False,
         )
@@ -280,42 +384,137 @@ class TablesDedupTabMixin:
         if not tables:
             self.ctx.notify("请先在左侧勾选至少 1 张表格再执行查重", "warning")
             return
-        if self._dedup_worker is not None and self._dedup_worker.isRunning():
+        if self._is_worker_running(self._dedup_worker):
             self.ctx.notify("多表查重正在运行中，请稍候...", "warning")
+            return
+        if not self._validate_dedup_key_columns(tables):
             return
 
         config = self._build_dedup_config(tables)
+        self._start_dedup_run(tables, config)
+
+    def _run_single_table_dedup(self, table: Optional[DataTable] = None) -> None:
+        """Quickly deduplicate a single table (intra-table analysis) without altering checkmarks."""
+        target = table or self.active_table()
+        if target is None:
+            self.ctx.notify("请先选择一张表格", "warning")
+            return
+        if self._is_worker_running(self._dedup_worker):
+            self.ctx.notify("多表查重正在运行中，请稍候...", "warning")
+            return
+
+        config = self._build_dedup_config([target], force_intra=True)
+        self.switch_sub_tab(1)
+        self._start_dedup_run([target], config, single_label=target.name)
+
+    def _start_dedup_run(
+        self,
+        tables: list[DataTable],
+        config: TableDedupConfig,
+        single_label: str = "",
+    ) -> None:
+        # Snapshot table copies (preserving table_id) so worker never races with main-thread edits
+        snapshots = [t.clone(new_id=t.table_id) for t in tables]
+        snapshot_sig = self._compute_tables_snapshot(tables)
         parser_engine = self.ctx.parser
 
-        self._btn_run_dedup.setEnabled(False)
+        self._dedup_gen += 1
+        gen = self._dedup_gen
+
         self._dedup_progress.setVisible(True)
         self._dedup_progress.setRange(0, 0)
+        self._btn_cancel_dedup.setVisible(True)
 
         def _task() -> TableDedupReport:
-            return run_multi_table_dedup(tables, config, parser_engine=parser_engine)
+            return run_multi_table_dedup(snapshots, config, parser_engine=parser_engine)
 
-        self._dedup_worker = WorkerThread(_task, parent=self)
-        self._dedup_worker.succeeded.connect(self._on_dedup_finished)
-        self._dedup_worker.failed.connect(self._on_dedup_failed)
-        self._dedup_worker.start()
-
-    def _on_dedup_finished(self, report: TableDedupReport) -> None:
-        self._btn_run_dedup.setEnabled(True)
-        self._dedup_progress.setVisible(False)
-        self.load_dedup_report(report)
-        self.ctx.notify(
-            f"多表查重完成：跨表重复 {len(report.cross_table_groups)} 组，表内重复 {len(report.intra_table_groups)} 组",
-            "success",
+        worker = self._make_worker(_task)
+        self._dedup_worker = worker
+        worker.succeeded.connect(
+            lambda report, g=gen, sig=snapshot_sig, lbl=single_label: self._on_dedup_finished(
+                g, sig, lbl, report
+            )
         )
+        worker.failed.connect(lambda detail, g=gen: self._on_dedup_failed(g, detail))
+        if hasattr(worker, "cancelled"):
+            worker.cancelled.connect(lambda g=gen: self._on_dedup_cancelled(g))
+        worker.finished.connect(lambda w=worker: self._clear_worker_ref("_dedup_worker", w))
+        self._sync_controls_state()
+        worker.start()
 
-    def _on_dedup_failed(self, detail: str) -> None:
-        self._btn_run_dedup.setEnabled(True)
+    def _cancel_dedup(self) -> None:
+        self._dedup_gen += 1
+        worker = self._dedup_worker
+        if worker is not None:
+            try:
+                worker.cancel()
+            except RuntimeError:
+                pass
         self._dedup_progress.setVisible(False)
+        self._btn_cancel_dedup.setVisible(False)
+        self._sync_controls_state()
+        self.ctx.notify("已请求取消多表查重", "info")
+
+    def _on_dedup_finished(
+        self,
+        gen: int,
+        snapshot_sig: Any,
+        single_label: str,
+        report: TableDedupReport,
+    ) -> None:
+        if gen != self._dedup_gen:
+            return
+        self._dedup_progress.setVisible(False)
+        self._btn_cancel_dedup.setVisible(False)
+        self.load_dedup_report(report, snapshot=snapshot_sig)
+        self._sync_controls_state()
+        if single_label:
+            self.ctx.notify(
+                f"「{single_label}」单表查重完成：表内重复 {len(report.intra_table_groups)} 组，唯一键 {report.unique_key_count:,} 个",
+                "success",
+            )
+        else:
+            self.ctx.notify(
+                f"多表查重完成：跨表重复 {len(report.cross_table_groups)} 组，表内重复 {len(report.intra_table_groups)} 组",
+                "success",
+            )
+
+    def _on_dedup_failed(self, gen: int, detail: str) -> None:
+        if gen != self._dedup_gen:
+            return
+        self._dedup_progress.setVisible(False)
+        self._btn_cancel_dedup.setVisible(False)
+        self._sync_controls_state()
         ScrollableDetailDialog("多表查重出错", "执行多表查重时发生错误：", detail, parent=self).exec()
 
-    def load_dedup_report(self, report: TableDedupReport) -> None:
-        """Populate metric cards and all 5 result sub-tabs from a TableDedupReport."""
+    def _on_dedup_cancelled(self, gen: int) -> None:
+        if gen != self._dedup_gen:
+            return
+        self._dedup_progress.setVisible(False)
+        self._btn_cancel_dedup.setVisible(False)
+        self._sync_controls_state()
+
+    def load_dedup_report(
+        self,
+        report: TableDedupReport,
+        snapshot: Optional[Any] = None,
+    ) -> None:
+        """Populate metric cards and lazily bind all 5 result sub-tabs from a TableDedupReport."""
         self._last_dedup_report = report
+        self._last_dedup_snapshot = snapshot
+        self._dedup_tab_populated.clear()
+        self._dedup_tab_refs.clear()
+
+        for model in (
+            self._dedup_cross_model,
+            self._dedup_intra_model,
+            self._dedup_inter_model,
+            self._dedup_unique_model,
+            self._dedup_unrec_model,
+        ):
+            model.clear()
+        for tv in self._dedup_views:
+            self._reset_table_view_sort_indicator(tv)
 
         # Metric cards
         self._card_d_tables.set_value(f"{len(report.table_names):,}")
@@ -325,147 +524,197 @@ class TablesDedupTabMixin:
         self._card_d_intra.set_value(f"{len(report.intra_table_groups):,}")
         self._card_d_inter.set_value(f"{len(report.intersection_keys):,}")
 
-        # 1. Cross-table duplicate rows
-        cross_headers = ["关键值 / 编码", "重复表数", "出现次数", "来源表", "原行号", "版本标签", "分集", "行内容摘要"]
-        cross_rows: list[list[str]] = []
-        cross_tints: dict[int, str] = {}
-        for g_idx, grp in enumerate(report.cross_table_groups):
-            tone = "cross_dup" if g_idx % 2 == 0 else "info"
-            for ref in grp.rows:
-                row_idx = len(cross_rows)
-                cross_rows.append(
-                    [
-                        grp.key_value,
-                        str(grp.table_count),
-                        str(grp.total_rows),
-                        ref.table_name,
-                        str(ref.row_index),
-                        ref.tags or "-",
-                        ref.part or "-",
-                        _format_row_summary(ref),
-                    ]
-                )
-                cross_tints[row_idx] = tone
-        self._dedup_cross_model.set_data(
-            cross_headers,
-            cross_rows,
-            row_tints=cross_tints,
-            highlight_columns={0},
-            mono_columns={0},
-            center_columns={1, 2, 4, 6},
-        )
-        self._auto_size_columns(self._tv_dedup_cross, self._dedup_cross_model)
+        # Fast counts for tab labels (without materializing inactive tabs)
+        cross_row_count = sum(len(g.rows) for g in report.cross_table_groups)
+        intra_row_count = sum(len(g.rows) for g in report.intra_table_groups)
+        uniq_row_count = sum(len(refs) for refs in report.unique_by_table.values())
+        unrec_row_count = len(report.unrecognized_rows)
 
-        # 2. Intra-table duplicate rows
-        intra_headers = ["关键值 / 编码", "来源表", "表内重复数", "原行号", "版本标签", "分集", "行内容摘要"]
-        intra_rows: list[list[str]] = []
-        intra_tints: dict[int, str] = {}
-        for grp in report.intra_table_groups:
-            for ref in grp.rows:
-                r_idx = len(intra_rows)
-                intra_rows.append(
-                    [
-                        grp.key_value,
-                        ref.table_name,
-                        str(grp.total_rows),
-                        str(ref.row_index),
-                        ref.tags or "-",
-                        ref.part or "-",
-                        _format_row_summary(ref),
-                    ]
-                )
-                intra_tints[r_idx] = "intra_dup"
-        self._dedup_intra_model.set_data(
-            intra_headers,
-            intra_rows,
-            row_tints=intra_tints,
-            highlight_columns={0},
-            mono_columns={0},
-            center_columns={2, 3, 5},
+        self._dedup_result_tabs.setTabText(
+            0, f"跨表重复 ({len(report.cross_table_groups)}组/{cross_row_count}行)"
         )
-        self._auto_size_columns(self._tv_dedup_intra, self._dedup_intra_model)
+        self._dedup_result_tabs.setTabText(
+            1, f"表内重复 ({len(report.intra_table_groups)}组/{intra_row_count}行)"
+        )
+        self._dedup_result_tabs.setTabText(2, f"全表交集 ({len(report.intersection_keys)}键)")
+        self._dedup_result_tabs.setTabText(3, f"独有差集 ({uniq_row_count}行)")
+        self._dedup_result_tabs.setTabText(4, f"未识别行 ({unrec_row_count}行)")
 
-        # 3. Intersection rows
-        inter_headers = ["关键值 / 编码", "来源表", "原行号", "版本标签", "分集", "行内容摘要"]
-        inter_rows: list[list[str]] = []
-        inter_tints: dict[int, str] = {}
-        for ref in report.intersection_rows:
-            r_idx = len(inter_rows)
-            inter_rows.append(
-                [
-                    ref.key_value,
-                    ref.table_name,
-                    str(ref.row_index),
-                    ref.tags or "-",
-                    ref.part or "-",
-                    _format_row_summary(ref),
-                ]
+        target_tab = 0
+        if cross_row_count > 0:
+            target_tab = 0
+        elif intra_row_count > 0:
+            target_tab = 1
+
+        self._dedup_result_tabs.blockSignals(True)
+        self._dedup_result_tabs.setCurrentIndex(target_tab)
+        self._dedup_result_tabs.blockSignals(False)
+
+        self._ensure_dedup_subtab_populated(target_tab)
+        self._apply_dedup_filter()
+        self._sync_controls_state()
+
+    def _ensure_dedup_subtab_populated(self, tab_idx: int) -> None:
+        """Lazily build the DynamicTableModel rows for the requested dedup result sub-tab."""
+        if tab_idx in self._dedup_tab_populated or self._last_dedup_report is None:
+            return
+        report = self._last_dedup_report
+        refs_out: list[TableRowRef] = []
+
+        if tab_idx == 0:
+            headers = ["关键值 / 编码", "重复表数", "出现次数", "来源表", "原行号", "版本标签", "分集", "行内容摘要"]
+            rows: list[list[str]] = []
+            tints: dict[int, str] = {}
+            for g_idx, grp in enumerate(report.cross_table_groups):
+                tone = "cross_dup" if g_idx % 2 == 0 else "info"
+                for ref in grp.rows:
+                    r_idx = len(rows)
+                    rows.append(
+                        [
+                            grp.key_value,
+                            str(grp.table_count),
+                            str(grp.total_rows),
+                            ref.table_name,
+                            str(ref.row_index),
+                            ref.tags or "-",
+                            ref.part or "-",
+                            _format_row_summary(ref),
+                        ]
+                    )
+                    tints[r_idx] = tone
+                    refs_out.append(ref)
+            self._dedup_cross_model.set_data(
+                headers,
+                rows,
+                row_tints=tints,
+                highlight_columns={0},
+                mono_columns={0},
+                center_columns={1, 2, 4, 6},
+                reset_filter=True,
             )
-            inter_tints[r_idx] = "intersection"
-        self._dedup_inter_model.set_data(
-            inter_headers,
-            inter_rows,
-            row_tints=inter_tints,
-            highlight_columns={0},
-            mono_columns={0},
-            center_columns={2, 4},
-        )
-        self._auto_size_columns(self._tv_dedup_inter, self._dedup_inter_model)
+            self._reset_table_view_sort_indicator(self._tv_dedup_cross)
+            self._auto_size_columns(self._tv_dedup_cross, self._dedup_cross_model)
 
-        # 4. Per-table exclusive rows
-        uniq_headers = ["来源表", "关键值 / 编码", "原行号", "版本标签", "分集", "行内容摘要"]
-        uniq_rows: list[list[str]] = []
-        for _tid, refs in report.unique_by_table.items():
-            for ref in refs:
-                uniq_rows.append(
+        elif tab_idx == 1:
+            headers = ["关键值 / 编码", "来源表", "表内重复数", "原行号", "版本标签", "分集", "行内容摘要"]
+            rows = []
+            tints = {}
+            for grp in report.intra_table_groups:
+                for ref in grp.rows:
+                    r_idx = len(rows)
+                    rows.append(
+                        [
+                            grp.key_value,
+                            ref.table_name,
+                            str(grp.total_rows),
+                            str(ref.row_index),
+                            ref.tags or "-",
+                            ref.part or "-",
+                            _format_row_summary(ref),
+                        ]
+                    )
+                    tints[r_idx] = "intra_dup"
+                    refs_out.append(ref)
+            self._dedup_intra_model.set_data(
+                headers,
+                rows,
+                row_tints=tints,
+                highlight_columns={0},
+                mono_columns={0},
+                center_columns={2, 3, 5},
+                reset_filter=True,
+            )
+            self._reset_table_view_sort_indicator(self._tv_dedup_intra)
+            self._auto_size_columns(self._tv_dedup_intra, self._dedup_intra_model)
+
+        elif tab_idx == 2:
+            headers = ["关键值 / 编码", "来源表", "原行号", "版本标签", "分集", "行内容摘要"]
+            rows = []
+            tints = {}
+            for ref in report.intersection_rows:
+                r_idx = len(rows)
+                rows.append(
                     [
-                        ref.table_name,
                         ref.key_value,
+                        ref.table_name,
                         str(ref.row_index),
                         ref.tags or "-",
                         ref.part or "-",
                         _format_row_summary(ref),
                     ]
                 )
-        self._dedup_unique_model.set_data(
-            uniq_headers,
-            uniq_rows,
-            highlight_columns={1},
-            mono_columns={1},
-            center_columns={2, 4},
-        )
-        self._auto_size_columns(self._tv_dedup_unique, self._dedup_unique_model)
+                tints[r_idx] = "intersection"
+                refs_out.append(ref)
+            self._dedup_inter_model.set_data(
+                headers,
+                rows,
+                row_tints=tints,
+                highlight_columns={0},
+                mono_columns={0},
+                center_columns={2, 4},
+                reset_filter=True,
+            )
+            self._reset_table_view_sort_indicator(self._tv_dedup_inter)
+            self._auto_size_columns(self._tv_dedup_inter, self._dedup_inter_model)
 
-        # 5. Unrecognized rows
-        unrec_headers = ["来源表", "原行号", "行内容摘要"]
-        unrec_rows = [
-            [ref.table_name, str(ref.row_index), _format_row_summary(ref, max_chars=240)]
-            for ref in report.unrecognized_rows
-        ]
-        self._dedup_unrec_model.set_data(
-            unrec_headers,
-            unrec_rows,
-            center_columns={1},
-        )
-        self._auto_size_columns(self._tv_dedup_unrec, self._dedup_unrec_model)
+        elif tab_idx == 3:
+            headers = ["来源表", "关键值 / 编码", "原行号", "版本标签", "分集", "行内容摘要"]
+            rows = []
+            for _tid, refs in report.unique_by_table.items():
+                for ref in refs:
+                    rows.append(
+                        [
+                            ref.table_name,
+                            ref.key_value,
+                            str(ref.row_index),
+                            ref.tags or "-",
+                            ref.part or "-",
+                            _format_row_summary(ref),
+                        ]
+                    )
+                    refs_out.append(ref)
+            self._dedup_unique_model.set_data(
+                headers,
+                rows,
+                highlight_columns={1},
+                mono_columns={1},
+                center_columns={2, 4},
+                reset_filter=True,
+            )
+            self._reset_table_view_sort_indicator(self._tv_dedup_unique)
+            self._auto_size_columns(self._tv_dedup_unique, self._dedup_unique_model)
 
-        # Tab labels
-        self._dedup_result_tabs.setTabText(0, f"跨表重复明细 ({len(report.cross_table_groups)}组/{len(cross_rows)}行)")
-        self._dedup_result_tabs.setTabText(1, f"表内重复明细 ({len(report.intra_table_groups)}组/{len(intra_rows)}行)")
-        self._dedup_result_tabs.setTabText(2, f"全表共有交集 ({len(report.intersection_keys)}键)")
-        self._dedup_result_tabs.setTabText(3, f"各表独有差集 ({len(uniq_rows)}行)")
-        self._dedup_result_tabs.setTabText(4, f"未识别行 ({len(unrec_rows)}行)")
+        elif tab_idx == 4:
+            headers = ["来源表", "原行号", "行内容摘要"]
+            rows = []
+            for ref in report.unrecognized_rows:
+                rows.append([ref.table_name, str(ref.row_index), _format_row_summary(ref, max_chars=240)])
+                refs_out.append(ref)
+            self._dedup_unrec_model.set_data(
+                headers,
+                rows,
+                center_columns={1},
+                reset_filter=True,
+            )
+            self._reset_table_view_sort_indicator(self._tv_dedup_unrec)
+            self._auto_size_columns(self._tv_dedup_unrec, self._dedup_unrec_model)
 
-        self._btn_dedup_export_xlsx.setEnabled(True)
-        self._btn_dedup_export_docx.setEnabled(True)
-        self._btn_dedup_export_csv.setEnabled(True)
+        self._dedup_tab_refs[tab_idx] = refs_out
+        self._dedup_tab_populated.add(tab_idx)
 
+    def _on_dedup_subtab_changed(self, tab_idx: int) -> None:
+        self._ensure_dedup_subtab_populated(tab_idx)
         self._apply_dedup_filter()
 
-        if cross_rows:
-            self._dedup_result_tabs.setCurrentIndex(0)
-        elif intra_rows:
-            self._dedup_result_tabs.setCurrentIndex(1)
+    def _on_dedup_row_double_clicked(self, tab_idx: int, index: QModelIndex) -> None:
+        if not index.isValid():
+            return
+        model, _ = self._active_dedup_model()
+        orig_row = model.original_row_index(index.row())
+        refs = self._dedup_tab_refs.get(tab_idx, [])
+        if 0 <= orig_row < len(refs):
+            ref = refs[orig_row]
+            self._jump_to_table_row(ref.table_id, ref.row_index, fallback_ref=ref)
 
     def _active_dedup_model(self) -> tuple[DynamicTableModel, str]:
         idx = self._dedup_result_tabs.currentIndex()
@@ -481,25 +730,40 @@ class TablesDedupTabMixin:
         return mapping[0]
 
     def _apply_dedup_filter(self) -> None:
+        idx = self._dedup_result_tabs.currentIndex()
+        self._ensure_dedup_subtab_populated(idx)
         query = self._dedup_search.text()
         model, _ = self._active_dedup_model()
         model.set_filter(query)
+        self._update_dedup_filter_label()
+
+    def _update_dedup_filter_label(self) -> None:
+        model, _ = self._active_dedup_model()
+        shown = model.filtered_row_count()
+        total = model.total_row_count()
+        if model.filter_query():
+            self._dedup_filter_lbl.setText(f"筛选命中 {shown:,} / {total:,} 行")
+        else:
+            self._dedup_filter_lbl.setText(f"共 {total:,} 行")
 
     def _reset_dedup_ui(self) -> None:
-        for card in (
-            self._card_d_tables,
-            self._card_d_rows,
-            self._card_d_unique,
-            self._card_d_cross,
-            self._card_d_intra,
-            self._card_d_inter,
-        ):
+        self._dedup_search_timer.stop()
+        self._dedup_search.blockSignals(True)
+        self._dedup_search.clear()
+        self._dedup_search.blockSignals(False)
+        self._dedup_tab_populated.clear()
+        self._dedup_tab_refs.clear()
+
+        for card in self._dedup_metric_cards:
             card.set_value("0")
+        for tv in self._dedup_views:
+            self._reset_table_view_sort_indicator(tv)
         self._dedup_result_tabs.setTabText(0, "跨表重复明细 (0)")
         self._dedup_result_tabs.setTabText(1, "表内重复明细 (0)")
         self._dedup_result_tabs.setTabText(2, "全表共有交集 (0)")
         self._dedup_result_tabs.setTabText(3, "各表独有差集 (0)")
         self._dedup_result_tabs.setTabText(4, "未识别行 (0)")
+        self._dedup_filter_lbl.setText("0 行")
         self._btn_dedup_export_xlsx.setEnabled(False)
         self._btn_dedup_export_docx.setEnabled(False)
         self._btn_dedup_export_csv.setEnabled(False)
@@ -516,14 +780,25 @@ class TablesDedupTabMixin:
         if not save_path:
             return
         self._remember_export_dir(save_path)
-        try:
-            merged_tbl = self._last_merge_result.merged_table if self._last_merge_result else None
-            export_dedup_report_excel(self._last_dedup_report, save_path, merged_table=merged_tbl)
-            self.ctx.notify(f"已导出多 Sheet Excel 查重报告：{Path(save_path).name}", "success")
-        except ExportError as exc:
-            ScrollableDetailDialog("导出报告失败", str(exc), parent=self).exec()
-        except Exception as exc:
-            ScrollableDetailDialog("导出报告异常", "导出 Excel 查重报告时发生错误：", str(exc), parent=self).exec()
+
+        report_ref = self._last_dedup_report
+        # Only attach merged_table when its input table snapshot strictly matches the dedup report!
+        merged_tbl: Optional[DataTable] = None
+        if (
+            self._last_merge_result is not None
+            and self._last_merge_snapshot is not None
+            and self._last_dedup_snapshot is not None
+            and self._last_merge_snapshot == self._last_dedup_snapshot
+        ):
+            merged_tbl = self._last_merge_result.merged_table.clone(
+                new_id=self._last_merge_result.merged_table.table_id
+            )
+
+        self._start_export_worker(
+            lambda: export_dedup_report_excel(report_ref, save_path, merged_table=merged_tbl),
+            success_msg=f"已导出多 Sheet Excel 查重报告：{Path(save_path).name}",
+            error_title="导出报告失败",
+        )
 
     def _export_dedup_word(self) -> None:
         if not self._last_dedup_report:
@@ -537,15 +812,17 @@ class TablesDedupTabMixin:
         if not save_path:
             return
         self._remember_export_dir(save_path)
-        try:
-            export_dedup_report_word(self._last_dedup_report, save_path)
-            self.ctx.notify(f"已导出 Word 查重报告：{Path(save_path).name}", "success")
-        except ExportError as exc:
-            ScrollableDetailDialog("导出 Word 报告失败", str(exc), parent=self).exec()
-        except Exception as exc:
-            ScrollableDetailDialog("导出 Word 报告异常", "导出 Word 查重报告时发生错误：", str(exc), parent=self).exec()
+
+        report_ref = self._last_dedup_report
+        self._start_export_worker(
+            lambda: export_dedup_report_word(report_ref, save_path),
+            success_msg=f"已导出 Word 查重报告：{Path(save_path).name}",
+            error_title="导出 Word 报告失败",
+        )
 
     def _export_dedup_current_csv(self) -> None:
+        idx = self._dedup_result_tabs.currentIndex()
+        self._ensure_dedup_subtab_populated(idx)
         model, tab_name = self._active_dedup_model()
         if model.columnCount() == 0:
             self.ctx.notify("当前查重视图暂无数据可导出", "warning")
@@ -559,17 +836,16 @@ class TablesDedupTabMixin:
         if not save_path:
             return
         self._remember_export_dir(save_path)
-        try:
-            view_table = DataTable(
-                table_id=generate_table_id(),
-                name=tab_name,
-                headers=model.headers(),
-                rows=model.visible_rows(),
-                source_type="merged",
-            )
-            export_table_csv(view_table, save_path)
-            self.ctx.notify(f"已导出当前视图 CSV：{Path(save_path).name}", "success")
-        except ExportError as exc:
-            ScrollableDetailDialog("导出 CSV 失败", str(exc), parent=self).exec()
-        except Exception as exc:
-            ScrollableDetailDialog("导出 CSV 异常", "导出当前视图 CSV 时发生错误：", str(exc), parent=self).exec()
+
+        view_table = DataTable(
+            table_id=generate_table_id(),
+            name=tab_name,
+            headers=model.headers(),
+            rows=model.visible_rows(),
+            source_type="merged",
+        )
+        self._start_export_worker(
+            lambda: export_table_csv(view_table, save_path),
+            success_msg=f"已导出当前视图 CSV：{Path(save_path).name}",
+            error_title="导出 CSV 失败",
+        )
