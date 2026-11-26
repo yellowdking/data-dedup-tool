@@ -438,3 +438,183 @@ def test_word_and_excel_no_false_parent_fallback_from_host_folder_or_sheet(tmp_p
     assert word_recognized == ["DEF-002", "GHI-003"]
     assert len(word_unrec) == 3  # Title paragraph + date/price paragraph + table header row
     assert not any("PRJ-2026" in c or "V110" in c for c in word_recognized)
+
+
+# ---------------------------------------------------------------------------
+# v1.2.0 Hardening: P0/P1 scanner, tree, CSV/TSV, dir, encoding & scandir tests
+# ---------------------------------------------------------------------------
+def test_v12_companion_filter_only_drops_single_file_items(tmp_path: Path) -> None:
+    import docx
+    import openpyxl
+
+    # 1. Excel multi-column row ending in `cover.jpg` must NOT be dropped.
+    xlsx_path = tmp_path / "with_cover.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["ABC-123", "主视频", "cover.jpg"])
+    ws.append(["cover.jpg"])  # Standalone companion filename in single cell IS filtered.
+    wb.save(xlsx_path)
+    wb.close()
+
+    excel_results = CodeParser().parse_items(scan_excel_file(xlsx_path), ignore_companions=True)
+    assert [r.canonical_code for r in excel_results if r.recognized] == ["ABC-123"]
+
+    # 2. Word paragraph ending in `readme.txt` must NOT be dropped.
+    docx_path = tmp_path / "with_readme.docx"
+    doc = docx.Document()
+    doc.add_paragraph("编号 ABC-123 说明见 readme.txt")
+    doc.save(docx_path)
+    word_results = CodeParser().parse_items(scan_word_file(docx_path), ignore_companions=True)
+    assert [r.canonical_code for r in word_results if r.recognized] == ["ABC-123"]
+
+    # 3. Multi-token TXT line ending in `.html` URL must NOT be dropped.
+    txt_results = CodeParser().parse_text(
+        "ABC-123 详情 https://example.com/page.html\ncover.jpg\n.DS_Store\n",
+        ignore_companions=True,
+    )
+    assert [r.canonical_code for r in txt_results if r.recognized] == ["ABC-123"]
+    assert len(txt_results) == 1
+
+
+def test_v12_multicolumn_csv_and_excel_pasted_tsv() -> None:
+    parser = CodeParser()
+
+    # CSV without recognized filename header scans all non-size columns.
+    csv_no_hdr = "序号,资产代号,大小\n1,ABC-123,1024\n2,DEF-456,2048\n"
+    items_1 = scan_text(csv_no_hdr, file_ext=".csv")
+    res_1 = parser.parse_items(items_1)
+    assert [r.canonical_code for r in res_1] == ["ABC-123", "DEF-456"]
+    assert res_1[0].file_size == 1024
+
+    # CSV with both `文件名` and `路径` prioritizes `文件名` over `路径`.
+    csv_both = "文件名,路径,大小\nABC-123.mp4,D:\\Videos,1024\n"
+    items_2 = scan_text(csv_both, file_ext=".csv")
+    res_2 = parser.parse_items(items_2)
+    assert [r.canonical_code for r in res_2] == ["ABC-123"]
+
+    # Excel copy-paste TSV scans all columns instead of only cols[0].
+    pasted_tsv = "1\tABC-123\t4K 中文字幕\n2\tDEF-456\t1080P\n"
+    res_tsv = parser.parse_text(pasted_tsv)
+    assert [r.canonical_code for r in res_tsv] == ["ABC-123", "DEF-456"]
+    assert "4K" in res_tsv[0].tags and "字幕" in res_tsv[0].tags
+
+
+def test_v12_tree_last_branch_space_prefixed_bar_and_no_stray_dash() -> None:
+    tree_text = """D:\\ARCHIVE
+└───PARENT-001
+    │   1.mp4
+    └───SUB
+            2.mp4
+"""
+    items = scan_text(tree_text, source_name="tree.txt")
+    assert [it.file_name for it in items] == ["1.mp4", "2.mp4"]
+    assert items[0].parent_dir == "PARENT-001"
+    assert not items[0].parent_dir.startswith("─")
+    assert items[1].parent_dir == "SUB"
+
+    results = CodeParser().parse_items(items, ignore_companions=True)
+    assert [r.canonical_code for r in results] == ["PARENT-001", "PARENT-001"]
+    assert all(r.from_parent for r in results)
+
+
+def test_v12_slash_codes_and_dates_not_misclassified_as_posix_paths() -> None:
+    parser = CodeParser()
+    r1 = parser.parse_text("ABC-123/DEF-456/GHI-789")
+    assert [r.canonical_code for r in r1] == ["ABC-123", "DEF-456", "GHI-789"]
+
+    r2 = parser.parse_text("ABC-123 2024/05/12 DEF-456")
+    assert [r.canonical_code for r in r2] == ["ABC-123", "DEF-456"]
+
+    r3 = parser.parse_text("ABC-123 2024/05/12/extra")
+    assert [r.canonical_code for r in r3] == ["ABC-123"]
+
+
+def test_v12_encoding_utf32_shift_jis_big5_and_corrupt_bom(tmp_path: Path) -> None:
+    # UTF-32LE BOM
+    p_u32 = tmp_path / "u32.txt"
+    p_u32.write_bytes("ABC-123 中文清单.mp4\n".encode("utf-32"))
+    txt_u32, enc_u32 = read_text_auto_encoding(p_u32)
+    assert enc_u32 == "utf-32"
+    assert "\x00" not in txt_u32
+    assert CodeParser().parse_text(txt_u32)[0].canonical_code == "ABC-123"
+
+    # Shift-JIS (cp932) must NOT be mis-decoded as GB18030 mojibake
+    p_sjis = tmp_path / "sjis.txt"
+    jp_sample = "日本語タイトル ABC-123 テスト.mp4\n"
+    p_sjis.write_bytes(jp_sample.encode("cp932"))
+    txt_sjis, enc_sjis = read_text_auto_encoding(p_sjis)
+    assert enc_sjis == "cp932"
+    assert "日本語タイトル" in txt_sjis and "テスト" in txt_sjis
+
+    # Corrupt UTF-8 BOM & corrupt UTF-16 BOM must never crash
+    p_bad_u8 = tmp_path / "bad_u8.txt"
+    p_bad_u8.write_bytes(b"\xef\xbb\xbfABC-123\xff.mp4")
+    txt_bad_u8, _ = read_text_auto_encoding(p_bad_u8)
+    assert "ABC-123" in txt_bad_u8
+
+    p_bad_u16 = tmp_path / "bad_u16.txt"
+    p_bad_u16.write_bytes(b"\xff\xfeA\x00\xd8")
+    txt_bad_u16, enc_bad_u16 = read_text_auto_encoding(p_bad_u16)
+    assert enc_bad_u16 == "utf-16-replace"
+    assert txt_bad_u16.startswith("A")
+
+
+def test_v12_windows_dir_us_eu_and_chinese_ampm_formats() -> None:
+    us_dir = """ Directory of D:\\Archive\\PRJ-123
+
+05/10/2024  02:30 PM     1,234,567,890 1.mp4
+05/10/2024  02:31 PM            12,345 cover.jpg
+"""
+    assert detect_input_format(us_dir.splitlines()) == "dir"
+    res_us = CodeParser().parse_items(scan_text(us_dir), ignore_companions=True)
+    assert len(res_us) == 1
+    assert res_us[0].canonical_code == "PRJ-123"
+    assert res_us[0].file_size == 1234567890
+
+    cn_dir = """ D:\\Archive\\CAT-456 的目录
+
+2024/05/10  下午 02:30         987,654 1.mp4
+2024/05/10  上午 09:05     <DIR>       ..
+"""
+    assert detect_input_format(cn_dir.splitlines()) == "dir"
+    res_cn = CodeParser().parse_items(scan_text(cn_dir), ignore_companions=True)
+    assert len(res_cn) == 1
+    assert res_cn[0].canonical_code == "CAT-456"
+    assert res_cn[0].file_size == 987654
+
+    eu_dir = """ Directory of D:\\Archive\\DOC-789
+
+10.05.2024  14:30       555,000 1.mkv
+10.05.2024  14:31         1,024 note.txt
+"""
+    assert detect_input_format(eu_dir.splitlines()) == "dir"
+    res_eu = CodeParser().parse_items(scan_text(eu_dir), ignore_companions=True)
+    assert [r.canonical_code for r in res_eu] == ["DOC-789"]
+
+
+def test_v12_scan_folder_dotfiles_above_root_clamp_and_cancel(tmp_path: Path) -> None:
+    # Above-root folder named `Backup-2024` must NOT leak onto unrecognized files inside `inbox`.
+    above = tmp_path / "Backup-2024" / "inbox"
+    above.mkdir(parents=True)
+    (above / "random.mp4").write_bytes(b"1234")
+    (above / ".DS_Store").write_bytes(b"meta")
+    sub = above / "PRJ-555"
+    sub.mkdir()
+    (sub / "1.mp4").write_bytes(b"5678")
+
+    items = scan_folder(above, recursive=True)
+    ds = [it for it in items if it.file_name == ".DS_Store"]
+    assert len(ds) == 1 and ds[0].is_companion is True
+
+    results = CodeParser().parse_items(items, ignore_companions=True)
+    by_name = {r.file_name: r for r in results}
+    assert ".DS_Store" not in by_name
+    assert by_name["random.mp4"].recognized is False
+    assert by_name["1.mp4"].canonical_code == "PRJ-555"
+
+    # Verify cancel_check stops scan_folder and scan_files cleanly.
+    cancelled_items = scan_folder(above, recursive=True, cancel_check=lambda: True)
+    assert cancelled_items == []
+
+    # Verify normalize_cell_text avoids scientific notation on large decimals.
+    assert normalize_cell_text(1234567.5) == "1234567.5"
