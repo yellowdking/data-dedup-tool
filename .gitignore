@@ -14,6 +14,7 @@ build/
 dist/
 *.egg-info/
 .eggs/
+build_version_info.txt
 
 # Testing / Coverage / Cache
 .pytest_cache/
@@ -27,7 +28,9 @@ htmlcov/
 *.db-wal
 *.db-shm
 *.bak
+*.tmp
 data/
+user_data/
 backups/
 exports/
 screenshots/
