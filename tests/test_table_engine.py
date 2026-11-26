@@ -14,7 +14,9 @@ import openpyxl
 import pytest
 
 from src.core.database import DatabaseRepository
+from src.core.doc_reader import read_database_as_table
 from src.core.exporter import ExportError
+from src.core.models import DataRecord
 from src.core.parser import CodeParser
 from src.core.table_data import (
     DataTable,
@@ -256,6 +258,52 @@ class TestMultiTableDedupColumnValue:
         )
         rep_punct = run_multi_table_dedup([t1, t2], cfg_punct)
         assert sorted(g.key_value for g in rep_punct.cross_table_groups) == ["e001", "e003"]
+
+    def test_composite_key_no_separator_collision_and_same_name_tables(self) -> None:
+        t1 = DataTable(
+            table_id="sep1",
+            name="export.csv",
+            headers=["A", "B"],
+            rows=[["foo | bar", "baz"], ["same", "val"]],
+        )
+        t2 = DataTable(
+            table_id="sep2",
+            name="export.csv",
+            headers=["A", "B"],
+            rows=[["foo", "bar | baz"], ["same", "val"]],
+        )
+        cfg = TableDedupConfig(mode="column_value", key_columns={"*": ["A", "B"]})
+        rep = run_multi_table_dedup([t1, t2], cfg)
+        # Only ("same", "val") matches; ("foo | bar", "baz") != ("foo", "bar | baz")!
+        assert [g.key_value for g in rep.cross_table_groups] == ["same | val"]
+        assert rep.cross_table_groups[0].table_count == 2
+        assert len(rep.cross_table_groups[0].table_names) == 2
+
+        # Union dedup also keeps both distinct composite tuples
+        m_res = merge_tables(
+            [t1, t2],
+            TableMergeConfig(
+                mode="union_dedup",
+                dedup_mode="column_value",
+                key_columns={"*": ["A", "B"]},
+                add_source_column=False,
+            ),
+        )
+        assert m_res.merged_table.row_count == 3
+        assert len(m_res.dropped_rows) == 1
+
+        # Smart code with invalid explicit column + scan_all_columns_for_code=False must NOT leak
+        t3 = DataTable(table_id="x", name="表X", headers=["描述"], rows=[["ABC-001"]])
+        rep_strict = run_multi_table_dedup(
+            [t3],
+            TableDedupConfig(
+                mode="smart_code",
+                key_columns={"x": ["不存在列"]},
+                scan_all_columns_for_code=False,
+            ),
+        )
+        assert rep_strict.unique_key_count == 0
+        assert len(rep_strict.unrecognized_rows) == 1
 
 
 # ----------------------------------------------------------------------
@@ -523,6 +571,122 @@ class TestMergeTables:
         with pytest.raises(ValueError):
             merge_tables([], TableMergeConfig(mode="union_dedup", keep_strategy="bad"))
 
+    def test_merge_strict_smart_code_column_ignore_punct_and_coalesce_provenance(
+        self,
+    ) -> None:
+        t1 = DataTable(
+            table_id="s1",
+            name="表A",
+            headers=["主编码", "备注"],
+            rows=[["ABC-001", ""], ["", "参考 ABC-001"]],
+        )
+        # scan_all_columns_for_code=False must NOT scan 备注 when 主编码 is blank
+        res_strict = merge_tables(
+            [t1],
+            TableMergeConfig(
+                mode="union_dedup",
+                dedup_mode="smart_code",
+                key_columns={"s1": ["主编码"]},
+                scan_all_columns_for_code=False,
+                add_source_column=False,
+            ),
+        )
+        assert res_strict.merged_table.row_count == 2
+        assert len(res_strict.dropped_rows) == 0
+
+        # ignore_punctuation=True + paired coalesce provenance in _原行号
+        p1 = DataTable(table_id="p1", name="表A", headers=["工号", "部门"], rows=[["E-001", ""]])
+        p2 = DataTable(table_id="p2", name="表B", headers=["工号", "部门"], rows=[["E_001", "研发"]])
+        res_p = merge_tables(
+            [p1, p2],
+            TableMergeConfig(
+                mode="union_dedup",
+                dedup_mode="column_value",
+                key_columns={"*": ["工号"]},
+                ignore_punctuation=True,
+                keep_strategy="coalesce",
+                add_source_column=True,
+                add_row_index_column=True,
+            ),
+        )
+        assert res_p.merged_table.row_count == 1
+        assert res_p.merged_table.rows[0] == ["E-001", "研发", "表A / 表B", "表A#1 / 表B#1"]
+
+    def test_join_outer_row_index_3table_inner_dropped_and_cartesian_guards(self) -> None:
+        # 1. Outer join preserves right-side _原行号
+        left = DataTable(table_id="l", name="左表", headers=["K", "L"], rows=[["a", "1"]])
+        right = DataTable(
+            table_id="r", name="右表", headers=["K", "R"], rows=[["a", "10"], ["b", "20"]]
+        )
+        res_out = merge_tables(
+            [left, right],
+            TableMergeConfig(
+                mode="join",
+                join_type="outer",
+                dedup_mode="column_value",
+                key_columns={"*": ["K"]},
+                add_source_column=True,
+                add_row_index_column=True,
+            ),
+        )
+        assert res_out.merged_table.row_count == 2
+        # Row 1 (right-only "b") must keep right row index "2", not ""
+        assert res_out.merged_table.rows[1][-2:] == ["右表", "2"]
+
+        # 2. 3-table inner join with Cartesian intermediate rows that fail Table 3
+        t1 = DataTable(
+            table_id="j1", name="T1", headers=["K", "V1"], rows=[["x", "a"], ["y", "b"]]
+        )
+        t2 = DataTable(
+            table_id="j2",
+            name="T2",
+            headers=["K", "V2"],
+            rows=[["x", "1"], ["x", "2"], ["y", "3"]],
+        )
+        t3 = DataTable(table_id="j3", name="T3", headers=["K", "V3"], rows=[["y", "ok"]])
+        res_3 = merge_tables(
+            [t1, t2, t3],
+            TableMergeConfig(
+                mode="join",
+                join_type="inner",
+                dedup_mode="column_value",
+                key_columns={"*": ["K"]},
+                add_source_column=False,
+            ),
+        )
+        assert res_3.merged_table.row_count == 1
+        # Dropped must contain T1#1 ("x"), T2#1 ("x"), T2#2 ("x") — each exactly ONCE!
+        dropped_keys = [(r.table_id, r.row_index) for r in res_3.dropped_rows]
+        assert dropped_keys == [("j1", 1), ("j2", 1), ("j2", 2)]
+
+        # 3. join_match_mode="first" vs max_join_rows explosion guard
+        m1 = DataTable(table_id="m1", name="M1", headers=["K"], rows=[["dup"]] * 20)
+        m2 = DataTable(table_id="m2", name="M2", headers=["K"], rows=[["dup"]] * 20)
+        with pytest.raises(ValueError, match="安全上限|笛卡尔积"):
+            merge_tables(
+                [m1, m2],
+                TableMergeConfig(
+                    mode="join",
+                    join_type="inner",
+                    dedup_mode="column_value",
+                    key_columns={"*": ["K"]},
+                    max_join_rows=100,
+                ),
+            )
+
+        res_first = merge_tables(
+            [m1, m2],
+            TableMergeConfig(
+                mode="join",
+                join_type="left",
+                dedup_mode="column_value",
+                key_columns={"*": ["K"]},
+                join_match_mode="first",
+                max_join_rows=100,
+            ),
+        )
+        assert res_first.merged_table.row_count == 20
+
 
 # ----------------------------------------------------------------------
 # 3. Database import roundtrip tests
@@ -578,6 +742,54 @@ class TestImportTableToDatabase:
             )
             assert summary3["added"] == 4
             assert summary3["skipped"] == 0
+
+    def test_db_table_db_roundtrip_explicit_part_and_code_column_validation(self) -> None:
+        parser = CodeParser()
+        with DatabaseRepository(":memory:") as db1, DatabaseRepository(":memory:") as db2:
+            db1.add_record(
+                DataRecord(
+                    canonical_code="ABC-001",
+                    prefix="ABC",
+                    number="001",
+                    file_name="clean_title_CD1.mp4",
+                    part="CD2",
+                    source_name="原库",
+                )
+            )
+            exported_tbl = read_database_as_table(db1, name="原库快照")
+            summary = import_table_to_database(exported_tbl, db2, parser_engine=parser)
+            assert summary["added"] == 1
+            rec = db2.query_records()[0]
+            # "原始名称" preserves file_name, and explicit "分集" ("CD2") overrides heuristic "CD1"!
+            assert rec.file_name == "clean_title_CD1.mp4"
+            assert rec.part == "CD2"
+
+            # Explicit non-existent code_column raises ValueError
+            with pytest.raises(ValueError, match="不存在指定的编码列"):
+                import_table_to_database(exported_tbl, db2, code_column="NO_SUCH_COL")
+            with pytest.raises(ValueError, match="超出范围"):
+                import_table_to_database(exported_tbl, db2, code_column=99)
+
+            # Empty table returns zero summary cleanly
+            empty_tbl = DataTable(table_id="e0", name="空表", headers=["编码"], rows=[])
+            assert import_table_to_database(empty_tbl, db2)["total"] == 0
+
+            # fallback_scan_all=True vs False with explicit code_column
+            mixed_tbl = DataTable(
+                table_id="fb",
+                name="回退表",
+                headers=["主编码", "备选列"],
+                rows=[["", "XYZ-777.mp4"]],
+            )
+            s_strict = import_table_to_database(
+                mixed_tbl, db2, parser_engine=parser, code_column="主编码", fallback_scan_all=False
+            )
+            assert s_strict["added"] == 0 and s_strict["unrecognized"] == 1
+
+            s_fallback = import_table_to_database(
+                mixed_tbl, db2, parser_engine=parser, code_column=0, fallback_scan_all=True
+            )
+            assert s_fallback["added"] == 1
 
 
 # ----------------------------------------------------------------------
