@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "data-dedup-tool"
+version = "1.0.0"
+description = "高效桌面端数据与文件编码查重程序：支持 TXT/目录树批量解析、多模式编码识别、SQLite 毫秒级查重与 Excel 导出"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+    { name = "yellowdking" },
+]
+dependencies = [
+    "PySide6-Essentials>=6.7.0",
+    "openpyxl>=3.1.0",
+    "Pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pyinstaller>=6.10.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
