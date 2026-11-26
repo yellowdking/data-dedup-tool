@@ -3,6 +3,8 @@
 
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_data_files
+
 PROJECT_ROOT = Path(SPECPATH).resolve()
 ICON_PATH = PROJECT_ROOT / "src" / "resources" / "app.ico"
 RESOURCES_DIR = PROJECT_ROOT / "src" / "resources"
@@ -11,13 +13,29 @@ datas = []
 if RESOURCES_DIR.exists():
     datas.append((str(RESOURCES_DIR), "src/resources"))
 
+# Include python-docx package templates (e.g. docx/templates/default.docx) so
+# creating and exporting .docx documents works cleanly in the frozen single-file EXE.
+datas += collect_data_files("docx")
+
 hiddenimports = [
     "PySide6.QtCore",
     "PySide6.QtGui",
     "PySide6.QtWidgets",
     "openpyxl",
     "openpyxl.cell._writer",
+    "docx",
+    "docx.oxml",
+    "docx.oxml.ns",
+    "docx.opc",
+    "docx.opc.constants",
+    "docx.shared",
+    "docx.enum.text",
+    "docx.enum.table",
+    "lxml",
+    "lxml.etree",
+    "lxml._elementpath",
     "sqlite3",
+    "csv",
 ]
 
 excludes = [
