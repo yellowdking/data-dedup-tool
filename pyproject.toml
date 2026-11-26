@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "data-dedup-tool"
-version = "1.1.0"
+version = "1.2.0"
 description = "高效桌面端数据查重与多表处理程序：支持 Word/Excel/CSV/TXT 多格式导入、多模式智能编码识别、多表跨表查重与合并、SQLite 毫秒级索引及多格式报表导出"
 readme = "README.md"
 license = { text = "MIT" }
@@ -16,13 +16,17 @@ dependencies = [
     "PySide6-Essentials>=6.7.0",
     "openpyxl>=3.1.0",
     "python-docx>=1.1.0",
-    "Pillow>=10.0.0",
 ]
 
 [project.optional-dependencies]
+build = [
+    "pyinstaller>=6.10.0",
+    "Pillow>=10.0.0",
+]
 dev = [
     "pytest>=8.0.0",
     "pyinstaller>=6.10.0",
+    "Pillow>=10.0.0",
 ]
 
 [tool.pytest.ini_options]
