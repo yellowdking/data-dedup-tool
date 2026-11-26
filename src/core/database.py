@@ -7,17 +7,21 @@ fast search/filtering/sorting/statistics, duplicate grouping, and rolling
 
 from __future__ import annotations
 
-import os
-import shutil
 import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from .database_backup import (
+    SCHEMA_VERSION,
+    DatabaseBackupMixin,
+    DatabaseError,
+    _SCHEMA_DDL,
+    _SQLITE_BUSY_TIMEOUT_MS,
+)
 from .models import DataRecord, DuplicateGroup, ImportBatch, LibraryStats
 
-SCHEMA_VERSION = "1"
 _SQLITE_PARAM_CHUNK = 800
 
 _VALID_SORT_COLUMNS: Dict[str, str] = {
@@ -67,6 +71,11 @@ def normalize_part_key(part: str) -> str:
     return str(part or "").strip().upper()
 
 
+def _escape_like(value: str) -> str:
+    """Escape SQL LIKE wildcard characters (``\\``, ``%``, ``_``) for ``ESCAPE '\\'``."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def is_group_possible_multipart(records: Sequence[DataRecord]) -> bool:
     """Return True if a group of records sharing a code looks like multi-part files.
 
@@ -83,11 +92,7 @@ def is_group_possible_multipart(records: Sequence[DataRecord]) -> bool:
     return len(part_keys) >= 2
 
 
-class DatabaseError(Exception):
-    """User-friendly database operation error."""
-
-
-class DatabaseRepository:
+class DatabaseRepository(DatabaseBackupMixin):
     """Thread-safe SQLite WAL repository supporting multiple ``.db`` libraries."""
 
     def __init__(
@@ -108,10 +113,6 @@ class DatabaseRepository:
     def db_path(self) -> str:
         """Return the active database file path (or ``':memory:'``)."""
         return self._db_path
-
-    @property
-    def is_memory(self) -> bool:
-        return self._db_path == ":memory:"
 
     @property
     def auto_backup(self) -> bool:
@@ -150,17 +151,20 @@ class DatabaseRepository:
             try:
                 conn = sqlite3.connect(
                     self._db_path,
-                    timeout=15.0,
+                    timeout=_SQLITE_BUSY_TIMEOUT_MS / 1000.0,
                     check_same_thread=False,
                 )
                 conn.row_factory = sqlite3.Row
                 conn.execute("PRAGMA foreign_keys = ON;")
-                conn.execute("PRAGMA busy_timeout = 5000;")
+                conn.execute(f"PRAGMA busy_timeout = {_SQLITE_BUSY_TIMEOUT_MS};")
                 if not self.is_memory:
                     conn.execute("PRAGMA journal_mode = WAL;")
                     conn.execute("PRAGMA synchronous = NORMAL;")
                 self._conn = conn
                 self._init_schema()
+            except DatabaseError:
+                self.close()
+                raise
             except sqlite3.Error as exc:
                 self.close()
                 raise DatabaseError(f"无法打开数据库文件「{self._db_path}」：{exc}") from exc
@@ -182,7 +186,8 @@ class DatabaseRepository:
             if target.exists() and overwrite:
                 self._remove_db_files(target)
             result = self.open(target)
-            assert isinstance(result, Path)
+            if not isinstance(result, Path):
+                raise DatabaseError(f"创建数据库失败：{target}")
             return result
 
     def close(self) -> None:
@@ -191,7 +196,7 @@ class DatabaseRepository:
             if self._conn is not None:
                 try:
                     if not self.is_memory:
-                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
                 except sqlite3.Error:
                     pass
                 try:
@@ -206,62 +211,30 @@ class DatabaseRepository:
 
     def _init_schema(self) -> None:
         conn = self._require_conn()
+        # Guard against opening a database created by a newer schema version.
+        has_meta = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'"
+        ).fetchone()
+        if has_meta is not None:
+            ver_row = conn.execute(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if ver_row is not None:
+                raw_ver = str(ver_row[0]).strip()
+                try:
+                    db_ver = int(raw_ver)
+                except ValueError as exc:
+                    raise DatabaseError(
+                        f"数据库架构版本号异常（{raw_ver!r}），拒绝打开以防数据损坏。"
+                    ) from exc
+                if db_ver > int(SCHEMA_VERSION):
+                    raise DatabaseError(
+                        f"数据库架构版本（v{db_ver}）高于当前程序支持版本（v{SCHEMA_VERSION}），"
+                        "请升级程序后再打开该数据库。"
+                    )
+
+        conn.executescript(_SCHEMA_DDL)
         with conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS schema_meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS import_batches (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    source_name TEXT NOT NULL DEFAULT '',
-                    source_type TEXT NOT NULL DEFAULT 'txt',
-                    total_count INTEGER NOT NULL DEFAULT 0,
-                    added_count INTEGER NOT NULL DEFAULT 0,
-                    duplicate_count INTEGER NOT NULL DEFAULT 0,
-                    unrecognized_count INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS records (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    canonical_code TEXT NOT NULL,
-                    prefix TEXT NOT NULL DEFAULT '',
-                    number TEXT NOT NULL DEFAULT '',
-                    raw_code TEXT NOT NULL DEFAULT '',
-                    raw_text TEXT NOT NULL DEFAULT '',
-                    file_name TEXT NOT NULL DEFAULT '',
-                    full_path TEXT NOT NULL DEFAULT '',
-                    source_name TEXT NOT NULL DEFAULT '',
-                    source_type TEXT NOT NULL DEFAULT 'txt',
-                    file_size INTEGER NOT NULL DEFAULT 0,
-                    file_ext TEXT NOT NULL DEFAULT '',
-                    tags TEXT NOT NULL DEFAULT '',
-                    part TEXT NOT NULL DEFAULT '',
-                    matched_rule TEXT NOT NULL DEFAULT '',
-                    confidence REAL NOT NULL DEFAULT 1.0,
-                    batch_id INTEGER REFERENCES import_batches(id) ON DELETE SET NULL,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    note TEXT NOT NULL DEFAULT ''
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_records_canonical_code
-                    ON records(canonical_code);
-                CREATE INDEX IF NOT EXISTS idx_records_prefix
-                    ON records(prefix);
-                CREATE INDEX IF NOT EXISTS idx_records_source_name
-                    ON records(source_name);
-                CREATE INDEX IF NOT EXISTS idx_records_batch_id
-                    ON records(batch_id);
-                CREATE INDEX IF NOT EXISTS idx_records_created_at
-                    ON records(created_at);
-                CREATE INDEX IF NOT EXISTS idx_records_part
-                    ON records(part);
-                """
-            )
             conn.execute(
                 "INSERT OR REPLACE INTO schema_meta(key, value) VALUES (?, ?)",
                 ("schema_version", SCHEMA_VERSION),
@@ -610,11 +583,24 @@ class DatabaseRepository:
         if not unique_ids:
             return 0
         with self._lock:
+            conn = self._require_conn()
+            has_match = False
+            for i in range(0, len(unique_ids), _SQLITE_PARAM_CHUNK):
+                chunk = unique_ids[i : i + _SQLITE_PARAM_CHUNK]
+                placeholders = ",".join("?" for _ in chunk)
+                if conn.execute(
+                    f"SELECT 1 FROM records WHERE id IN ({placeholders}) LIMIT 1",
+                    chunk,
+                ).fetchone():
+                    has_match = True
+                    break
+            if not has_match:
+                return 0
+
             should_backup = self._auto_backup if create_backup is None else bool(create_backup)
             if should_backup and not self.is_memory:
                 self.create_backup(reason="pre_delete")
 
-            conn = self._require_conn()
             deleted = 0
             with conn:
                 for i in range(0, len(unique_ids), _SQLITE_PARAM_CHUNK):
@@ -635,30 +621,53 @@ class DatabaseRepository:
     ) -> int:
         """Delete all records belonging to a specific import batch."""
         with self._lock:
+            conn = self._require_conn()
+            bid = int(batch_id)
+            has_rows = (
+                conn.execute(
+                    "SELECT 1 FROM records WHERE batch_id = ? LIMIT 1",
+                    (bid,),
+                ).fetchone()
+                is not None
+                or conn.execute(
+                    "SELECT 1 FROM import_batches WHERE id = ? LIMIT 1",
+                    (bid,),
+                ).fetchone()
+                is not None
+            )
+            if not has_rows:
+                return 0
+
             should_backup = self._auto_backup if create_backup is None else bool(create_backup)
             if should_backup and not self.is_memory:
                 self.create_backup(reason="pre_delete_batch")
 
-            conn = self._require_conn()
             with conn:
                 cur = conn.execute(
                     "DELETE FROM records WHERE batch_id = ?",
-                    (int(batch_id),),
+                    (bid,),
                 )
                 conn.execute(
                     "DELETE FROM import_batches WHERE id = ?",
-                    (int(batch_id),),
+                    (bid,),
                 )
             return int(cur.rowcount)
 
     def clear_all_records(self, *, create_backup: Optional[bool] = None) -> int:
         """Remove all records and import batches from the active database."""
         with self._lock:
+            conn = self._require_conn()
+            has_any = (
+                conn.execute("SELECT 1 FROM records LIMIT 1").fetchone() is not None
+                or conn.execute("SELECT 1 FROM import_batches LIMIT 1").fetchone() is not None
+            )
+            if not has_any:
+                return 0
+
             should_backup = self._auto_backup if create_backup is None else bool(create_backup)
             if should_backup and not self.is_memory:
                 self.create_backup(reason="pre_clear")
 
-            conn = self._require_conn()
             with conn:
                 cur = conn.execute("DELETE FROM records")
                 conn.execute("DELETE FROM import_batches")
@@ -682,17 +691,17 @@ class DatabaseRepository:
         params: List[object] = []
 
         if search and search.strip():
-            like_val = f"%{search.strip()}%"
+            like_val = f"%{_escape_like(search.strip())}%"
             clauses.append(
                 "("
-                "r.canonical_code LIKE ? OR "
-                "r.raw_code LIKE ? OR "
-                "r.file_name LIKE ? OR "
-                "r.raw_text LIKE ? OR "
-                "r.full_path LIKE ? OR "
-                "r.source_name LIKE ? OR "
-                "r.tags LIKE ? OR "
-                "r.note LIKE ?"
+                "r.canonical_code LIKE ? ESCAPE '\\' OR "
+                "r.raw_code LIKE ? ESCAPE '\\' OR "
+                "r.file_name LIKE ? ESCAPE '\\' OR "
+                "r.raw_text LIKE ? ESCAPE '\\' OR "
+                "r.full_path LIKE ? ESCAPE '\\' OR "
+                "r.source_name LIKE ? ESCAPE '\\' OR "
+                "r.tags LIKE ? ESCAPE '\\' OR "
+                "r.note LIKE ? ESCAPE '\\'"
                 ")"
             )
             params.extend([like_val] * 8)
@@ -706,8 +715,8 @@ class DatabaseRepository:
             params.append(source_name.strip())
 
         if tag and tag.strip():
-            clauses.append("(',' || r.tags || ',') LIKE ?")
-            params.append(f"%,{tag.strip()},%")
+            clauses.append("(',' || r.tags || ',') LIKE ? ESCAPE '\\'")
+            params.append(f"%,{_escape_like(tag.strip())},%")
 
         if batch_id is not None:
             clauses.append("r.batch_id = ?")
@@ -732,15 +741,13 @@ class DatabaseRepository:
             )
         elif mode == "multipart":
             clauses.append(
-                "("
-                "r.part != '' OR "
                 "r.canonical_code IN ("
                 "SELECT canonical_code FROM records "
                 "WHERE canonical_code != '' "
                 "GROUP BY canonical_code "
-                "HAVING COUNT(*) > 1 AND SUM(CASE WHEN part != '' THEN 1 ELSE 0 END) > 0 "
-                "AND COUNT(DISTINCT UPPER(TRIM(part))) >= 2"
-                ")"
+                "HAVING COUNT(*) > 1 "
+                "AND MAX(UPPER(TRIM(part))) != '' "
+                "AND MIN(UPPER(TRIM(part))) != MAX(UPPER(TRIM(part)))"
                 ")"
             )
 
@@ -778,11 +785,15 @@ class DatabaseRepository:
 
             if sort_col == "dup_cnt":
                 sql = f"""
-                    SELECT r.*, COALESCE(c.cnt, 1) AS dup_cnt
+                    SELECT r.*,
+                           CASE WHEN r.canonical_code = '' THEN 0
+                                ELSE COALESCE(c.cnt, 1)
+                           END AS dup_cnt
                     FROM records r
                     LEFT JOIN (
                         SELECT canonical_code, COUNT(*) AS cnt
                         FROM records
+                        WHERE canonical_code != ''
                         GROUP BY canonical_code
                     ) c ON c.canonical_code = r.canonical_code
                     {where_sql}
@@ -914,24 +925,40 @@ class DatabaseRepository:
             return groups
 
     def get_stats(self) -> LibraryStats:
-        """Compute summary statistics for the active library."""
+        """Compute summary statistics for the active library using SQL aggregates."""
         with self._lock:
             conn = self._require_conn()
-            total_records = int(
-                conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
-            )
-            unique_codes = int(
-                conn.execute(
-                    "SELECT COUNT(DISTINCT canonical_code) FROM records WHERE canonical_code != ''"
-                ).fetchone()[0]
-            )
+            summary = conn.execute(
+                """
+                SELECT
+                    COALESCE(SUM(cnt), 0) AS total_records,
+                    COALESCE(SUM(CASE WHEN canonical_code != '' THEN 1 ELSE 0 END), 0) AS unique_codes,
+                    COALESCE(SUM(CASE WHEN canonical_code != '' AND cnt > 1 THEN 1 ELSE 0 END), 0) AS dup_groups,
+                    COALESCE(SUM(CASE WHEN canonical_code != '' AND cnt > 1 THEN cnt - 1 ELSE 0 END), 0) AS dup_records,
+                    COALESCE(SUM(
+                        CASE
+                            WHEN canonical_code != '' AND cnt > 1
+                                 AND max_part != '' AND min_part != max_part
+                            THEN 1 ELSE 0
+                        END
+                    ), 0) AS mp_groups
+                FROM (
+                    SELECT
+                        canonical_code,
+                        COUNT(*) AS cnt,
+                        MIN(UPPER(TRIM(part))) AS min_part,
+                        MAX(UPPER(TRIM(part))) AS max_part
+                    FROM records
+                    GROUP BY canonical_code
+                )
+                """
+            ).fetchone()
 
-            dup_groups = self.get_duplicate_groups(include_multipart=True)
-            duplicate_groups = len(dup_groups)
-            duplicate_records = sum(g.count - 1 for g in dup_groups)
-            possible_multipart_groups = sum(
-                1 for g in dup_groups if g.is_possible_multipart
-            )
+            total_records = int(summary["total_records"]) if summary else 0
+            unique_codes = int(summary["unique_codes"]) if summary else 0
+            duplicate_groups = int(summary["dup_groups"]) if summary else 0
+            duplicate_records = int(summary["dup_records"]) if summary else 0
+            possible_multipart_groups = int(summary["mp_groups"]) if summary else 0
 
             prefix_rows = conn.execute(
                 """
@@ -952,115 +979,3 @@ class DatabaseRepository:
                 possible_multipart_groups=possible_multipart_groups,
                 prefix_counts=prefix_counts,
             )
-
-    # ------------------------------------------------------------------
-    # Rolling .bak backup & restore
-    # ------------------------------------------------------------------
-
-    def get_backup_dir(self) -> Optional[Path]:
-        if self.is_memory:
-            return None
-        return Path(self._db_path).parent / "backups"
-
-    def create_backup(
-        self,
-        reason: str = "manual",
-        *,
-        protect_paths: Optional[Iterable[Path]] = None,
-    ) -> Optional[Path]:
-        """Create a consistent SQLite ``.bak`` snapshot and prune older backups."""
-        with self._lock:
-            if self.is_memory:
-                return None
-            src_path = Path(self._db_path)
-            if not src_path.exists():
-                return None
-
-            conn = self._require_conn()
-            backup_dir = src_path.parent / "backups"
-            backup_dir.mkdir(parents=True, exist_ok=True)
-
-            safe_reason = "".join(
-                ch if (ch.isalnum() or ch in ("_", "-")) else "_"
-                for ch in (reason or "manual")
-            )[:32]
-            stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            backup_path = backup_dir / f"{src_path.stem}_{stamp}_{safe_reason}.db.bak"
-
-            dst_conn = sqlite3.connect(str(backup_path))
-            try:
-                conn.backup(dst_conn)
-            finally:
-                dst_conn.close()
-
-            self._prune_backups(backup_dir, src_path.stem, protect_paths=protect_paths)
-            return backup_path
-
-    def _prune_backups(
-        self,
-        backup_dir: Path,
-        db_stem: str,
-        *,
-        protect_paths: Optional[Iterable[Path]] = None,
-    ) -> None:
-        protected = {p.resolve() for p in (protect_paths or ())}
-        pattern = f"{db_stem}_*.db.bak"
-        backups = sorted(
-            backup_dir.glob(pattern),
-            key=lambda p: (p.stat().st_mtime, p.name),
-            reverse=True,
-        )
-        for old_file in backups[self._backup_keep_count :]:
-            if old_file.resolve() in protected:
-                continue
-            try:
-                old_file.unlink()
-            except OSError:
-                pass
-
-    def list_backups(self) -> List[Path]:
-        """List existing ``.bak`` snapshots for the current database, newest first."""
-        if self.is_memory:
-            return []
-        src_path = Path(self._db_path)
-        backup_dir = src_path.parent / "backups"
-        if not backup_dir.exists():
-            return []
-        pattern = f"{src_path.stem}_*.db.bak"
-        return sorted(
-            backup_dir.glob(pattern),
-            key=lambda p: (p.stat().st_mtime, p.name),
-            reverse=True,
-        )
-
-    def restore_backup(self, backup_path: str | Path) -> Path:
-        """Restore the current database from a ``.bak`` file safely."""
-        if self.is_memory:
-            raise DatabaseError("内存数据库不支持备份恢复。")
-        bak = Path(backup_path).expanduser().resolve()
-        if not bak.is_file():
-            raise DatabaseError(f"备份文件不存在：{bak}")
-
-        with self._lock:
-            target = Path(self._db_path)
-            if target.exists():
-                self.create_backup(reason="pre_restore", protect_paths=[bak])
-            self.close()
-            try:
-                self._remove_db_files(target)
-                shutil.copy2(bak, target)
-            except OSError as exc:
-                raise DatabaseError(f"恢复备份失败：{exc}") from exc
-            finally:
-                self.open(target)
-            return target
-
-    @staticmethod
-    def _remove_db_files(target: Path) -> None:
-        for suffix in ("", "-wal", "-shm"):
-            p = Path(f"{target}{suffix}")
-            if p.exists():
-                try:
-                    p.unlink()
-                except OSError:
-                    pass
