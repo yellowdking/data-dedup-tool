@@ -24,7 +24,11 @@ from PySide6.QtWidgets import (
 
 from src.core.dedup import commit_preview, preview_import
 from src.core.models import DedupPreview, ParseResult, ScannedItem
-from src.core.scanner import scan_file, scan_folder
+from src.core.scanner import (
+    SUPPORTED_DOCUMENT_EXTENSIONS,
+    scan_document_file,
+    scan_folder,
+)
 from src.ui.app_context import AppContext
 from src.ui.table_models import PreviewTableModel
 from src.ui.widgets import DropZoneWidget, ScrollableDetailDialog, WorkerThread
@@ -55,13 +59,14 @@ class ImportView(QWidget):
 
         # Drag-and-drop source zone
         self._drop_zone = DropZoneWidget(
-            title="拖拽多个 TXT / 目录树 / CSV 清单文件，或本地文件夹到此处",
-            subtitle="自动探测 UTF-8 / GBK / Shift-JIS 编码与 tree/Everything/dir 目录结构，先预演再入库",
+            title="拖入 TXT、Word (.docx)、Excel (.xlsx)、CSV 或文件夹",
+            subtitle="支持 Word 段落/表格、多 Sheet Excel、CSV/TSV 及目录树清单，自动识别编码并先预演再入库",
             allow_dirs=True,
+            allowed_exts=set(SUPPORTED_DOCUMENT_EXTENSIONS),
         )
         self._drop_zone.paths_dropped.connect(self._on_paths_added)
 
-        btn_files = QPushButton("选择 TXT / 目录树 / CSV 文件")
+        btn_files = QPushButton("选择文件 (TXT / Word / Excel / CSV)")
         btn_files.setProperty("variant", "primary")
         btn_files.clicked.connect(self._pick_files)
         self._drop_zone.add_action_button(btn_files)
@@ -114,7 +119,7 @@ class ImportView(QWidget):
         root.addWidget(ctrl_card)
 
         # Summary strip
-        self._summary_label = QLabel("尚未导入文件 — 请拖入或选择 TXT/目录树/CSV 文件或本地文件夹")
+        self._summary_label = QLabel("尚未导入文件 — 请拖入或选择 TXT、Word (.docx)、Excel (.xlsx)、CSV 文件或本地文件夹")
         self._summary_label.setProperty("role", "subtitle")
         root.addWidget(self._summary_label)
 
@@ -174,16 +179,24 @@ class ImportView(QWidget):
         tv.verticalHeader().setVisible(False)
         tv.horizontalHeader().setStretchLastSection(True)
         tv.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        tv.setColumnWidth(0, 165 if editable else 145)
-        tv.setColumnWidth(1, 280 if editable else 120)
         if not editable:
             tv.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-            tv.setColumnWidth(4, 280)
+            if model._mode == "db_dup":
+                widths = [118, 175, 195, 70, 52, 200]
+            else:
+                widths = [118, 62, 70, 52, 205, 112, 200]
+            for idx, w in enumerate(widths):
+                if idx < model.columnCount():
+                    tv.setColumnWidth(idx, w)
         else:
             tv.setEditTriggers(
                 QAbstractItemView.EditTrigger.DoubleClicked
                 | QAbstractItemView.EditTrigger.EditKeyPressed
             )
+            widths = [155, 225, 110, 195, 150]
+            for idx, w in enumerate(widths):
+                if idx < model.columnCount():
+                    tv.setColumnWidth(idx, w)
         return tv
 
     def _on_toggle_companion(self, checked: bool) -> None:
@@ -194,9 +207,11 @@ class ImportView(QWidget):
         start_dir = self.ctx.config.default_import_dir or str(Path.home())
         paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "选择要导入的清单文件（支持多选）",
+            "选择要导入的文件（支持多选）",
             start_dir,
-            "清单文件 (*.txt *.csv *.efu *.log);;所有文件 (*.*)",
+            "支持的文档与清单 (*.txt *.docx *.xlsx *.xlsm *.csv *.tsv *.efu *.log);;"
+            "Word 文档 (*.docx);;Excel 表格 (*.xlsx *.xlsm);;"
+            "文本与 CSV (*.txt *.csv *.tsv *.efu *.log);;所有文件 (*.*)",
         )
         if paths:
             self.ctx.config.default_import_dir = str(Path(paths[0]).parent)
@@ -250,7 +265,7 @@ class ImportView(QWidget):
                         )
                     )
                 elif p.is_file():
-                    scanned.extend(scan_file(p, companion_extensions=comp_exts))
+                    scanned.extend(scan_document_file(p, companion_extensions=comp_exts))
 
             total_scanned = len(scanned)
             skipped = 0
@@ -355,13 +370,32 @@ class ImportView(QWidget):
         self._btn_commit_new.setEnabled(new_count > 0)
         self._btn_commit_all.setEnabled(all_count > 0)
 
+    @staticmethod
+    def _infer_source_type(paths: list[str]) -> str:
+        if any(Path(p).is_dir() for p in paths):
+            return "folder"
+        kinds: set[str] = set()
+        for p in paths:
+            ext = Path(p).suffix.lower()
+            if ext == ".docx":
+                kinds.add("word")
+            elif ext in {".xlsx", ".xlsm"}:
+                kinds.add("excel")
+            elif ext in {".csv", ".tsv", ".efu"}:
+                kinds.add("csv")
+            else:
+                kinds.add("txt")
+        if len(kinds) == 1:
+            return next(iter(kinds))
+        return "mixed" if kinds else "txt"
+
     def _commit(self, include_duplicates: bool) -> None:
         if not self._current_preview:
             return
         fixed = self._manually_fixed_items()
         source_names = [Path(p).name for p in self._queued_paths]
         source_label = ", ".join(source_names[:3]) + (" 等" if len(source_names) > 3 else "")
-        source_type = "folder" if any(Path(p).is_dir() for p in self._queued_paths) else "txt"
+        source_type = self._infer_source_type(self._queued_paths)
 
         saved, _batch = commit_preview(
             self._current_preview,
@@ -388,7 +422,7 @@ class ImportView(QWidget):
         self._tabs.setTabText(1, "库内重复 (0)")
         self._tabs.setTabText(2, "批内重复 (0)")
         self._tabs.setTabText(3, "未识别与待确认 (0)")
-        self._summary_label.setText("尚未导入文件 — 请拖入或选择 TXT/目录树/CSV 文件或本地文件夹")
+        self._summary_label.setText("尚未导入文件 — 请拖入或选择 TXT、Word (.docx)、Excel (.xlsx)、CSV 文件或本地文件夹")
         self._fixed_count_label.setText("")
         self._btn_rescan.setEnabled(False)
         self._btn_commit_new.setEnabled(False)
