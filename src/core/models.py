@@ -63,30 +63,35 @@ class CustomRule:
 
     @classmethod
     def from_dict(cls, data: dict) -> "CustomRule":
+        raw_priority = data.get("priority", 5)
+        try:
+            priority = int(raw_priority)
+        except (TypeError, ValueError):
+            priority = 5
         return cls(
-            id=str(data.get("id", "")),
-            name=str(data.get("name", "")),
-            pattern=str(data.get("pattern", "")),
-            format_template=str(data.get("format_template", "")),
-            priority=int(data.get("priority", 5)),
+            id=str(data.get("id", "") or "").strip(),
+            name=str(data.get("name", "") or ""),
+            pattern=str(data.get("pattern", "") or ""),
+            format_template=str(data.get("format_template", "") or ""),
+            priority=priority,
             enabled=bool(data.get("enabled", True)),
             is_builtin=bool(data.get("is_builtin", False)),
-            category=str(data.get("category", "自定义")),
-            description=str(data.get("description", "")),
-            example=str(data.get("example", "")),
+            category=str(data.get("category", "自定义") or "自定义"),
+            description=str(data.get("description", "") or ""),
+            example=str(data.get("example", "") or ""),
         )
 
 
 @dataclass
 class ScannedItem:
-    """Raw item produced by TXT/tree/CSV/folder scanners prior to code parsing."""
+    """Raw item produced by TXT/tree/CSV/TSV/Word/Excel/folder scanners prior to code parsing."""
 
     raw_text: str
     file_name: str = ""
     parent_dir: str = ""
     full_path: str = ""
     source_name: str = ""
-    source_type: str = "txt"  # "txt" | "folder" | "tree" | "csv" | "paste"
+    source_type: str = "txt"  # "txt" | "folder" | "tree" | "csv" | "tsv" | "word" | "excel" | "paste"
     line_number: int = 0
     file_size: int = 0
     file_ext: str = ""

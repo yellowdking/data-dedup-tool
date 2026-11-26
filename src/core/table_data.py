@@ -191,12 +191,18 @@ class TableDuplicateGroup:
 
     def __post_init__(self) -> None:
         if not self.table_names and self.rows:
-            self.table_names = list(dict.fromkeys(r.table_name for r in self.rows))
+            seen_tids: set[str] = set()
+            names: list[str] = []
+            for r in self.rows:
+                if r.table_id not in seen_tids:
+                    seen_tids.add(r.table_id)
+                    names.append(r.table_name)
+            self.table_names = names
         if not self.table_count:
-            if self.table_names:
-                self.table_count = len(self.table_names)
-            elif self.rows:
+            if self.rows:
                 self.table_count = len({r.table_id for r in self.rows})
+            elif self.table_names:
+                self.table_count = len(self.table_names)
         if not self.total_rows and self.rows:
             self.total_rows = len(self.rows)
 
@@ -234,6 +240,10 @@ class TableMergeConfig:
     add_extracted_code_column: bool = False
     ignore_case: bool = True
     strip_whitespace: bool = True
+    ignore_punctuation: bool = False
+    scan_all_columns_for_code: bool = True
+    join_match_mode: str = "all"  # "all" | "first"
+    max_join_rows: int = 200_000
 
 
 @dataclass

@@ -17,6 +17,8 @@ from .table_dedup import (
 from .table_merge import (
     ALIGN_MODE_BY_HEADER,
     ALIGN_MODE_BY_POSITION,
+    JOIN_MATCH_ALL,
+    JOIN_MATCH_FIRST,
     JOIN_TYPE_INNER,
     JOIN_TYPE_LEFT,
     JOIN_TYPE_OUTER,
@@ -49,6 +51,8 @@ __all__ = [
     "JOIN_TYPE_LEFT",
     "JOIN_TYPE_INNER",
     "JOIN_TYPE_OUTER",
+    "JOIN_MATCH_ALL",
+    "JOIN_MATCH_FIRST",
     "KEEP_STRATEGY_LABELS",
     "run_multi_table_dedup",
     "merge_tables",
