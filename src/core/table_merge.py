@@ -33,11 +33,12 @@ from .table_dedup import (
     DEDUP_MODE_COLUMN_VALUE,
     DEDUP_MODE_SMART_CODE,
     _VALID_DEDUP_MODES,
-    _extract_column_value_key,
+    _extract_column_value_key_parts,
     _extract_smart_code_for_row,
     _find_common_headers,
     _make_unique_header,
     _pad_row,
+    _resolve_explicit_key_columns,
     _resolve_table_key_columns,
 )
 
@@ -58,6 +59,9 @@ JOIN_TYPE_LEFT = "left"
 JOIN_TYPE_INNER = "inner"
 JOIN_TYPE_OUTER = "outer"
 
+JOIN_MATCH_ALL = "all"
+JOIN_MATCH_FIRST = "first"
+
 KEEP_STRATEGY_LABELS: Dict[str, str] = {
     KEEP_STRATEGY_FIRST: "保留首条",
     KEEP_STRATEGY_LAST: "保留末条",
@@ -76,6 +80,7 @@ _VALID_KEEP_STRATEGIES = {
     KEEP_STRATEGY_COALESCE,
 }
 _VALID_JOIN_TYPES = {JOIN_TYPE_LEFT, JOIN_TYPE_INNER, JOIN_TYPE_OUTER}
+_VALID_JOIN_MATCH_MODES = {JOIN_MATCH_ALL, JOIN_MATCH_FIRST}
 
 
 # ----------------------------------------------------------------------
@@ -91,6 +96,7 @@ class _AlignedRowEntry:
     order_seq: int
     aligned_values: List[str]
     raw_row_ref: TableRowRef
+    match_key: Tuple[str, ...]
     key_value: str
     parsed_code: str
     tags: List[str]
@@ -267,8 +273,7 @@ def _select_group_keeper(
     if strategy == KEEP_STRATEGY_COALESCE:
         base = group[0]
         merged_vals = list(base.aligned_values)
-        contributing_sources: List[str] = [base.table_name]
-        contributing_rows: List[str] = [str(base.row_index)]
+        contributing_pairs: List[Tuple[str, int]] = [(base.table_name, base.row_index)]
         for candidate in group[1:]:
             contributed = False
             for col_idx in range(len(merged_vals)):
@@ -282,15 +287,19 @@ def _select_group_keeper(
                         merged_vals[col_idx] = cand_val
                         contributed = True
             if contributed:
-                if candidate.table_name not in contributing_sources:
-                    contributing_sources.append(candidate.table_name)
-                contributing_rows.append(str(candidate.row_index))
+                contributing_pairs.append((candidate.table_name, candidate.row_index))
+
+        distinct_sources = list(dict.fromkeys(t for t, _ in contributing_pairs))
+        if len(contributing_pairs) > 1:
+            row_idx_label = " / ".join(f"{t}#{r}" for t, r in contributing_pairs)
+        else:
+            row_idx_label = str(base.row_index)
         return (
             merged_vals,
             base,
             list(group[1:]),
-            " / ".join(contributing_sources),
-            " / ".join(contributing_rows),
+            " / ".join(distinct_sources),
+            row_idx_label,
         )
 
     raise ValueError(f"不支持的去重保留策略：{strategy}")
@@ -323,27 +332,21 @@ def _merge_vertical(
         col_n = len(headers_copy)
 
         explicit_smart_cols: List[int] = []
+        has_explicit_smart = False
         col_val_indices: List[int] = []
         if cfg.mode == MERGE_MODE_UNION_DEDUP:
             if cfg.dedup_mode == DEDUP_MODE_SMART_CODE:
-                raw_spec = (
-                    cfg.key_columns.get(tbl.table_id)
-                    or cfg.key_columns.get(tbl.name)
-                    or cfg.key_columns.get("*")
+                explicit_smart_cols, has_explicit_smart = _resolve_explicit_key_columns(
+                    tbl, cfg.key_columns
                 )
-                if isinstance(raw_spec, str) and raw_spec.strip():
-                    idx = tbl.get_column_index(raw_spec.strip())
-                    if idx >= 0:
-                        explicit_smart_cols.append(idx)
-                elif isinstance(raw_spec, (list, tuple)):
-                    for cn in raw_spec:
-                        idx = tbl.get_column_index(str(cn).strip())
-                        if idx >= 0 and idx not in explicit_smart_cols:
-                            explicit_smart_cols.append(idx)
             else:
                 col_val_indices = _resolve_table_key_columns(
                     tbl, cfg.key_columns, fallback_headers=common_headers
                 )
+        elif cfg.add_extracted_code_column:
+            explicit_smart_cols, has_explicit_smart = _resolve_explicit_key_columns(
+                tbl, cfg.key_columns
+            )
 
         for idx_0, raw_row in enumerate(tbl.rows):
             row_idx_1 = idx_0 + 1
@@ -357,6 +360,7 @@ def _merge_vertical(
             tags: List[str] = []
             part = ""
             key_val = ""
+            match_key: Tuple[str, ...] = ()
 
             if active_parser is not None and (
                 cfg.add_extracted_code_column
@@ -371,20 +375,23 @@ def _merge_vertical(
                     row_idx_1,
                     active_parser,
                     preferred_col_indices=explicit_smart_cols,
-                    scan_all_columns=True,
+                    scan_all_columns=cfg.scan_all_columns_for_code,
+                    has_explicit_columns=has_explicit_smart,
                 )
                 parsed_code = extracted.parsed_code
                 tags = list(extracted.tags)
                 part = extracted.part
                 if cfg.mode == MERGE_MODE_UNION_DEDUP and cfg.dedup_mode == DEDUP_MODE_SMART_CODE:
                     key_val = extracted.key_value
+                    match_key = (key_val,) if key_val else ()
 
             if cfg.mode == MERGE_MODE_UNION_DEDUP and cfg.dedup_mode == DEDUP_MODE_COLUMN_VALUE:
-                key_val = _extract_column_value_key(
+                match_key, key_val = _extract_column_value_key_parts(
                     row_vals,
                     col_val_indices,
                     ignore_case=cfg.ignore_case,
                     strip_whitespace=cfg.strip_whitespace,
+                    ignore_punctuation=cfg.ignore_punctuation,
                 )
                 if not tags and cfg.keep_strategy == KEEP_STRATEGY_HIGHEST_TAG_SCORE:
                     tags = extract_tags(" ".join(v for v in row_vals if v))
@@ -408,6 +415,7 @@ def _merge_vertical(
                     order_seq=seq,
                     aligned_values=aligned,
                     raw_row_ref=ref,
+                    match_key=match_key,
                     key_value=key_val,
                     parsed_code=parsed_code,
                     tags=tags,
@@ -450,19 +458,19 @@ def _merge_vertical(
         )
 
     slots: List[Tuple[str, Any]] = []
-    grouped: Dict[str, List[_AlignedRowEntry]] = {}
+    grouped: Dict[Tuple[str, ...], List[_AlignedRowEntry]] = {}
     unrecognized_kept = 0
 
     for entry in entries:
-        if not entry.key_value:
+        if not entry.match_key:
             slots.append(("raw", entry))
             unrecognized_kept += 1
             continue
-        if entry.key_value not in grouped:
-            grouped[entry.key_value] = [entry]
-            slots.append(("key", entry.key_value))
+        if entry.match_key not in grouped:
+            grouped[entry.match_key] = [entry]
+            slots.append(("key", entry.match_key))
         else:
-            grouped[entry.key_value].append(entry)
+            grouped[entry.match_key].append(entry)
 
     out_rows = []
     dropped_refs: List[TableRowRef] = []
@@ -542,12 +550,13 @@ def _merge_vertical(
 
 @dataclass
 class _JoinRowRecord:
+    match_key: Tuple[str, ...]
     key: str
     cells: List[str]
     source_names: List[str]
     row_index_label: str
     parsed_code: str
-    origin_ref: TableRowRef
+    origin_refs: List[TableRowRef]
 
 
 def _extract_join_entries(
@@ -561,22 +570,12 @@ def _extract_join_entries(
     col_n = len(headers_copy)
 
     explicit_smart_cols: List[int] = []
+    has_explicit_smart = False
     col_val_indices: List[int] = []
     if cfg.dedup_mode == DEDUP_MODE_SMART_CODE:
-        raw_spec = (
-            cfg.key_columns.get(tbl.table_id)
-            or cfg.key_columns.get(tbl.name)
-            or cfg.key_columns.get("*")
+        explicit_smart_cols, has_explicit_smart = _resolve_explicit_key_columns(
+            tbl, cfg.key_columns
         )
-        if isinstance(raw_spec, str) and raw_spec.strip():
-            idx = tbl.get_column_index(raw_spec.strip())
-            if idx >= 0:
-                explicit_smart_cols.append(idx)
-        elif isinstance(raw_spec, (list, tuple)):
-            for cn in raw_spec:
-                idx = tbl.get_column_index(str(cn).strip())
-                if idx >= 0 and idx not in explicit_smart_cols:
-                    explicit_smart_cols.append(idx)
     else:
         col_val_indices = _resolve_table_key_columns(
             tbl, cfg.key_columns, fallback_headers=common_headers
@@ -589,27 +588,32 @@ def _extract_join_entries(
         parsed_code = ""
         tags_str = ""
         part = ""
+        match_key: Tuple[str, ...] = ()
 
         if cfg.dedup_mode == DEDUP_MODE_SMART_CODE:
-            assert parser is not None
+            if parser is None:
+                parser = CodeParser()
             ext = _extract_smart_code_for_row(
                 tbl,
                 vals,
                 row_idx_1,
                 parser,
                 preferred_col_indices=explicit_smart_cols,
-                scan_all_columns=True,
+                scan_all_columns=cfg.scan_all_columns_for_code,
+                has_explicit_columns=has_explicit_smart,
             )
             key_val = ext.key_value
+            match_key = (key_val,) if key_val else ()
             parsed_code = ext.parsed_code
             tags_str = ext.tags_str
             part = ext.part
         else:
-            key_val = _extract_column_value_key(
+            match_key, key_val = _extract_column_value_key_parts(
                 vals,
                 col_val_indices,
                 ignore_case=cfg.ignore_case,
                 strip_whitespace=cfg.strip_whitespace,
+                ignore_punctuation=cfg.ignore_punctuation,
             )
             if cfg.add_extracted_code_column and parser is not None:
                 ext = _extract_smart_code_for_row(
@@ -632,12 +636,13 @@ def _extract_join_entries(
         )
         records.append(
             _JoinRowRecord(
+                match_key=match_key,
                 key=key_val,
                 cells=vals,
                 source_names=[tbl.name],
                 row_index_label=str(row_idx_1),
                 parsed_code=parsed_code,
-                origin_ref=ref,
+                origin_refs=[ref],
             )
         )
     return records
@@ -651,6 +656,12 @@ def _merge_join(
     """Execute horizontal left/inner/outer join anchored on primary table."""
     if cfg.join_type not in _VALID_JOIN_TYPES:
         raise ValueError(f"不支持的横向拼接类型：{cfg.join_type}")
+    match_mode = (cfg.join_match_mode or JOIN_MATCH_ALL).strip().lower()
+    if match_mode not in _VALID_JOIN_MATCH_MODES:
+        raise ValueError(f"不支持的横向拼接匹配模式：{cfg.join_match_mode}")
+    max_join_rows = int(cfg.max_join_rows)
+    if max_join_rows <= 0:
+        raise ValueError(f"横向拼接最大行数上限必须为正整数：{cfg.max_join_rows}")
 
     need_parser = (
         cfg.dedup_mode == DEDUP_MODE_SMART_CODE or cfg.add_extracted_code_column
@@ -688,72 +699,94 @@ def _merge_join(
 
     working = _extract_join_entries(primary, cfg, active_parser, common_headers)
     current_width = primary.col_count
-    dropped_refs: List[TableRowRef] = []
+    all_input_refs: List[TableRowRef] = [w.origin_refs[0] for w in working]
+
+    def _guard_row_limit(count: int) -> None:
+        if count > max_join_rows:
+            raise ValueError(
+                f"横向拼接结果行数已超过安全上限（{max_join_rows:,} 行），可能由多对多重复键引起笛卡尔积膨胀。"
+                "请先对源表去重、改用“仅匹配首条(first)”模式，或适当调高 max_join_rows 后重试。"
+            )
+
+    _guard_row_limit(len(working))
 
     for sec in secondaries:
         sec_entries = _extract_join_entries(sec, cfg, active_parser, common_headers)
+        all_input_refs.extend(s_rec.origin_refs[0] for s_rec in sec_entries)
         sec_width = sec.col_count
-        sec_index: Dict[str, List[Tuple[int, _JoinRowRecord]]] = {}
+        sec_index: Dict[Tuple[str, ...], List[Tuple[int, _JoinRowRecord]]] = {}
         for pos, s_rec in enumerate(sec_entries):
-            if s_rec.key:
-                sec_index.setdefault(s_rec.key, []).append((pos, s_rec))
+            if s_rec.match_key:
+                sec_index.setdefault(s_rec.match_key, []).append((pos, s_rec))
 
         matched_sec_positions: set[int] = set()
         next_working: List[_JoinRowRecord] = []
 
         for left_rec in working:
-            matches = sec_index.get(left_rec.key, []) if left_rec.key else []
+            matches = sec_index.get(left_rec.match_key, []) if left_rec.match_key else []
             if matches:
-                for pos, right_rec in matches:
+                chosen_matches = matches[:1] if match_mode == JOIN_MATCH_FIRST else matches
+                for pos, right_rec in chosen_matches:
                     matched_sec_positions.add(pos)
                     merged_sources = list(left_rec.source_names)
                     if sec.name not in merged_sources:
                         merged_sources.append(sec.name)
+                    _guard_row_limit(len(next_working) + 1)
                     next_working.append(
                         _JoinRowRecord(
+                            match_key=left_rec.match_key,
                             key=left_rec.key,
                             cells=left_rec.cells + right_rec.cells,
                             source_names=merged_sources,
                             row_index_label=left_rec.row_index_label,
                             parsed_code=left_rec.parsed_code or right_rec.parsed_code,
-                            origin_ref=left_rec.origin_ref,
+                            origin_refs=left_rec.origin_refs + right_rec.origin_refs,
                         )
                     )
             else:
                 if cfg.join_type in (JOIN_TYPE_LEFT, JOIN_TYPE_OUTER):
+                    _guard_row_limit(len(next_working) + 1)
                     next_working.append(
                         _JoinRowRecord(
+                            match_key=left_rec.match_key,
                             key=left_rec.key,
                             cells=left_rec.cells + ([""] * sec_width),
                             source_names=list(left_rec.source_names),
                             row_index_label=left_rec.row_index_label,
                             parsed_code=left_rec.parsed_code,
-                            origin_ref=left_rec.origin_ref,
+                            origin_refs=list(left_rec.origin_refs),
                         )
                     )
-                else:
-                    dropped_refs.append(left_rec.origin_ref)
 
         if cfg.join_type == JOIN_TYPE_OUTER:
             for pos, right_rec in enumerate(sec_entries):
                 if pos not in matched_sec_positions:
+                    _guard_row_limit(len(next_working) + 1)
                     next_working.append(
                         _JoinRowRecord(
+                            match_key=right_rec.match_key,
                             key=right_rec.key,
                             cells=([""] * current_width) + right_rec.cells,
                             source_names=[sec.name],
-                            row_index_label="",
+                            row_index_label=right_rec.row_index_label,
                             parsed_code=right_rec.parsed_code,
-                            origin_ref=right_rec.origin_ref,
+                            origin_refs=list(right_rec.origin_refs),
                         )
                     )
-        else:
-            for pos, right_rec in enumerate(sec_entries):
-                if pos not in matched_sec_positions:
-                    dropped_refs.append(right_rec.origin_ref)
 
         working = next_working
         current_width += sec_width
+
+    surviving_keys = {
+        (ref.table_id, ref.row_index)
+        for w in working
+        for ref in w.origin_refs
+    }
+    dropped_refs: List[TableRowRef] = [
+        ref
+        for ref in all_input_refs
+        if (ref.table_id, ref.row_index) not in surviving_keys
+    ]
 
     out_headers, _ = _append_meta_headers(data_headers, cfg)
     out_rows = [
@@ -852,7 +885,7 @@ def merge_tables(
 # ----------------------------------------------------------------------
 
 _CODE_COL_HINTS = ("_标准编码", "标准编码", "编码", "编号", "code", "canonical_code")
-_FILENAME_COL_HINTS = ("原始文件名", "文件名", "名称", "标题", "file_name", "name")
+_FILENAME_COL_HINTS = ("原始文件名", "原始名称", "文件名", "名称", "标题", "file_name", "name")
 _PATH_COL_HINTS = ("完整路径", "路径", "full_path", "path")
 _TAGS_COL_HINTS = ("标签", "tags")
 _PART_COL_HINTS = ("分集", "part")
@@ -877,11 +910,37 @@ def import_table_to_database(
     source_name: str = "",
     *,
     skip_existing: bool = True,
+    fallback_scan_all: bool = True,
 ) -> Dict[str, Any]:
     """Convert a ``DataTable`` into ``DataRecord``s and write them to ``DatabaseRepository``."""
     parser = parser_engine or CodeParser()
     eff_source_name = (source_name or table.name or "表格导入").strip()
     eff_source_type = table.source_type or "merged"
+
+    preferred_cols: List[int] = []
+    has_explicit_code_col = False
+    if code_column is not None and code_column != "":
+        has_explicit_code_col = True
+        if isinstance(code_column, int) and not isinstance(code_column, bool):
+            if 0 <= code_column < table.col_count:
+                preferred_cols = [code_column]
+            else:
+                raise ValueError(
+                    f"指定的编码列索引超出范围：{code_column}（当前表共 {table.col_count} 列）"
+                )
+        else:
+            col_name = str(code_column).strip()
+            idx = table.get_column_index(col_name)
+            if idx >= 0:
+                preferred_cols = [idx]
+            else:
+                raise ValueError(f"表格「{table.name}」中不存在指定的编码列：{col_name}")
+        scan_all = bool(fallback_scan_all)
+    else:
+        hint_idx = _find_hint_column(table.headers, _CODE_COL_HINTS)
+        if hint_idx >= 0:
+            preferred_cols = [hint_idx]
+        scan_all = bool(fallback_scan_all) if preferred_cols else True
 
     if table.row_count == 0:
         return {
@@ -894,23 +953,6 @@ def import_table_to_database(
             "unrecognized": 0,
             "batch_id": None,
         }
-
-    preferred_cols: List[int] = []
-    scan_all = True
-    if code_column is not None and code_column != "":
-        if isinstance(code_column, int):
-            if 0 <= code_column < table.col_count:
-                preferred_cols = [code_column]
-                scan_all = False
-        else:
-            idx = table.get_column_index(str(code_column).strip())
-            if idx >= 0:
-                preferred_cols = [idx]
-                scan_all = False
-    else:
-        hint_idx = _find_hint_column(table.headers, _CODE_COL_HINTS)
-        if hint_idx >= 0:
-            preferred_cols = [hint_idx]
 
     fname_idx = _find_hint_column(table.headers, _FILENAME_COL_HINTS)
     path_idx = _find_hint_column(table.headers, _PATH_COL_HINTS)
@@ -933,6 +975,7 @@ def import_table_to_database(
             parser,
             preferred_col_indices=preferred_cols,
             scan_all_columns=scan_all,
+            has_explicit_columns=has_explicit_code_col,
         )
 
         if extracted.parse_result is not None and extracted.parsed_code:
@@ -957,7 +1000,7 @@ def import_table_to_database(
                     if t not in res.tags:
                         res.tags.append(t)
 
-            if part_idx >= 0 and row_vals[part_idx].strip() and not res.part:
+            if part_idx >= 0 and row_vals[part_idx].strip():
                 res.part = row_vals[part_idx].strip().upper()
 
             if note_idx >= 0 and row_vals[note_idx].strip():
