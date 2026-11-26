@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import dataclasses
+import inspect
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QModelIndex, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -25,13 +27,14 @@ from src.core.table_data import (
     DataTable,
     TableMergeConfig,
     TableMergeResult,
+    TableRowRef,
 )
 from src.core.table_engine import (
     import_table_to_database,
     merge_tables,
 )
 from src.ui.tables_widgets import _PerTableKeyDialog, _format_row_summary
-from src.ui.widgets import ScrollableDetailDialog, WorkerThread
+from src.ui.widgets import ScrollableDetailDialog
 
 
 class TablesMergeTabMixin:
@@ -50,7 +53,7 @@ class TablesMergeTabMixin:
         cfg_layout.setContentsMargins(12, 10, 12, 10)
         cfg_layout.setSpacing(8)
 
-        # Row 1: Merge mode + alignment / join controls + run CTA
+        # Row 1: Merge mode + alignment / join controls + cancel + run CTA
         r1 = QHBoxLayout()
         r1.setSpacing(7)
 
@@ -89,6 +92,13 @@ class TablesMergeTabMixin:
         self._merge_join_combo.setMinimumWidth(78)
         r1.addWidget(self._merge_join_combo)
 
+        self._merge_join_match_combo = QComboBox()
+        self._merge_join_match_combo.addItem("全部匹配", "all")
+        self._merge_join_match_combo.addItem("仅首条匹配", "first")
+        self._merge_join_match_combo.setToolTip("当右表存在重复键时，选择保留全部笛卡尔匹配或仅取首条匹配")
+        self._merge_join_match_combo.setMinimumWidth(92)
+        r1.addWidget(self._merge_join_match_combo)
+
         self._merge_primary_lbl = QLabel("主表：")
         self._merge_primary_lbl.setProperty("role", "subtitle")
         r1.addWidget(self._merge_primary_lbl)
@@ -97,6 +107,12 @@ class TablesMergeTabMixin:
         self._merge_primary_combo.setMinimumWidth(96)
         self._merge_primary_combo.setMaximumWidth(155)
         r1.addWidget(self._merge_primary_combo)
+
+        self._btn_merge_cols = QPushButton("列管理")
+        self._btn_merge_cols.setProperty("compact", True)
+        self._btn_merge_cols.setToolTip("管理当前选中表的列名与列筛选，合并前快速对齐不一致列名")
+        self._btn_merge_cols.clicked.connect(lambda: self._open_column_manager(self.active_table()))
+        r1.addWidget(self._btn_merge_cols)
 
         r1.addStretch()
 
@@ -107,10 +123,17 @@ class TablesMergeTabMixin:
         self._merge_progress.setVisible(False)
         r1.addWidget(self._merge_progress)
 
+        self._btn_cancel_merge = QPushButton("取消")
+        self._btn_cancel_merge.setProperty("compact", True)
+        self._btn_cancel_merge.setProperty("variant", "danger")
+        self._btn_cancel_merge.setVisible(False)
+        self._btn_cancel_merge.clicked.connect(self._cancel_merge)
+        r1.addWidget(self._btn_cancel_merge)
+
         self._btn_run_merge = QPushButton("▶ 合并预览")
         self._btn_run_merge.setToolTip("执行表格合并并生成预览")
         self._btn_run_merge.setProperty("variant", "primary")
-        self._btn_run_merge.setStyleSheet("padding: 5px 10px;")
+        self._btn_run_merge.setProperty("compact", True)
         self._btn_run_merge.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_run_merge.clicked.connect(self.run_merge)
         r1.addWidget(self._btn_run_merge)
@@ -143,9 +166,24 @@ class TablesMergeTabMixin:
         r2.addWidget(self._merge_col_combo)
 
         self._btn_merge_per_table = QPushButton("按表指定")
-        self._btn_merge_per_table.setStyleSheet("padding: 5px 8px; font-size: 12px;")
+        self._btn_merge_per_table.setProperty("compact", True)
+        self._btn_merge_per_table.setToolTip("为不同表分别配置有序关键列或组合多列键")
         self._btn_merge_per_table.clicked.connect(self._open_merge_key_dialog)
         r2.addWidget(self._btn_merge_per_table)
+
+        self._merge_custom_key_badge = QLabel("已覆盖下拉框")
+        self._merge_custom_key_badge.setProperty("badge", "warning")
+        self._merge_custom_key_badge.setToolTip("已启用按表自定义关键列配置，将优先于左侧统一关键列下拉框")
+        self._merge_custom_key_badge.setVisible(False)
+        r2.addWidget(self._merge_custom_key_badge)
+
+        self._btn_merge_clear_keys = QPushButton("恢复默认")
+        self._btn_merge_clear_keys.setProperty("compact", True)
+        self._btn_merge_clear_keys.setProperty("variant", "ghost")
+        self._btn_merge_clear_keys.setToolTip("清除按表自定义关键列配置")
+        self._btn_merge_clear_keys.setVisible(False)
+        self._btn_merge_clear_keys.clicked.connect(self._clear_merge_custom_keys)
+        r2.addWidget(self._btn_merge_clear_keys)
 
         self._merge_keep_lbl = QLabel("保留策略：")
         self._merge_keep_lbl.setProperty("role", "subtitle")
@@ -190,6 +228,10 @@ class TablesMergeTabMixin:
         self._chk_merge_strip.setChecked(True)
         r3.addWidget(self._chk_merge_strip)
 
+        self._chk_merge_ignore_punct = QCheckBox("忽略标点符号")
+        self._chk_merge_ignore_punct.setChecked(False)
+        r3.addWidget(self._chk_merge_ignore_punct)
+
         r3.addStretch()
         cfg_layout.addLayout(r3)
         layout.addWidget(cfg_card)
@@ -198,22 +240,32 @@ class TablesMergeTabMixin:
         mid_row = QHBoxLayout()
         mid_row.setSpacing(10)
 
-        self._merge_summary_lbl = QLabel("请勾选左侧 2 张及以上表格后，点击「执行合并预览」")
+        self._merge_summary_lbl = QLabel("请勾选左侧表格后，点击「▶ 合并预览」（支持单表去重或多表合并）")
         self._merge_summary_lbl.setProperty("role", "subtitle")
         mid_row.addWidget(self._merge_summary_lbl, 1)
+
+        self._merge_filter_lbl = QLabel("0 行")
+        self._merge_filter_lbl.setProperty("role", "muted")
+        mid_row.addWidget(self._merge_filter_lbl)
 
         self._merge_search = QLineEdit()
         self._merge_search.setPlaceholderText("🔍 筛选合并结果或被去重明细...")
         self._merge_search.setClearButtonEnabled(True)
-        self._merge_search.setMaximumWidth(280)
+        self._merge_search.setMaximumWidth(260)
         self._merge_search.textChanged.connect(lambda _: self._merge_search_timer.start())
         mid_row.addWidget(self._merge_search)
         layout.addLayout(mid_row)
 
         # Preview Sub-Tabs: Merged Table + Dropped Rows
         self._merge_preview_tabs = QTabWidget()
+        self._merge_preview_tabs.setProperty("subtabs", True)
+
         self._tv_merge_result = self._make_table_view(self._merge_result_model)
+        self._tv_merge_result.doubleClicked.connect(self._on_merge_result_double_clicked)
+
         self._tv_merge_dropped = self._make_table_view(self._merge_dropped_model)
+        self._tv_merge_dropped.doubleClicked.connect(self._on_merge_dropped_double_clicked)
+
         self._merge_preview_tabs.addTab(self._tv_merge_result, "合并结果表 (0 行 × 0 列)")
         self._merge_preview_tabs.addTab(self._tv_merge_dropped, "被去重明细 (0 条)")
         self._merge_preview_tabs.currentChanged.connect(lambda _: self._apply_merge_filter())
@@ -227,47 +279,52 @@ class TablesMergeTabMixin:
         lbl_m_exp.setProperty("role", "subtitle")
         export_bar.addWidget(lbl_m_exp)
 
-        compact_btn_qss = "padding: 5px 9px; font-size: 12px;"
-
         self._btn_merge_xlsx = QPushButton("Excel")
         self._btn_merge_xlsx.setToolTip("导出合并结果为 Excel 工作簿 (.xlsx)")
-        self._btn_merge_xlsx.setStyleSheet(compact_btn_qss)
+        self._btn_merge_xlsx.setProperty("compact", True)
         self._btn_merge_xlsx.setEnabled(False)
         self._btn_merge_xlsx.clicked.connect(lambda: self._export_merged("xlsx"))
         export_bar.addWidget(self._btn_merge_xlsx)
 
         self._btn_merge_docx = QPushButton("Word")
         self._btn_merge_docx.setToolTip("导出合并结果为 Word 文档 (.docx)")
-        self._btn_merge_docx.setStyleSheet(compact_btn_qss)
+        self._btn_merge_docx.setProperty("compact", True)
         self._btn_merge_docx.setEnabled(False)
         self._btn_merge_docx.clicked.connect(lambda: self._export_merged("docx"))
         export_bar.addWidget(self._btn_merge_docx)
 
         self._btn_merge_csv = QPushButton("CSV")
-        self._btn_merge_csv.setStyleSheet(compact_btn_qss)
+        self._btn_merge_csv.setProperty("compact", True)
         self._btn_merge_csv.setEnabled(False)
         self._btn_merge_csv.clicked.connect(lambda: self._export_merged("csv"))
         export_bar.addWidget(self._btn_merge_csv)
 
         self._btn_merge_txt = QPushButton("TXT")
-        self._btn_merge_txt.setStyleSheet(compact_btn_qss)
+        self._btn_merge_txt.setProperty("compact", True)
         self._btn_merge_txt.setEnabled(False)
         self._btn_merge_txt.clicked.connect(lambda: self._export_merged("txt"))
         export_bar.addWidget(self._btn_merge_txt)
 
         self._btn_merge_add_workspace = QPushButton("加入工作台")
         self._btn_merge_add_workspace.setToolTip("将合并结果作为新表加入左侧数据源列表")
-        self._btn_merge_add_workspace.setStyleSheet(compact_btn_qss)
+        self._btn_merge_add_workspace.setProperty("compact", True)
         self._btn_merge_add_workspace.setEnabled(False)
         self._btn_merge_add_workspace.clicked.connect(self._add_merged_to_workspace)
         export_bar.addWidget(self._btn_merge_add_workspace)
 
         export_bar.addStretch()
 
+        self._db_import_progress = QProgressBar()
+        self._db_import_progress.setFixedWidth(56)
+        self._db_import_progress.setFixedHeight(14)
+        self._db_import_progress.setTextVisible(False)
+        self._db_import_progress.setVisible(False)
+        export_bar.addWidget(self._db_import_progress)
+
         self._btn_merge_write_db = QPushButton("写入数据总库")
-        self._btn_merge_write_db.setToolTip("一键解析标准编码并写入当前 SQLite 数据总库")
+        self._btn_merge_write_db.setToolTip("后台解析标准编码并写入当前 SQLite 数据总库")
         self._btn_merge_write_db.setProperty("variant", "success")
-        self._btn_merge_write_db.setStyleSheet("padding: 5px 10px; font-size: 12px;")
+        self._btn_merge_write_db.setProperty("compact", True)
         self._btn_merge_write_db.setEnabled(False)
         self._btn_merge_write_db.clicked.connect(self._write_merged_to_db)
         export_bar.addWidget(self._btn_merge_write_db)
@@ -285,29 +342,95 @@ class TablesMergeTabMixin:
         self._merge_align_combo.setVisible(not is_join)
         self._merge_join_lbl.setVisible(is_join)
         self._merge_join_combo.setVisible(is_join)
+        self._merge_join_match_combo.setVisible(is_join)
         self._merge_primary_lbl.setVisible(is_join)
         self._merge_primary_combo.setVisible(is_join)
 
         self._merge_row2_widget.setVisible(not is_union_all)
         dedup_mode = self._merge_dedup_mode_combo.currentData() or "smart_code"
-        show_col = dedup_mode == "column_value"
+        show_col = (not is_union_all) and (dedup_mode == "column_value")
         self._merge_col_lbl.setVisible(show_col)
         self._merge_col_combo.setVisible(show_col)
         self._btn_merge_per_table.setVisible(show_col)
 
+        checked_ids = {t.table_id for t in self.checked_tables()}
+        has_custom = any(self._merge_custom_keys.get(tid) for tid in checked_ids)
+        self._merge_custom_key_badge.setVisible(show_col and has_custom)
+        self._btn_merge_clear_keys.setVisible(show_col and has_custom)
+
         self._merge_keep_lbl.setVisible(is_union_dedup)
         self._merge_keep_combo.setVisible(is_union_dedup)
+
+        # Hide column-value normalization options when in union_all or smart_code mode
+        self._chk_merge_ignore_case.setVisible(show_col)
+        self._chk_merge_strip.setVisible(show_col)
+        cfg_fields = {f.name for f in dataclasses.fields(TableMergeConfig)}
+        self._chk_merge_ignore_punct.setVisible(show_col and ("ignore_punctuation" in cfg_fields))
 
     def _open_merge_key_dialog(self) -> None:
         tables = self.checked_tables()
         if not tables:
             self.ctx.notify("请先在左侧勾选至少 1 张表格", "warning")
             return
-        dlg = _PerTableKeyDialog(tables, self._merge_custom_keys, parent=self)
+        default_col = str(self._merge_col_combo.currentData() or "")
+        dlg = _PerTableKeyDialog(
+            tables,
+            self._merge_custom_keys,
+            parent=self,
+            default_column=default_col,
+        )
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            self._merge_custom_keys.update(dlg.get_key_mapping())
-            self._update_custom_key_button_labels()
-            self.ctx.notify("已更新各表合并关键列配置", "success")
+            if dlg.was_cleared:
+                self._merge_custom_keys.clear()
+                self._update_custom_key_button_labels()
+                self._on_merge_mode_changed()
+                self.ctx.notify("已清除合并按表关键列配置，恢复使用统一关键列", "info")
+            else:
+                self._merge_custom_keys.update(dlg.get_key_mapping())
+                self._update_custom_key_button_labels()
+                self._on_merge_mode_changed()
+                self.ctx.notify("已更新各表合并关键列配置", "success")
+
+    def _clear_merge_custom_keys(self) -> None:
+        self._merge_custom_keys.clear()
+        self._update_custom_key_button_labels()
+        self._on_merge_mode_changed()
+        self.ctx.notify("已恢复默认合并关键列", "info")
+
+    def _validate_merge_key_columns(self, tables: list[DataTable]) -> bool:
+        mode = self._merge_mode_combo.currentData() or "union_dedup"
+        dedup_mode = self._merge_dedup_mode_combo.currentData() or "smart_code"
+        if mode == "union_all" or dedup_mode != "column_value":
+            return True
+
+        selected_col = str(self._merge_col_combo.currentData() or "")
+        missing_tables: list[str] = []
+        for tbl in tables:
+            custom = [c for c in self._merge_custom_keys.get(tbl.table_id, []) if c in tbl.headers]
+            if custom:
+                continue
+            if selected_col and selected_col not in tbl.headers:
+                missing_tables.append(tbl.name)
+
+        if not missing_tables:
+            return True
+
+        detail_lines = [
+            f"当前选择的关键列「{selected_col}」在以下表格中不存在：",
+            *[f"• {name}" for name in missing_tables],
+            "",
+            "若继续执行，缺失该列的表格将默认回退到第 1 列进行匹配。",
+            "建议先通过「列管理」重命名列名，或点击「按表指定」为各表分别映射关键列。",
+        ]
+        dlg = ScrollableDetailDialog(
+            title="部分表格缺少所选关键列",
+            summary=f"有 {len(missing_tables)} 张参与表不包含列「{selected_col}」，是否继续执行合并？",
+            detail_text="\n".join(detail_lines),
+            confirm_mode=True,
+            confirm_label="仍要继续",
+            parent=self,
+        )
+        return dlg.exec() == QDialog.DialogCode.Accepted
 
     def _build_merge_config(self, tables: list[DataTable]) -> TableMergeConfig:
         mode = self._merge_mode_combo.currentData() or "union_dedup"
@@ -315,7 +438,7 @@ class TablesMergeTabMixin:
         key_columns: dict[str, list[str]] = {}
 
         if dedup_mode == "column_value" and mode != "union_all":
-            selected_col = self._merge_col_combo.currentData() or ""
+            selected_col = str(self._merge_col_combo.currentData() or "")
             for tbl in tables:
                 custom = [c for c in self._merge_custom_keys.get(tbl.table_id, []) if c in tbl.headers]
                 if custom:
@@ -326,20 +449,28 @@ class TablesMergeTabMixin:
                     key_columns[tbl.table_id] = [tbl.headers[0]]
 
         primary_id = self._merge_primary_combo.currentData() or (tables[0].table_id if tables else "")
-        return TableMergeConfig(
-            mode=mode,
-            align_mode=self._merge_align_combo.currentData() or "by_header",
-            dedup_mode=dedup_mode,
-            key_columns=key_columns,
-            keep_strategy=self._merge_keep_combo.currentData() or "first",
-            join_type=self._merge_join_combo.currentData() or "left",
-            primary_table_id=primary_id,
-            add_source_column=self._chk_merge_add_source.isChecked(),
-            add_row_index_column=self._chk_merge_add_row_idx.isChecked(),
-            add_extracted_code_column=self._chk_merge_add_code.isChecked(),
-            ignore_case=self._chk_merge_ignore_case.isChecked(),
-            strip_whitespace=self._chk_merge_strip.isChecked(),
-        )
+        kwargs: dict[str, Any] = {
+            "mode": mode,
+            "align_mode": self._merge_align_combo.currentData() or "by_header",
+            "dedup_mode": dedup_mode,
+            "key_columns": key_columns,
+            "keep_strategy": self._merge_keep_combo.currentData() or "first",
+            "join_type": self._merge_join_combo.currentData() or "left",
+            "primary_table_id": primary_id,
+            "add_source_column": self._chk_merge_add_source.isChecked(),
+            "add_row_index_column": self._chk_merge_add_row_idx.isChecked(),
+            "add_extracted_code_column": self._chk_merge_add_code.isChecked(),
+            "ignore_case": self._chk_merge_ignore_case.isChecked(),
+            "strip_whitespace": self._chk_merge_strip.isChecked(),
+        }
+        # Forward v1.2.0 TableMergeConfig fields when present
+        valid_fields = {f.name for f in dataclasses.fields(TableMergeConfig)}
+        if "ignore_punctuation" in valid_fields:
+            kwargs["ignore_punctuation"] = self._chk_merge_ignore_punct.isChecked()
+        if "join_match_mode" in valid_fields:
+            kwargs["join_match_mode"] = self._merge_join_match_combo.currentData() or "all"
+
+        return TableMergeConfig(**kwargs)
 
     def run_merge(self) -> None:
         """Execute table merge in a background WorkerThread."""
@@ -351,47 +482,104 @@ class TablesMergeTabMixin:
         if mode == "join" and len(tables) < 2:
             self.ctx.notify("横向拼接 (Join) 至少需要勾选 2 张表格", "warning")
             return
-        if self._merge_worker is not None and self._merge_worker.isRunning():
+        if self._is_worker_running(self._merge_worker):
             self.ctx.notify("正在执行表格合并，请稍候...", "warning")
+            return
+        if not self._validate_merge_key_columns(tables):
             return
 
         config = self._build_merge_config(tables)
+        snapshots = [t.clone(new_id=t.table_id) for t in tables]
+        snapshot_sig = self._compute_tables_snapshot(tables)
         parser_engine = self.ctx.parser
 
-        self._btn_run_merge.setEnabled(False)
+        self._merge_gen += 1
+        gen = self._merge_gen
+
         self._merge_progress.setVisible(True)
         self._merge_progress.setRange(0, 0)
+        self._btn_cancel_merge.setVisible(True)
 
         def _task() -> TableMergeResult:
-            return merge_tables(tables, config, parser_engine=parser_engine)
+            return merge_tables(snapshots, config, parser_engine=parser_engine)
 
-        self._merge_worker = WorkerThread(_task, parent=self)
-        self._merge_worker.succeeded.connect(self._on_merge_finished)
-        self._merge_worker.failed.connect(self._on_merge_failed)
-        self._merge_worker.start()
+        worker = self._make_worker(_task)
+        self._merge_worker = worker
+        worker.succeeded.connect(
+            lambda res, g=gen, sig=snapshot_sig: self._on_merge_finished(g, sig, res)
+        )
+        worker.failed.connect(lambda detail, g=gen: self._on_merge_failed(g, detail))
+        if hasattr(worker, "cancelled"):
+            worker.cancelled.connect(lambda g=gen: self._on_merge_cancelled(g))
+        worker.finished.connect(lambda w=worker: self._clear_worker_ref("_merge_worker", w))
+        self._sync_controls_state()
+        worker.start()
 
-    def _on_merge_finished(self, result: TableMergeResult) -> None:
-        self._btn_run_merge.setEnabled(True)
+    def _cancel_merge(self) -> None:
+        self._merge_gen += 1
+        worker = self._merge_worker
+        if worker is not None:
+            try:
+                worker.cancel()
+            except RuntimeError:
+                pass
         self._merge_progress.setVisible(False)
-        self.load_merge_result(result)
+        self._btn_cancel_merge.setVisible(False)
+        self._sync_controls_state()
+        self.ctx.notify("已请求取消表格合并", "info")
+
+    def _on_merge_finished(
+        self,
+        gen: int,
+        snapshot_sig: Any,
+        result: TableMergeResult,
+    ) -> None:
+        if gen != self._merge_gen:
+            return
+        self._merge_progress.setVisible(False)
+        self._btn_cancel_merge.setVisible(False)
+        self.load_merge_result(result, snapshot=snapshot_sig)
+        self._sync_controls_state()
         self.ctx.notify(
             f"合并预览完成：共 {result.merged_table.row_count:,} 行 × {result.merged_table.col_count} 列"
             + (f"（去重移除 {len(result.dropped_rows):,} 行）" if result.dropped_rows else ""),
             "success",
         )
 
-    def _on_merge_failed(self, detail: str) -> None:
-        self._btn_run_merge.setEnabled(True)
+    def _on_merge_failed(self, gen: int, detail: str) -> None:
+        if gen != self._merge_gen:
+            return
         self._merge_progress.setVisible(False)
+        self._btn_cancel_merge.setVisible(False)
+        self._sync_controls_state()
         ScrollableDetailDialog("表格合并出错", "执行表格合并时发生错误：", detail, parent=self).exec()
 
-    def load_merge_result(self, result: TableMergeResult) -> None:
+    def _on_merge_cancelled(self, gen: int) -> None:
+        if gen != self._merge_gen:
+            return
+        self._merge_progress.setVisible(False)
+        self._btn_cancel_merge.setVisible(False)
+        self._sync_controls_state()
+
+    def load_merge_result(
+        self,
+        result: TableMergeResult,
+        snapshot: Optional[Any] = None,
+    ) -> None:
         """Display merged table and dropped rows audit trail."""
         self._last_merge_result = result
+        self._last_merge_snapshot = snapshot
+        self._merge_dropped_refs = list(result.dropped_rows)
         merged = result.merged_table
 
         mono_cols = {i for i, h in enumerate(merged.headers) if h in ("标准编码", "_标准编码")}
-        self._merge_result_model.set_table(merged, highlight_columns=mono_cols, mono_columns=mono_cols)
+        self._merge_result_model.set_table(
+            merged,
+            highlight_columns=mono_cols,
+            mono_columns=mono_cols,
+            reset_filter=True,
+        )
+        self._reset_table_view_sort_indicator(self._tv_merge_result)
         self._auto_size_columns(self._tv_merge_result, self._merge_result_model)
 
         dropped_headers = ["去重键 / 编码", "来源表", "原行号", "提取编码", "版本标签", "分集", "原行内容摘要"]
@@ -418,7 +606,9 @@ class TablesMergeTabMixin:
             highlight_columns={0},
             mono_columns={0, 3},
             center_columns={2, 5},
+            reset_filter=True,
         )
+        self._reset_table_view_sort_indicator(self._tv_merge_dropped)
         self._auto_size_columns(self._tv_merge_dropped, self._merge_dropped_model)
 
         self._merge_preview_tabs.setTabText(0, f"合并结果表 ({merged.row_count:,} 行 × {merged.col_count} 列)")
@@ -434,18 +624,20 @@ class TablesMergeTabMixin:
             stats_parts.insert(0, f"原始输入：{result.stats['input_rows']:,} 行")
         self._merge_summary_lbl.setText(" · ".join(stats_parts))
 
-        has_data = merged.row_count > 0 or merged.col_count > 0
-        for btn in (
-            self._btn_merge_xlsx,
-            self._btn_merge_docx,
-            self._btn_merge_csv,
-            self._btn_merge_txt,
-            self._btn_merge_add_workspace,
-            self._btn_merge_write_db,
-        ):
-            btn.setEnabled(has_data)
-
         self._apply_merge_filter()
+        self._sync_controls_state()
+
+    def _on_merge_result_double_clicked(self, index: QModelIndex) -> None:
+        if index.isValid():
+            self._inspect_table_view_row(self._tv_merge_result, index.row())
+
+    def _on_merge_dropped_double_clicked(self, index: QModelIndex) -> None:
+        if not index.isValid():
+            return
+        orig_row = self._merge_dropped_model.original_row_index(index.row())
+        if 0 <= orig_row < len(self._merge_dropped_refs):
+            ref: TableRowRef = self._merge_dropped_refs[orig_row]
+            self._jump_to_table_row(ref.table_id, ref.row_index, fallback_ref=ref)
 
     def _apply_merge_filter(self) -> None:
         query = self._merge_search.text()
@@ -453,11 +645,35 @@ class TablesMergeTabMixin:
             self._merge_result_model.set_filter(query)
         else:
             self._merge_dropped_model.set_filter(query)
+        self._update_merge_filter_label()
+
+    def _update_merge_filter_label(self) -> None:
+        model = (
+            self._merge_result_model
+            if self._merge_preview_tabs.currentIndex() == 0
+            else self._merge_dropped_model
+        )
+        shown = model.filtered_row_count()
+        total = model.total_row_count()
+        if model.filter_query():
+            self._merge_filter_lbl.setText(f"筛选命中 {shown:,} / {total:,} 行")
+        else:
+            self._merge_filter_lbl.setText(f"共 {total:,} 行")
 
     def _reset_merge_ui(self) -> None:
+        self._merge_search_timer.stop()
+        self._merge_search.blockSignals(True)
+        self._merge_search.clear()
+        self._merge_search.blockSignals(False)
+        self._merge_dropped_refs.clear()
+
+        self._reset_table_view_sort_indicator(self._tv_merge_result)
+        self._reset_table_view_sort_indicator(self._tv_merge_dropped)
+
         self._merge_preview_tabs.setTabText(0, "合并结果表 (0 行 × 0 列)")
         self._merge_preview_tabs.setTabText(1, "被去重明细 (0 条)")
-        self._merge_summary_lbl.setText("请勾选左侧 2 张及以上表格后，点击「执行合并预览」")
+        self._merge_summary_lbl.setText("请勾选左侧表格后，点击「▶ 合并预览」（支持单表去重或多表合并）")
+        self._merge_filter_lbl.setText("0 行")
         for btn in (
             self._btn_merge_xlsx,
             self._btn_merge_docx,
@@ -479,6 +695,9 @@ class TablesMergeTabMixin:
     def _write_merged_to_db(self) -> None:
         if not self._last_merge_result:
             return
+        if self._is_worker_running(self._db_import_worker):
+            self.ctx.notify("正在写入数据总库，请稍候...", "warning")
+            return
         merged = self._last_merge_result.merged_table
         if merged.row_count == 0:
             self.ctx.notify("合并结果为空，无需写入数据总库", "warning")
@@ -490,7 +709,7 @@ class TablesMergeTabMixin:
                 f"即将把合并结果「{merged.name}」（共 {merged.row_count:,} 行）"
                 f"解析标准编码并写入当前数据库「{Path(self.ctx.db.db_path).name}」："
             ),
-            detail_text="系统会自动提取每行的标准编码、版本标签与分集信息并创建导入批次记录。",
+            detail_text="系统将在后台线程自动提取每行的标准编码、版本标签与分集信息并创建导入批次记录。",
             confirm_mode=True,
             confirm_label="确认写入总库",
             parent=self,
@@ -498,30 +717,79 @@ class TablesMergeTabMixin:
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
 
-        try:
-            code_col: Optional[str] = None
-            for cand in ("_标准编码", "标准编码"):
-                if cand in merged.headers:
-                    code_col = cand
-                    break
+        snapshot = merged.clone(new_id=merged.table_id)
+        db_repo = self.ctx.db
+        parser_engine = self.ctx.parser
+        source_name = snapshot.name or "多表合并入库"
 
-            res = import_table_to_database(
-                merged,
-                self.ctx.db,
-                self.ctx.parser,
-                code_column=code_col,
-                source_name=merged.name or "多表合并入库",
+        # Prefer "_标准编码"/"标准编码" when present, while keeping fallback scanning enabled for blank cells!
+        preferred_code_col: Optional[str] = None
+        for cand in ("_标准编码", "标准编码"):
+            if cand in snapshot.headers:
+                preferred_code_col = cand
+                break
+        sig_params = inspect.signature(import_table_to_database).parameters
+
+        self._db_import_gen += 1
+        gen = self._db_import_gen
+        self._db_import_progress.setVisible(True)
+        self._db_import_progress.setRange(0, 0)
+
+        def _task() -> dict[str, Any]:
+            if "fallback_scan_all" in sig_params:
+                return import_table_to_database(
+                    snapshot,
+                    db_repo,
+                    parser_engine,
+                    code_column=preferred_code_col,
+                    source_name=source_name,
+                    fallback_scan_all=True,
+                )
+            # Legacy signature: code_column=None already prefers _CODE_COL_HINTS with scan_all=True
+            return import_table_to_database(
+                snapshot,
+                db_repo,
+                parser_engine,
+                code_column=None,
+                source_name=source_name,
             )
-            added = int(res.get("added", 0))
-            skipped = int(res.get("skipped", 0))
-            unrec = int(res.get("unrecognized", 0))
-            self.ctx.data_changed.emit()
-            self.ctx.notify(
-                f"写入数据总库完成：新增 {added:,} 条，跳过重复 {skipped:,} 条，未识别 {unrec:,} 条",
-                "success",
-            )
-        except Exception as exc:
-            ScrollableDetailDialog("写入数据总库失败", str(exc), parent=self).exec()
+
+        worker = self._make_worker(_task)
+        self._db_import_worker = worker
+        worker.succeeded.connect(lambda res, g=gen: self._on_db_import_finished(g, res))
+        worker.failed.connect(lambda detail, g=gen: self._on_db_import_failed(g, detail))
+        if hasattr(worker, "cancelled"):
+            worker.cancelled.connect(lambda g=gen: self._on_db_import_cancelled(g))
+        worker.finished.connect(lambda w=worker: self._clear_worker_ref("_db_import_worker", w))
+        self._sync_controls_state()
+        worker.start()
+
+    def _on_db_import_finished(self, gen: int, res: dict[str, Any]) -> None:
+        if gen != self._db_import_gen:
+            return
+        self._db_import_progress.setVisible(False)
+        self._sync_controls_state()
+        added = int(res.get("added", 0))
+        skipped = int(res.get("skipped", 0))
+        unrec = int(res.get("unrecognized", 0))
+        self.ctx.data_changed.emit()
+        self.ctx.notify(
+            f"写入数据总库完成：新增 {added:,} 条，跳过重复 {skipped:,} 条，未识别 {unrec:,} 条",
+            "success",
+        )
+
+    def _on_db_import_failed(self, gen: int, detail: str) -> None:
+        if gen != self._db_import_gen:
+            return
+        self._db_import_progress.setVisible(False)
+        self._sync_controls_state()
+        ScrollableDetailDialog("写入数据总库失败", "写入数据总库时发生错误：", detail, parent=self).exec()
+
+    def _on_db_import_cancelled(self, gen: int) -> None:
+        if gen != self._db_import_gen:
+            return
+        self._db_import_progress.setVisible(False)
+        self._sync_controls_state()
 
     def _export_merged(self, fmt: str) -> None:
         if not self._last_merge_result:
