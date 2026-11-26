@@ -5,7 +5,7 @@ Covers:
 - MainWindow initialization, version sync, tab navigation, theme switch, safe shutdown
 - RecordTableModel, PreviewTableModel (inline manual fix + sort), DynamicTableModel (sort/NaN/filter/reset)
 - ImportView threaded preview, queue deduplication, cancellation reset & db_switched invalidation
-- CompareView companion-file checkbox independence from global default & non-mutating DB check
+- CompareView Mode A (companion-file checkbox & non-mutating DB check) and Mode B Dual-List Coverage Comparison (DB load, coverage rate, filter pills, search, A/B swap, exact-line mode, clipboard copy, async TXT/CSV/Excel exports, Light/Dark theme)
 - TablesView async file loading, filter reset on switch, dedup, merge & snapshot invalidation
 - SettingsView & RuleEditorDialog regex validator (ReDoS, empty-match, clean_text preview)
 - CLI `python -m src.app --smoke-test` end-to-end subprocess check
@@ -124,11 +124,11 @@ def test_app_context_lifecycle_and_settings(isolated_ctx: AppContext, tmp_path: 
 
 
 def test_main_window_init_theme_switch_and_safe_shutdown(isolated_ctx: AppContext) -> None:
-    assert APP_VERSION.startswith("v1.2.")
+    assert APP_VERSION.startswith("v1.3.")
 
     win = MainWindow(isolated_ctx)
     try:
-        assert "v1.2." in win.windowTitle()
+        assert "v1.3." in win.windowTitle()
 
         # Navigate across all 6 views
         for idx in range(6):
@@ -406,6 +406,287 @@ def test_compare_view_companion_checkbox_overrides_global_default(isolated_ctx: 
 
         # Non-mutating guarantee: DB still has only the 1 seeded record
         assert isolated_ctx.db.get_stats().total_records == 1
+    finally:
+        view.shutdown()
+        view.deleteLater()
+        QApplication.processEvents()
+
+
+def test_compare_view_mode_b_dual_list_coverage_e2e(
+    isolated_ctx: AppContext,
+    tmp_path: Path,
+) -> None:
+    """End-to-end headless verification of Mode B Dual-List Coverage Comparison."""
+    import openpyxl
+
+    # Seed Base List A in SQLite DB (5 records across 4 unique codes, including multi-hit + base-only)
+    isolated_ctx.db.add_records(
+        [
+            DataRecord(
+                canonical_code="ABC-001",
+                prefix="ABC",
+                number="001",
+                raw_text="ABC-001_4K.mp4",
+                file_name="ABC-001_4K.mp4",
+                tags=["4K"],
+                source_type="txt",
+                source_name="archive_a.txt",
+            ),
+            DataRecord(
+                canonical_code="ABC-001",
+                prefix="ABC",
+                number="001",
+                raw_text="ABC-001_CHS.mkv",
+                file_name="ABC-001_CHS.mkv",
+                tags=["字幕"],
+                source_type="txt",
+                source_name="archive_a.txt",
+            ),
+            DataRecord(
+                canonical_code="PRJ-0042",
+                prefix="PRJ",
+                number="0042",
+                raw_text="PRJ-0042_HD.mp4",
+                file_name="PRJ-0042_HD.mp4",
+                tags=["高清"],
+                source_type="txt",
+                source_name="archive_a.txt",
+            ),
+            DataRecord(
+                canonical_code="DEV-108",
+                prefix="DEV",
+                number="108",
+                raw_text="DEV-108_final.mkv",
+                file_name="DEV-108_final.mkv",
+                source_type="txt",
+                source_name="archive_a.txt",
+            ),
+            DataRecord(
+                canonical_code="ONLY-999",
+                prefix="ONLY",
+                number="999",
+                raw_text="ONLY-999_extra.mp4",
+                file_name="ONLY-999_extra.mp4",
+                source_type="txt",
+                source_name="archive_a.txt",
+            ),
+        ]
+    )
+
+    view = CompareView(isolated_ctx)
+    try:
+        view._mode_tabs.setCurrentIndex(1)
+        QApplication.processEvents()
+
+        # 1. Load active DB as Base List A and paste ranked Target List B (with ranking noise)
+        loaded_count = view.load_db_to_ab_side("A")
+        assert loaded_count == 5
+        assert "当前总库" in view._ab_badges["A"].text()
+
+        target_text = "\n".join(
+            [
+                "#1 TOP250 ABC-001 示例条目一",
+                "No.25 PRJ-0042 示例条目二",
+                "Rank 100 MISS-007 缺失条目一",
+                "第4名 DEV-108 示例条目三",
+                "005. MISS-008 缺失条目二",
+            ]
+        )
+        view.set_ab_text("B", target_text)
+        assert view._btn_run_ab.isEnabled() is True
+
+        view.run_ab_compare()
+        assert _wait_until(
+            lambda: view._ab_result is not None and not view._is_worker_running(view._ab_worker),
+            timeout_s=10.0,
+        )
+
+        res = view._ab_result
+        assert res is not None
+        assert res.match_mode == "smart_code"
+        assert res.unique_b_count == 5
+        assert res.hit_b_count == 3
+        assert res.missing_b_count == 2
+        assert res.coverage_rate == pytest.approx(60.0)
+        assert res.is_fully_covered is False
+        assert res.missing_b_codes == ["MISS-007", "MISS-008"]
+        assert res.matched_b_codes == ["ABC-001", "PRJ-0042", "DEV-108"]
+
+        # Coverage banner & progress bar reflect 60.0%
+        assert view._ab_coverage_bar.value() == 600
+        assert "60.0%" in view._lbl_ab_percent.text()
+        assert "60.0%" in view._lbl_ab_verdict.text()
+
+        # Sub-tab models populated cleanly with exact Target B order
+        assert view._model_ab_checklist.rowCount() == 5
+        assert view._model_ab_missing.rowCount() == 2
+        assert view._model_ab_matched.rowCount() == 3
+        assert view._model_ab_only_a.rowCount() == 1
+        assert view._model_ab_checklist.data(view._model_ab_checklist.index(0, 0)) == "#1"
+        assert view._model_ab_checklist.data(view._model_ab_checklist.index(0, 2)) == "ABC-001"
+        assert view._model_ab_checklist.data(view._model_ab_checklist.index(0, 4)) == "2"
+        assert view._model_ab_only_a.data(view._model_ab_only_a.index(0, 0)) == "ONLY-999"
+
+        # 2. Filter pills: 全部 / 只看缺失 / 只看已包含 + live text search
+        view.set_ab_checklist_filter("missing")
+        assert view._model_ab_checklist.rowCount() == 2
+        assert [
+            view._model_ab_checklist.data(view._model_ab_checklist.index(r, 2))
+            for r in range(2)
+        ] == ["MISS-007", "MISS-008"]
+
+        view.set_ab_checklist_filter("matched")
+        assert view._model_ab_checklist.rowCount() == 3
+
+        view.set_ab_checklist_filter("all")
+        assert view._model_ab_checklist.rowCount() == 5
+
+        view._ab_checklist_search.setText("MISS-008")
+        QApplication.processEvents()
+        assert view._model_ab_checklist.rowCount() == 1
+        assert view._model_ab_checklist.data(view._model_ab_checklist.index(0, 2)) == "MISS-008"
+
+        view._ab_checklist_search.clear()
+        QApplication.processEvents()
+        assert view._model_ab_checklist.rowCount() == 5
+
+        # Sorting on all 4 models works without raising
+        view._model_ab_checklist.sort(2, Qt.SortOrder.AscendingOrder)
+        view._model_ab_missing.sort(1, Qt.SortOrder.DescendingOrder)
+        view._model_ab_matched.sort(3, Qt.SortOrder.DescendingOrder)
+        view._model_ab_only_a.sort(0, Qt.SortOrder.AscendingOrder)
+        view._model_ab_checklist.sort(0, Qt.SortOrder.AscendingOrder)
+
+        # 3. Copy missing & matched codes to clipboard
+        copied_missing = view.copy_ab_missing_codes()
+        assert copied_missing == 2
+        assert QApplication.clipboard().text() == "MISS-007\nMISS-008"
+
+        copied_matched = view.copy_ab_matched_codes()
+        assert copied_matched == 3
+        assert QApplication.clipboard().text() == "ABC-001\nPRJ-0042\nDEV-108"
+
+        # 4. Light & Dark theme semantic row tinting update
+        light_bg_matched = view._model_ab_checklist.data(
+            view._model_ab_checklist.index(0, 1), Qt.ItemDataRole.BackgroundRole
+        )
+        light_bg_missing = view._model_ab_checklist.data(
+            view._model_ab_checklist.index(2, 1), Qt.ItemDataRole.BackgroundRole
+        )
+        assert light_bg_matched is not None and light_bg_missing is not None
+        assert light_bg_matched.color() != light_bg_missing.color()
+
+        isolated_ctx.set_theme("dark")
+        QApplication.processEvents()
+        dark_bg_matched = view._model_ab_checklist.data(
+            view._model_ab_checklist.index(0, 1), Qt.ItemDataRole.BackgroundRole
+        )
+        assert dark_bg_matched is not None
+        assert dark_bg_matched.color() != light_bg_matched.color()
+
+        isolated_ctx.set_theme("light")
+        QApplication.processEvents()
+
+        # 5. Async exports: TXT missing list, CSV missing list, and 5-sheet Excel full report
+        missing_txt = tmp_path / "missing_codes.txt"
+        view.export_ab_missing(str(missing_txt))
+        assert _wait_until(
+            lambda: missing_txt.is_file() and not view._is_worker_running(view._export_worker),
+            timeout_s=10.0,
+        )
+        assert missing_txt.read_text(encoding="utf-8").splitlines() == ["MISS-007", "MISS-008"]
+
+        missing_csv = tmp_path / "missing_detail.csv"
+        view.export_ab_missing(str(missing_csv))
+        assert _wait_until(
+            lambda: missing_csv.is_file() and not view._is_worker_running(view._export_worker),
+            timeout_s=10.0,
+        )
+        csv_text = missing_csv.read_text(encoding="utf-8-sig")
+        assert "MISS-007" in csv_text and "MISS-008" in csv_text
+
+        report_xlsx = tmp_path / "coverage_report.xlsx"
+        view.export_ab_full_report(str(report_xlsx))
+        assert _wait_until(
+            lambda: report_xlsx.is_file() and not view._is_worker_running(view._export_worker),
+            timeout_s=10.0,
+        )
+        wb = openpyxl.load_workbook(report_xlsx, read_only=True)
+        try:
+            assert len(wb.sheetnames) == 5
+            assert wb.sheetnames[0] == "覆盖率总览"
+            assert wb.sheetnames[1] == "目标清单逐条核对"
+        finally:
+            wb.close()
+
+        # focus_search switches to Tab 0 cleanly
+        view._ab_result_tabs.setCurrentIndex(2)
+        view.focus_search()
+        assert view._ab_result_tabs.currentIndex() == 0
+    finally:
+        view.shutdown()
+        view.deleteLater()
+        QApplication.processEvents()
+
+
+def test_compare_view_mode_b_swap_exact_line_and_files(
+    isolated_ctx: AppContext,
+    tmp_path: Path,
+) -> None:
+    """Verify A/B swap, exact-line office comparison, 100% full-coverage banner, and multi-file load."""
+    file_a1 = tmp_path / "base_part1.txt"
+    file_a2 = tmp_path / "base_part2.txt"
+    file_a1.write_text("需求规格说明书\n接口设计文档\n", encoding="utf-8")
+    file_a2.write_text("测试验收报告\n部署手册\n", encoding="utf-8")
+
+    view = CompareView(isolated_ctx)
+    try:
+        view._mode_tabs.setCurrentIndex(1)
+        view.set_ab_match_mode("exact_line")
+        view.set_ab_files("A", [str(file_a1), str(file_a2)])
+        view.set_ab_text("B", "需求规格说明书\n测试验收报告\n")
+
+        # 1. Exact-line 100% coverage check
+        view.run_ab_compare()
+        assert _wait_until(
+            lambda: view._ab_result is not None and not view._is_worker_running(view._ab_worker),
+            timeout_s=10.0,
+        )
+        res = view._ab_result
+        assert res is not None
+        assert res.match_mode == "exact_line"
+        assert res.is_fully_covered is True
+        assert res.coverage_rate == pytest.approx(100.0)
+        assert res.missing_b_count == 0
+        assert "100.0%" in view._lbl_ab_verdict.text()
+        assert view._btn_copy_missing.isEnabled() is False
+        assert view._btn_export_missing.isEnabled() is False
+
+        # 2. Swap A/B: now the 2-item list is Base A and the 4-item files are Target B -> 50% coverage
+        badge_a_before = view._ab_badges["A"].text()
+        badge_b_before = view._ab_badges["B"].text()
+        view.swap_ab_sides()
+        assert view._ab_badges["A"].text() == badge_b_before
+        assert view._ab_badges["B"].text() == badge_a_before
+
+        view._ab_result = None
+        view.run_ab_compare()
+        assert _wait_until(
+            lambda: view._ab_result is not None and not view._is_worker_running(view._ab_worker),
+            timeout_s=10.0,
+        )
+        swapped = view._ab_result
+        assert swapped is not None
+        assert swapped.unique_b_count == 4
+        assert swapped.hit_b_count == 2
+        assert swapped.missing_b_count == 2
+        assert swapped.coverage_rate == pytest.approx(50.0)
+        assert swapped.missing_b_codes == ["接口设计文档", "部署手册"]
+        assert view._btn_copy_missing.isEnabled() is True
+
+        # 3. Clear side disables Run button cleanly
+        view.clear_ab_side("B")
+        assert view._btn_run_ab.isEnabled() is False
     finally:
         view.shutdown()
         view.deleteLater()
