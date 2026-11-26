@@ -787,6 +787,206 @@ QProgressBar::chunk {{
     border-radius: 5px;
 }}
 
+/* ===== Dual-List Coverage Comparison (Mode B) ===== */
+QFrame[sourceCard="true"] {{
+    background-color: {p['bg_surface']};
+    border: 1px solid {p['border']};
+    border-radius: 10px;
+}}
+
+QFrame[sourceCard="true"]:hover {{
+    border-color: {p['border_strong']};
+}}
+
+QPlainTextEdit[dragActive="true"] {{
+    background-color: {p['accent_soft']};
+    border: 2px dashed {p['accent']};
+}}
+
+QPushButton#SwapABButton {{
+    background-color: {p['bg_surface']};
+    color: {p['accent']};
+    border: 1px solid {p['border_strong']};
+    border-radius: 16px;
+    padding: 4px 8px;
+    font-size: 13px;
+    font-weight: 700;
+    min-width: 34px;
+    min-height: 32px;
+}}
+
+QPushButton#SwapABButton:hover {{
+    background-color: {p['accent_soft']};
+    border-color: {p['accent']};
+}}
+
+QFrame#CoverageBanner {{
+    background-color: {p['bg_surface']};
+    border: 1px solid {p['border']};
+    border-radius: 10px;
+}}
+
+QFrame#CoverageBanner[coverageState="full"] {{
+    border: 1px solid {p['success']};
+}}
+
+QLabel#CoverageVerdict {{
+    font-size: 14px;
+    font-weight: 700;
+    color: {p['text_primary']};
+}}
+
+QLabel#CoverageVerdict[coverageState="full"] {{
+    color: {p['success']};
+}}
+
+QLabel#CoveragePercent {{
+    font-size: 20px;
+    font-weight: 700;
+    color: {p['accent']};
+}}
+
+QLabel#CoveragePercent[coverageLevel="full"] {{
+    color: {p['success']};
+}}
+
+QLabel#CoveragePercent[coverageLevel="high"] {{
+    color: {p['accent']};
+}}
+
+QLabel#CoveragePercent[coverageLevel="mid"] {{
+    color: {p['warning']};
+}}
+
+QLabel#CoveragePercent[coverageLevel="low"] {{
+    color: {p['danger']};
+}}
+
+QLabel#CoveragePercent[coverageLevel="idle"] {{
+    color: {p['text_muted']};
+}}
+
+QProgressBar#CoverageBar {{
+    background-color: {p['bg_surface_alt']};
+    border: 1px solid {p['border']};
+    border-radius: 7px;
+    min-height: 14px;
+    max-height: 14px;
+    text-align: center;
+    color: {p['text_primary']};
+    font-size: 11px;
+    font-weight: 600;
+}}
+
+QProgressBar#CoverageBar::chunk {{
+    background-color: {p['accent']};
+    border-radius: 6px;
+}}
+
+QProgressBar#CoverageBar[coverageLevel="full"]::chunk {{
+    background-color: {p['success']};
+}}
+
+QProgressBar#CoverageBar[coverageLevel="high"]::chunk {{
+    background-color: {p['accent']};
+}}
+
+QProgressBar#CoverageBar[coverageLevel="mid"]::chunk {{
+    background-color: {p['warning']};
+}}
+
+QProgressBar#CoverageBar[coverageLevel="low"]::chunk {{
+    background-color: {p['danger']};
+}}
+
+QFrame[coverageStat="true"] {{
+    background-color: {p['bg_surface_alt']};
+    border: 1px solid {p['border']};
+    border-radius: 8px;
+}}
+
+QFrame[coverageStat="success"] {{
+    background-color: {p['success_soft']};
+    border: 1px solid {p['border']};
+    border-radius: 8px;
+}}
+
+QFrame[coverageStat="danger"] {{
+    background-color: {p['danger_soft']};
+    border: 1px solid {p['border']};
+    border-radius: 8px;
+}}
+
+QFrame[coverageStat="accent"] {{
+    background-color: {p['accent_soft']};
+    border: 1px solid {p['border']};
+    border-radius: 8px;
+}}
+
+QLabel[coverageStatTitle="true"] {{
+    font-size: 11px;
+    color: {p['text_secondary']};
+}}
+
+QLabel[coverageStatValue="true"] {{
+    font-size: 15px;
+    font-weight: 700;
+    color: {p['text_primary']};
+}}
+
+QLabel[coverageStatValue="success"] {{
+    font-size: 15px;
+    font-weight: 700;
+    color: {p['success']};
+}}
+
+QLabel[coverageStatValue="danger"] {{
+    font-size: 15px;
+    font-weight: 700;
+    color: {p['danger']};
+}}
+
+QLabel[coverageStatValue="accent"] {{
+    font-size: 15px;
+    font-weight: 700;
+    color: {p['accent']};
+}}
+
+QPushButton[filterPill="true"] {{
+    background-color: {p['bg_surface_alt']};
+    color: {p['text_secondary']};
+    border: 1px solid {p['border']};
+    border-radius: 14px;
+    padding: 4px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    min-height: 20px;
+}}
+
+QPushButton[filterPill="true"]:hover {{
+    background-color: {p['bg_hover']};
+    color: {p['text_primary']};
+    border-color: {p['border_strong']};
+}}
+
+QPushButton[filterPill="true"]:checked {{
+    background-color: {p['accent_soft']};
+    color: {p['accent']};
+    border-color: {p['accent']};
+}}
+
+QPushButton[filterPill="true"][pillTone="danger"]:checked {{
+    background-color: {p['danger_soft']};
+    color: {p['danger']};
+    border-color: {p['danger']};
+}}
+
+QPushButton[filterPill="true"][pillTone="success"]:checked {{
+    background-color: {p['success_soft']};
+    color: {p['success']};
+    border-color: {p['success']};
+}}
+
 /* ===== Menus ===== */
 QMenu {{
     background-color: {p['bg_surface']};
