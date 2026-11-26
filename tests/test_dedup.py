@@ -190,6 +190,33 @@ class TestImportPreviewAndCommit:
                 ("MP-001", "MP-001-CD1_copy.mp4")
             ]
 
+    def test_commit_preview_infers_source_type_and_db_batch_dup_split(
+        self, tmp_path: Path
+    ) -> None:
+        with DatabaseRepository(tmp_path / "infer_st.db") as db:
+            db.add_record(_record("ABC-001", file_name="ABC-001.mp4"))
+
+            item_folder = _parsed("NEW-101", file_name="NEW-101.mp4")
+            item_folder.source_type = "folder"
+            dup1 = _parsed("ABC-001", file_name="ABC-001_copy1.mp4")
+            dup1.source_type = "folder"
+            dup2 = _parsed("ABC-001", file_name="ABC-001_copy2.mp4")
+            dup2.source_type = "folder"
+
+            preview = preview_import([item_folder, dup1, dup2], db)
+            assert len(preview.db_duplicates) == 1
+            assert len(preview.batch_duplicates) == 1
+
+            saved, batch = commit_preview(
+                preview,
+                db,
+                include_db_duplicates=True,
+                include_batch_duplicates=False,
+            )
+            assert batch.source_type == "folder"
+            # NEW-101 + only 1 copy of ABC-001 (batch duplicate excluded)
+            assert len(saved) == 2
+
 
 # ----------------------------------------------------------------------
 # 2. Pure DB compare & 3. A-vs-B cross-comparison
