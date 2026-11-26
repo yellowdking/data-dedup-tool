@@ -1,54 +1,52 @@
-"""Multi-Table Studio view (多表工作台) for 数据查重程序 v1.1.0.
+"""Multi-Table Studio view (多表工作台) for 数据查重程序 v1.2.0.
 
 Provides unified multi-format table management (Excel/Word/CSV/TXT/Database),
-virtualized preview & search, cross-table/intra-table deduplication,
-union/dedup/coalesce/join merging, and multi-format report exports.
+interactive multi-sheet / Word-table / header-row import picking, column profiling
+and renaming, virtualized preview & search, cross-table/intra-table deduplication,
+union/dedup/coalesce/join merging, and fully asynchronous background exports.
 """
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
-from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QFileDialog,
-    QFrame,
-    QHBoxLayout,
-    QInputDialog,
-    QLabel,
-    QListWidget,
-    QListWidgetItem,
-    QMenu,
-    QProgressBar,
-    QPushButton,
+    QDialog,
     QSplitter,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from src.core.doc_reader import (
-    load_tables_from_file,
-    read_database_as_table,
-)
+from src.core.doc_reader import read_database_as_table
 from src.core.table_data import (
     DataTable,
     TableDedupReport,
     TableMergeResult,
+    TableRowRef,
 )
 from src.ui.app_context import AppContext
 from src.ui.table_preview_model import DynamicTableModel
 from src.ui.tables_dedup_tab import TablesDedupTabMixin
+from src.ui.tables_dialogs import (
+    _ColumnManagerDialog,
+    _ImportOptionsDialog,
+    _PerTableKeyDialog,
+    _RowDetailDialog,
+    _call_load_tables_from_file,
+    _inspect_file_for_import,
+)
 from src.ui.tables_merge_tab import TablesMergeTabMixin
+from src.ui.tables_source_panel import TablesSourcePanelMixin
 from src.ui.tables_widgets import (
     TablesPreviewAndExportMixin,
-    _FILE_PICKER_FILTER,
     _BadgeIconCache,
     _CompactMetricCard,
     _CompactTableDropZone,
-    _PerTableKeyDialog,
     _format_row_summary,
 )
 from src.ui.widgets import ScrollableDetailDialog, WorkerThread
@@ -56,14 +54,20 @@ from src.ui.widgets import ScrollableDetailDialog, WorkerThread
 __all__ = [
     "TablesView",
     "_BadgeIconCache",
+    "_ColumnManagerDialog",
     "_CompactMetricCard",
     "_CompactTableDropZone",
+    "_ImportOptionsDialog",
     "_PerTableKeyDialog",
+    "_RowDetailDialog",
+    "_call_load_tables_from_file",
     "_format_row_summary",
+    "_inspect_file_for_import",
 ]
 
 
 class TablesView(
+    TablesSourcePanelMixin,
     TablesPreviewAndExportMixin,
     TablesDedupTabMixin,
     TablesMergeTabMixin,
@@ -79,19 +83,38 @@ class TablesView(
         self._tables: list[DataTable] = []
         self._tables_by_id: dict[str, DataTable] = {}
         self._active_table_id: Optional[str] = None
+        self._db_snapshot_stale: bool = False
 
         # Per-table custom key mappings for column_value mode
         self._dedup_custom_keys: dict[str, list[str]] = {}
         self._merge_custom_keys: dict[str, list[str]] = {}
 
-        # Last computed results
+        # Last computed results & input table snapshots
         self._last_dedup_report: Optional[TableDedupReport] = None
+        self._last_dedup_snapshot: Optional[tuple[tuple[str, str, int, int, tuple[str, ...]], ...]] = None
         self._last_merge_result: Optional[TableMergeResult] = None
+        self._last_merge_snapshot: Optional[tuple[tuple[str, str, int, int, tuple[str, ...]], ...]] = None
 
-        # Background worker threads
+        # Lazy dedup sub-tab population state & row references for double-click jump
+        self._dedup_tab_populated: set[int] = set()
+        self._dedup_tab_refs: dict[int, list[TableRowRef]] = {}
+        self._merge_dropped_refs: list[TableRowRef] = []
+
+        # Background worker threads & monotonic run generation tokens
+        self._inspect_worker: Optional[WorkerThread] = None
+        self._inspect_gen: int = 0
         self._load_worker: Optional[WorkerThread] = None
+        self._load_gen: int = 0
+        self._db_load_worker: Optional[WorkerThread] = None
+        self._db_load_gen: int = 0
         self._dedup_worker: Optional[WorkerThread] = None
+        self._dedup_gen: int = 0
         self._merge_worker: Optional[WorkerThread] = None
+        self._merge_gen: int = 0
+        self._export_worker: Optional[WorkerThread] = None
+        self._export_gen: int = 0
+        self._db_import_worker: Optional[WorkerThread] = None
+        self._db_import_gen: int = 0
 
         theme = self.ctx.config.theme
 
@@ -134,16 +157,305 @@ class TablesView(
 
         self._setup_ui()
         self.ctx.theme_changed.connect(self.apply_theme)
+        self.ctx.data_changed.connect(self._on_db_mutated)
+        self.ctx.db_switched.connect(self._on_db_mutated)
         self._sync_controls_state()
 
     # ------------------------------------------------------------------
-    # Public API (theme sync & programmatic control)
+    # Lifecycle, Worker Management & Shell Hooks
+    # ------------------------------------------------------------------
+
+    def _make_worker(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> WorkerThread:
+        """Create a WorkerThread with safe auto_delete / finished->deleteLater cleanup."""
+        sig_params = inspect.signature(WorkerThread.__init__).parameters
+        if "auto_delete" in sig_params:
+            return WorkerThread(fn, *args, parent=self, auto_delete=True, **kwargs)
+        worker = WorkerThread(fn, *args, parent=self, **kwargs)
+        worker.finished.connect(worker.deleteLater)
+        return worker
+
+    def _is_worker_running(self, worker: Optional[WorkerThread]) -> bool:
+        if worker is None:
+            return False
+        try:
+            return bool(worker.isRunning())
+        except RuntimeError:
+            return False
+
+    def _clear_worker_ref(self, attr_name: str, worker: WorkerThread) -> None:
+        if getattr(self, attr_name, None) is worker:
+            setattr(self, attr_name, None)
+        self._sync_controls_state()
+
+    def _safe_stop_worker(self, attr_name: str, timeout_ms: int = 3000) -> None:
+        worker = getattr(self, attr_name, None)
+        setattr(self, attr_name, None)
+        if worker is None:
+            return
+        try:
+            if hasattr(worker, "safe_stop"):
+                worker.safe_stop(timeout_ms=timeout_ms)
+                return
+            worker.cancel()
+            for sig_name in ("progress", "succeeded", "failed", "cancelled", "finished"):
+                sig = getattr(worker, sig_name, None)
+                if sig is not None:
+                    try:
+                        sig.disconnect()
+                    except (RuntimeError, TypeError):
+                        pass
+            if worker.isRunning():
+                worker.wait(timeout_ms)
+        except RuntimeError:
+            pass
+
+    def shutdown(self) -> None:
+        """Cleanly cancel and join all background workers before window close / DB close."""
+        self._inspect_gen += 1
+        self._load_gen += 1
+        self._db_load_gen += 1
+        self._dedup_gen += 1
+        self._merge_gen += 1
+        self._export_gen += 1
+        self._db_import_gen += 1
+
+        for timer in (
+            self._preview_search_timer,
+            self._dedup_search_timer,
+            self._merge_search_timer,
+        ):
+            timer.stop()
+
+        for attr in (
+            "_inspect_worker",
+            "_load_worker",
+            "_db_load_worker",
+            "_dedup_worker",
+            "_merge_worker",
+            "_export_worker",
+            "_db_import_worker",
+        ):
+            self._safe_stop_worker(attr, timeout_ms=3000)
+
+    def focus_search(self) -> None:
+        """Focus the active sub-tab's search input (invoked by Ctrl+F from MainWindow)."""
+        idx = self._work_tabs.currentIndex()
+        target = (
+            self._preview_search
+            if idx == 0
+            else (self._dedup_search if idx == 1 else self._merge_search)
+        )
+        target.setFocus()
+        target.selectAll()
+
+    def on_activated(self) -> None:
+        """Hook called by MainWindow when switching to Multi-Table Studio."""
+        self._update_db_stale_hint()
+
+    def _start_export_worker(
+        self,
+        task_fn: Callable[[], Any],
+        *,
+        success_msg: str,
+        error_title: str = "导出失败",
+    ) -> None:
+        """Run an export callable asynchronously off the GUI thread."""
+        if self._is_worker_running(self._export_worker):
+            self.ctx.notify("正在执行导出任务，请稍候...", "warning")
+            return
+
+        self._export_gen += 1
+        gen = self._export_gen
+        self.ctx.notify("正在后台生成导出文件...", "info")
+
+        worker = self._make_worker(task_fn)
+        self._export_worker = worker
+        worker.succeeded.connect(
+            lambda _res, g=gen, msg=success_msg: self._on_export_finished(g, msg)
+        )
+        worker.failed.connect(
+            lambda detail, g=gen, title=error_title: self._on_export_failed(g, title, detail)
+        )
+        worker.finished.connect(lambda w=worker: self._clear_worker_ref("_export_worker", w))
+        self._sync_controls_state()
+        worker.start()
+
+    def _on_export_finished(self, gen: int, success_msg: str) -> None:
+        if gen != self._export_gen:
+            return
+        self._sync_controls_state()
+        self.ctx.notify(success_msg, "success")
+
+    def _on_export_failed(self, gen: int, error_title: str, detail: str) -> None:
+        if gen != self._export_gen:
+            return
+        self._sync_controls_state()
+        ScrollableDetailDialog(error_title, "导出文件时遇到错误：", detail, parent=self).exec()
+
+    # ------------------------------------------------------------------
+    # Snapshot & Invalidation Helpers
+    # ------------------------------------------------------------------
+
+    def _compute_tables_snapshot(
+        self, tables: list[DataTable]
+    ) -> tuple[tuple[str, str, int, int, tuple[str, ...]], ...]:
+        return tuple(
+            (t.table_id, t.name, t.row_count, t.col_count, tuple(t.headers)) for t in tables
+        )
+
+    def _invalidate_stale_results(self, affected_table_ids: Optional[set[str]] = None) -> None:
+        """Invalidate dedup/merge reports whose input table snapshot is no longer valid."""
+        invalidate_dedup = False
+        if self._last_dedup_report is not None:
+            if affected_table_ids is None or self._last_dedup_snapshot is None:
+                invalidate_dedup = True
+            else:
+                snap_ids = {entry[0] for entry in self._last_dedup_snapshot}
+                if snap_ids & affected_table_ids:
+                    invalidate_dedup = True
+
+        if invalidate_dedup:
+            self._last_dedup_report = None
+            self._last_dedup_snapshot = None
+            for model in (
+                self._dedup_cross_model,
+                self._dedup_intra_model,
+                self._dedup_inter_model,
+                self._dedup_unique_model,
+                self._dedup_unrec_model,
+            ):
+                model.clear()
+            self._reset_dedup_ui()
+
+        invalidate_merge = False
+        if self._last_merge_result is not None:
+            if affected_table_ids is None or self._last_merge_snapshot is None:
+                invalidate_merge = True
+            else:
+                snap_ids = {entry[0] for entry in self._last_merge_snapshot}
+                if snap_ids & affected_table_ids:
+                    invalidate_merge = True
+
+        if invalidate_merge:
+            self._last_merge_result = None
+            self._last_merge_snapshot = None
+            self._merge_result_model.clear()
+            self._merge_dropped_model.clear()
+            self._reset_merge_ui()
+
+    def _jump_to_table_row(
+        self,
+        table_id: str,
+        row_index_1based: int,
+        fallback_ref: Optional[TableRowRef] = None,
+    ) -> None:
+        """Jump directly to (table_id, 1-based row_index) in Preview, or open full-row inspector."""
+        tbl = self._tables_by_id.get(table_id)
+        if tbl is not None and 1 <= row_index_1based <= tbl.row_count:
+            self._select_table_by_id(table_id)
+            self.switch_sub_tab(0)
+            if self._preview_model.filter_query():
+                self._preview_search.blockSignals(True)
+                self._preview_search.clear()
+                self._preview_search.blockSignals(False)
+                self._preview_model.set_filter("")
+                self._update_preview_footer()
+            view_row = self._preview_model.find_view_row_for_original(row_index_1based - 1)
+            if view_row >= 0:
+                idx = self._preview_model.index(view_row, 0)
+                self._preview_table.selectRow(view_row)
+                self._preview_table.scrollTo(idx, QAbstractItemView.ScrollHint.PositionAtCenter)
+                self._preview_table.setFocus()
+                self.ctx.notify(f"已定位到「{tbl.name}」第 {row_index_1based:,} 行", "info")
+                return
+
+        if fallback_ref is not None:
+            dlg = _RowDetailDialog(
+                title=f"行内容完整详情 — {fallback_ref.table_name} (第 {fallback_ref.row_index} 行)",
+                headers=fallback_ref.headers,
+                values=fallback_ref.row_data,
+                subtitle="原表已从工作台移除或行号已变更，以下展示报告快照中的完整行内容：",
+                can_jump=False,
+                parent=self,
+            )
+            dlg.exec()
+
+    def _open_column_manager(self, table: Optional[DataTable] = None) -> None:
+        """Open column profiling / rename / drop dialog for the active or specified table."""
+        if self._any_mutation_lock_active():
+            self.ctx.notify("后台任务运行中，请稍候再修改表结构", "warning")
+            return
+        tbl = table or self.active_table()
+        if tbl is None:
+            self.ctx.notify("请先在左侧选择一张表格", "warning")
+            return
+        if tbl.col_count == 0:
+            self.ctx.notify("当前表格暂无列可管理", "warning")
+            return
+
+        old_headers = list(tbl.headers)
+        dlg = _ColumnManagerDialog(tbl, parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        plan = dlg.get_column_plan()
+        if not plan:
+            return
+
+        new_headers = [new_name for _orig_idx, new_name in plan]
+        col_indices = [orig_idx for orig_idx, _new_name in plan]
+        if new_headers == old_headers and col_indices == list(range(len(old_headers))):
+            return
+
+        rename_map = {
+            old_headers[orig_idx]: new_name
+            for orig_idx, new_name in plan
+            if 0 <= orig_idx < len(old_headers)
+        }
+        tbl.headers = new_headers
+        tbl.rows = [
+            [row[i] if i < len(row) else "" for i in col_indices]
+            for row in tbl.rows
+        ]
+
+        # Keep custom key mappings synced with renamed/dropped columns
+        for mapping in (self._dedup_custom_keys, self._merge_custom_keys):
+            if tbl.table_id in mapping:
+                updated = [rename_map[c] for c in mapping[tbl.table_id] if c in rename_map]
+                if updated:
+                    mapping[tbl.table_id] = updated
+                else:
+                    mapping.pop(tbl.table_id, None)
+
+        # Refresh list item dimensions
+        self._table_list.blockSignals(True)
+        for idx in range(self._table_list.count()):
+            item = self._table_list.item(idx)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == tbl.table_id:
+                self._format_list_item(item, tbl)
+                break
+        self._table_list.blockSignals(False)
+
+        self._invalidate_stale_results({tbl.table_id})
+        if self._active_table_id == tbl.table_id:
+            self._show_preview_for_table(tbl.table_id)
+        self._refresh_column_and_table_selectors()
+        self._sync_controls_state()
+        self.ctx.notify(
+            f"已更新「{tbl.name}」列结构（当前 {tbl.col_count} 列）",
+            "success",
+        )
+
+    # ------------------------------------------------------------------
+    # Public API (theme sync, loading & programmatic control)
     # ------------------------------------------------------------------
 
     def apply_theme(self, theme: str) -> None:
-        """Propagate Light/Dark theme changes to all virtualized table models."""
+        """Propagate Light/Dark theme changes to all virtualized table models & metric cards."""
         for model in self._all_models:
             model.set_theme(theme)
+        for card in self._dedup_metric_cards:
+            card.apply_theme(theme)
 
     def switch_sub_tab(self, index: int) -> None:
         """Programmatically switch right-panel sub-tab (0=Preview, 1=Dedup, 2=Merge)."""
@@ -186,26 +498,149 @@ class TablesView(
         if select_first and first_new_id is not None:
             self._select_table_by_id(first_new_id)
 
-    def load_files(self, paths: list[str]) -> None:
-        """Load one or more files in a background WorkerThread."""
+    def load_files(
+        self,
+        paths: list[str],
+        *,
+        interactive: bool = True,
+        force_options_dialog: bool = False,
+        import_options: Optional[dict[str, dict[str, Any]]] = None,
+    ) -> None:
+        """Inspect and load one or more files asynchronously, with Import Picker when needed."""
         valid_paths = [str(p) for p in paths if Path(p).is_file()]
         if not valid_paths:
             return
-        if self._load_worker is not None and self._load_worker.isRunning():
+        if self._is_worker_running(self._inspect_worker) or self._is_worker_running(self._load_worker):
             self.ctx.notify("正在加载表格文件，请稍候...", "warning")
             return
 
-        self._btn_add_files.setEnabled(False)
+        if import_options is not None or not interactive:
+            self._start_load_files_worker(valid_paths, import_options or {})
+            return
+
+        inspect_candidates = [
+            p
+            for p in valid_paths
+            if force_options_dialog or Path(p).suffix.lower() in {".xlsx", ".xlsm", ".docx"}
+        ]
+        if not inspect_candidates:
+            self._start_load_files_worker(valid_paths, {})
+            return
+
+        self._inspect_gen += 1
+        gen = self._inspect_gen
         self._left_progress.setVisible(True)
         self._left_progress.setRange(0, 0)
+        self._btn_cancel_left.setVisible(True)
+
+        def _inspect_task() -> tuple[list[dict[str, Any]], list[str]]:
+            specs: list[dict[str, Any]] = []
+            errors: list[str] = []
+            for p_str in inspect_candidates:
+                try:
+                    specs.append(_inspect_file_for_import(p_str))
+                except Exception as exc:
+                    errors.append(f"{Path(p_str).name}：{exc}")
+            return specs, errors
+
+        worker = self._make_worker(_inspect_task)
+        self._inspect_worker = worker
+        worker.succeeded.connect(
+            lambda payload, g=gen, all_p=valid_paths, forced=force_options_dialog: self._on_inspect_finished(
+                g, all_p, forced, payload
+            )
+        )
+        worker.failed.connect(lambda detail, g=gen: self._on_load_failed(g, detail, is_inspect=True))
+        if hasattr(worker, "cancelled"):
+            worker.cancelled.connect(lambda g=gen: self._on_left_cancelled(g, is_inspect=True))
+        worker.finished.connect(lambda w=worker: self._clear_worker_ref("_inspect_worker", w))
+        self._sync_controls_state()
+        worker.start()
+
+    def _on_inspect_finished(
+        self,
+        gen: int,
+        all_paths: list[str],
+        force_options_dialog: bool,
+        payload: tuple[list[dict[str, Any]], list[str]],
+    ) -> None:
+        if gen != self._inspect_gen:
+            return
+        specs, inspect_errors = payload
+        self._left_progress.setVisible(False)
+        self._btn_cancel_left.setVisible(False)
+        self._sync_controls_state()
+
+        if inspect_errors:
+            ScrollableDetailDialog(
+                "部分文件检查失败",
+                f"共有 {len(inspect_errors)} 个文件无法读取结构：",
+                "\n".join(inspect_errors),
+                parent=self,
+            ).exec()
+
+        failed_names = {e.split("：", 1)[0] for e in inspect_errors}
+        remaining_paths = [p for p in all_paths if Path(p).name not in failed_names]
+        if not remaining_paths:
+            return
+
+        picker_specs: list[dict[str, Any]] = []
+        for spec in specs:
+            kind = spec.get("kind")
+            if force_options_dialog:
+                picker_specs.append(spec)
+            elif kind == "excel" and len(spec.get("sheets") or []) > 1:
+                picker_specs.append(spec)
+            elif kind == "word" and (spec.get("tables") or spec.get("paragraph_count", 0) > 0):
+                picker_specs.append(spec)
+
+        chosen_options: dict[str, dict[str, Any]] = {}
+        if picker_specs:
+            dlg = _ImportOptionsDialog(picker_specs, parent=self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                self.ctx.notify("已取消导入", "info")
+                return
+            chosen_options = dlg.get_options()
+
+            filtered_paths: list[str] = []
+            for p_str in remaining_paths:
+                opts = chosen_options.get(p_str)
+                if opts is not None:
+                    if "sheet_names" in opts and not opts["sheet_names"]:
+                        continue
+                    if (
+                        "table_indices" in opts
+                        and not opts["table_indices"]
+                        and not opts.get("include_paragraphs_as_table", False)
+                    ):
+                        continue
+                filtered_paths.append(p_str)
+            remaining_paths = filtered_paths
+            if not remaining_paths:
+                self.ctx.notify("未勾选任何可导入的工作表或表格", "warning")
+                return
+
+        self._start_load_files_worker(remaining_paths, chosen_options)
+
+    def _start_load_files_worker(
+        self,
+        paths: list[str],
+        options_by_path: dict[str, dict[str, Any]],
+    ) -> None:
+        self._load_gen += 1
+        gen = self._load_gen
+        self._left_progress.setVisible(True)
+        self._left_progress.setRange(0, 0)
+        self._btn_cancel_left.setVisible(True)
         parser_engine = self.ctx.parser
 
         def _task() -> tuple[list[DataTable], list[str]]:
             loaded: list[DataTable] = []
             errors: list[str] = []
-            for p_str in valid_paths:
+            for p_str in paths:
                 try:
-                    sub_tables = load_tables_from_file(p_str, parser_engine=parser_engine)
+                    opts = options_by_path.get(p_str, {})
+                    sub_tables = _call_load_tables_from_file(p_str, opts, parser_engine)
                     if not sub_tables:
                         errors.append(f"{Path(p_str).name}：未检测到有效数据表或非空内容")
                     else:
@@ -214,23 +649,78 @@ class TablesView(
                     errors.append(f"{Path(p_str).name}：{exc}")
             return loaded, errors
 
-        self._load_worker = WorkerThread(_task, parent=self)
-        self._load_worker.succeeded.connect(self._on_files_loaded)
-        self._load_worker.failed.connect(self._on_load_failed)
-        self._load_worker.start()
+        worker = self._make_worker(_task)
+        self._load_worker = worker
+        worker.succeeded.connect(lambda payload, g=gen: self._on_files_loaded(g, payload))
+        worker.failed.connect(lambda detail, g=gen: self._on_load_failed(g, detail))
+        if hasattr(worker, "cancelled"):
+            worker.cancelled.connect(lambda g=gen: self._on_left_cancelled(g))
+        worker.finished.connect(lambda w=worker: self._clear_worker_ref("_load_worker", w))
+        self._sync_controls_state()
+        worker.start()
 
     def load_database_table(self) -> None:
-        """Load current SQLite Data Library into the workspace as a DataTable."""
-        try:
-            db_stem = Path(self.ctx.db.db_path).stem
-            tbl = read_database_as_table(self.ctx.db, name=f"当前数据总库 ({db_stem})")
-            if tbl.row_count == 0:
-                self.ctx.notify("当前数据总库为空，暂无记录可载入", "warning")
-                return
-            self.add_tables([tbl], select_first=True)
-            self.ctx.notify(f"已载入数据总库：{tbl.row_count:,} 条记录", "success")
-        except Exception as exc:
-            ScrollableDetailDialog("载入数据总库失败", str(exc), parent=self).exec()
+        """Load current SQLite Data Library into the workspace asynchronously via WorkerThread."""
+        if self._is_worker_running(self._db_load_worker):
+            self.ctx.notify("正在载入数据总库，请稍候...", "warning")
+            return
+
+        db_repo = self.ctx.db
+        db_stem = Path(db_repo.db_path).stem if not db_repo.is_memory else "内存库"
+        tbl_name = f"当前数据总库 ({db_stem})"
+
+        self._db_load_gen += 1
+        gen = self._db_load_gen
+        self._left_progress.setVisible(True)
+        self._left_progress.setRange(0, 0)
+        self._btn_cancel_left.setVisible(True)
+
+        worker = self._make_worker(lambda: read_database_as_table(db_repo, name=tbl_name))
+        self._db_load_worker = worker
+        worker.succeeded.connect(lambda tbl, g=gen: self._on_db_table_loaded(g, tbl))
+        worker.failed.connect(lambda detail, g=gen: self._on_db_load_failed(g, detail))
+        if hasattr(worker, "cancelled"):
+            worker.cancelled.connect(lambda g=gen: self._on_left_cancelled(g, is_db=True))
+        worker.finished.connect(lambda w=worker: self._clear_worker_ref("_db_load_worker", w))
+        self._sync_controls_state()
+        worker.start()
+
+    def _on_db_table_loaded(self, gen: int, tbl: DataTable) -> None:
+        if gen != self._db_load_gen:
+            return
+        self._left_progress.setVisible(False)
+        self._btn_cancel_left.setVisible(False)
+        self._db_snapshot_stale = False
+        self._update_db_stale_hint()
+        self._sync_controls_state()
+
+        if tbl.row_count == 0:
+            self.ctx.notify("当前数据总库为空，暂无记录可载入", "warning")
+            return
+        self.add_tables([tbl], select_first=True)
+        self.ctx.notify(f"已载入数据总库：{tbl.row_count:,} 条记录", "success")
+
+    def _on_db_load_failed(self, gen: int, detail: str) -> None:
+        if gen != self._db_load_gen:
+            return
+        self._left_progress.setVisible(False)
+        self._btn_cancel_left.setVisible(False)
+        self._sync_controls_state()
+        ScrollableDetailDialog("载入数据总库失败", "后台读取数据总库时发生错误：", detail, parent=self).exec()
+
+    def _on_db_mutated(self, *_args: Any) -> None:
+        if any(t.source_type == "database" for t in self._tables):
+            self._db_snapshot_stale = True
+            self._update_db_stale_hint()
+
+    def _update_db_stale_hint(self) -> None:
+        has_db_table = any(t.source_type == "database" for t in self._tables)
+        if has_db_table and self._db_snapshot_stale:
+            self._btn_load_db.setText("↻ 重新载入数据总库 (已更新)")
+            self._btn_load_db.setToolTip("当前数据总库已发生变化，点击可载入最新快照")
+        else:
+            self._btn_load_db.setText("载入当前数据总库")
+            self._btn_load_db.setToolTip("将当前 SQLite 数据总库作为一张表载入工作台")
 
     def checked_tables(self) -> list[DataTable]:
         """Return all currently checked tables in list order."""
@@ -250,7 +740,7 @@ class TablesView(
         return None
 
     # ------------------------------------------------------------------
-    # UI Construction (Left Panel & Right Panel Container)
+    # Top-Level Layout & Control State Synchronization
     # ------------------------------------------------------------------
 
     def _setup_ui(self) -> None:
@@ -266,108 +756,9 @@ class TablesView(
         self._main_splitter.addWidget(self._build_right_panel())
         self._main_splitter.setStretchFactor(0, 0)
         self._main_splitter.setStretchFactor(1, 1)
-        self._main_splitter.setSizes([252, 800])
+        self._main_splitter.setSizes([256, 800])
 
         root.addWidget(self._main_splitter, 1)
-
-    def _build_left_panel(self) -> QWidget:
-        panel = QFrame()
-        panel.setObjectName("TablesSourcePanel")
-        panel.setProperty("card", True)
-        panel.setMinimumWidth(232)
-        panel.setMaximumWidth(360)
-
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(7)
-
-        hdr_row = QHBoxLayout()
-        hdr_lbl = QLabel("数据源表格管理")
-        hdr_lbl.setProperty("role", "section")
-        hdr_row.addWidget(hdr_lbl)
-        hdr_row.addStretch()
-        self._table_count_lbl = QLabel("0 个表")
-        self._table_count_lbl.setProperty("role", "muted")
-        hdr_row.addWidget(self._table_count_lbl)
-        layout.addLayout(hdr_row)
-
-        self._drop_zone = _CompactTableDropZone(self)
-        self._drop_zone.files_dropped.connect(self.load_files)
-        layout.addWidget(self._drop_zone)
-
-        self._btn_add_files = QPushButton("＋ 添加表格 / 文档")
-        self._btn_add_files.setToolTip("支持多选 Excel (.xlsx/.xlsm)、Word (.docx)、CSV、TXT 文件")
-        self._btn_add_files.setProperty("variant", "primary")
-        self._btn_add_files.setStyleSheet("padding: 6px 8px; font-size: 12px;")
-        self._btn_add_files.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_add_files.clicked.connect(self._pick_files)
-        layout.addWidget(self._btn_add_files)
-
-        self._btn_load_db = QPushButton("载入当前数据总库")
-        self._btn_load_db.setStyleSheet("padding: 5px 8px; font-size: 12px;")
-        self._btn_load_db.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._btn_load_db.clicked.connect(self.load_database_table)
-        layout.addWidget(self._btn_load_db)
-
-        self._left_progress = QProgressBar()
-        self._left_progress.setFixedHeight(10)
-        self._left_progress.setTextVisible(False)
-        self._left_progress.setVisible(False)
-        layout.addWidget(self._left_progress)
-
-        row1 = QHBoxLayout()
-        row1.setSpacing(6)
-        btn_sel_all = QPushButton("全选")
-        btn_sel_all.setStyleSheet("padding: 4px 8px; font-size: 12px;")
-        btn_sel_all.clicked.connect(self._select_all_tables)
-        btn_invert = QPushButton("反选")
-        btn_invert.setStyleSheet("padding: 4px 8px; font-size: 12px;")
-        btn_invert.clicked.connect(self._invert_table_checks)
-        btn_rename = QPushButton("重命名")
-        btn_rename.setStyleSheet("padding: 4px 8px; font-size: 12px;")
-        btn_rename.clicked.connect(self._rename_selected_table)
-        row1.addWidget(btn_sel_all)
-        row1.addWidget(btn_invert)
-        row1.addWidget(btn_rename)
-        layout.addLayout(row1)
-
-        row2 = QHBoxLayout()
-        row2.setSpacing(6)
-        btn_remove = QPushButton("移除选中")
-        btn_remove.setStyleSheet("padding: 4px 8px; font-size: 12px;")
-        btn_remove.clicked.connect(self._remove_selected_table)
-        btn_clear = QPushButton("清空全部")
-        btn_clear.setProperty("variant", "ghost")
-        btn_clear.setStyleSheet("padding: 4px 8px; font-size: 12px;")
-        btn_clear.clicked.connect(self._clear_all_tables)
-        row2.addWidget(btn_remove)
-        row2.addWidget(btn_clear)
-        layout.addLayout(row2)
-
-        self._table_list = QListWidget()
-        self._table_list.setObjectName("TablesSourceList")
-        self._table_list.setIconSize(QSize(44, 20))
-        self._table_list.setSpacing(3)
-        self._table_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._table_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self._table_list.customContextMenuRequested.connect(self._show_list_context_menu)
-        self._table_list.currentItemChanged.connect(self._on_list_selection_changed)
-        self._table_list.itemChanged.connect(self._on_list_item_checked)
-        layout.addWidget(self._table_list, 1)
-
-        self._checked_hint_lbl = QLabel("勾选参与查重或合并，点击表名可在右侧预览")
-        self._checked_hint_lbl.setProperty("role", "muted")
-        self._checked_hint_lbl.setWordWrap(True)
-        layout.addWidget(self._checked_hint_lbl)
-
-        self._btn_pack_xlsx = QPushButton("📦 打包多Sheet导出")
-        self._btn_pack_xlsx.setToolTip("将已勾选表格打包导出为一个多 Sheet Excel 工作簿 (.xlsx)")
-        self._btn_pack_xlsx.setStyleSheet("padding: 5px 8px; font-size: 12px;")
-        self._btn_pack_xlsx.setEnabled(False)
-        self._btn_pack_xlsx.clicked.connect(self._export_multi_sheet_workbook)
-        layout.addWidget(self._btn_pack_xlsx)
-
-        return panel
 
     def _build_right_panel(self) -> QWidget:
         container = QWidget()
@@ -384,277 +775,87 @@ class TablesView(
         layout.addWidget(self._work_tabs, 1)
         return container
 
-    # ------------------------------------------------------------------
-    # Left Panel Actions & List Management
-    # ------------------------------------------------------------------
-
-    def _create_list_item(self, tbl: DataTable) -> QListWidgetItem:
-        item = QListWidgetItem()
-        item.setFlags(
-            item.flags()
-            | Qt.ItemFlag.ItemIsUserCheckable
-            | Qt.ItemFlag.ItemIsSelectable
-            | Qt.ItemFlag.ItemIsEnabled
+    def _any_left_worker_running(self) -> bool:
+        return (
+            self._is_worker_running(self._inspect_worker)
+            or self._is_worker_running(self._load_worker)
+            or self._is_worker_running(self._db_load_worker)
         )
-        item.setCheckState(Qt.CheckState.Checked)
-        item.setData(Qt.ItemDataRole.UserRole, tbl.table_id)
-        item.setIcon(_BadgeIconCache.get(tbl.source_type))
-        self._format_list_item(item, tbl)
-        return item
 
-    def _format_list_item(self, item: QListWidgetItem, tbl: DataTable) -> None:
-        item.setText(f"{tbl.name}\n{tbl.row_count:,} 行 × {tbl.col_count} 列")
-        tooltip_parts = [
-            f"表名：{tbl.name}",
-            f"维度：{tbl.row_count:,} 行 × {tbl.col_count} 列",
-            f"类型：{tbl.source_type}",
-        ]
-        if tbl.source_path:
-            tooltip_parts.append(f"来源路径：{tbl.source_path}")
-        if tbl.sheet_name:
-            tooltip_parts.append(f"工作表/子表：{tbl.sheet_name}")
-        item.setToolTip("\n".join(tooltip_parts))
-
-    def _pick_files(self) -> None:
-        start_dir = self.ctx.config.default_import_dir or str(Path.home())
-        paths, _ = QFileDialog.getOpenFileNames(
-            self,
-            "添加表格或文档文件（支持多选）",
-            start_dir,
-            _FILE_PICKER_FILTER,
+    def _any_mutation_lock_active(self) -> bool:
+        return (
+            self._any_left_worker_running()
+            or self._is_worker_running(self._dedup_worker)
+            or self._is_worker_running(self._merge_worker)
         )
-        if paths:
-            self.ctx.config.default_import_dir = str(Path(paths[0]).parent)
-            self.ctx.config_manager.save()
-            self.load_files(paths)
-
-    def _on_files_loaded(self, payload: tuple[list[DataTable], list[str]]) -> None:
-        loaded, errors = payload
-        self._btn_add_files.setEnabled(True)
-        self._left_progress.setVisible(False)
-
-        if loaded:
-            self.add_tables(loaded, select_first=True)
-            total_rows = sum(t.row_count for t in loaded)
-            self.ctx.notify(f"成功载入 {len(loaded)} 张表（共 {total_rows:,} 行）", "success")
-        if errors:
-            ScrollableDetailDialog(
-                "部分文件未能加载",
-                f"共有 {len(errors)} 个文件加载失败或为空：",
-                "\n".join(errors),
-                parent=self,
-            ).exec()
-
-    def _on_load_failed(self, detail: str) -> None:
-        self._btn_add_files.setEnabled(True)
-        self._left_progress.setVisible(False)
-        ScrollableDetailDialog("加载文件出错", "后台读取表格文件时发生异常：", detail, parent=self).exec()
-
-    def _select_table_by_id(self, table_id: str) -> None:
-        for idx in range(self._table_list.count()):
-            item = self._table_list.item(idx)
-            if item is not None and item.data(Qt.ItemDataRole.UserRole) == table_id:
-                self._table_list.setCurrentRow(idx)
-                self._show_preview_for_table(table_id)
-                return
-
-    def _on_list_selection_changed(
-        self,
-        current: Optional[QListWidgetItem],
-        _previous: Optional[QListWidgetItem],
-    ) -> None:
-        if current is None:
-            self._active_table_id = None
-            self._show_preview_for_table(None)
-            return
-        tid = current.data(Qt.ItemDataRole.UserRole)
-        self._show_preview_for_table(tid)
-
-    def _on_list_item_checked(self, _item: QListWidgetItem) -> None:
-        self._update_table_count_ui()
-        self._refresh_column_and_table_selectors()
-        self._sync_controls_state()
-
-    def _select_all_tables(self) -> None:
-        self._table_list.blockSignals(True)
-        for idx in range(self._table_list.count()):
-            item = self._table_list.item(idx)
-            if item is not None:
-                item.setCheckState(Qt.CheckState.Checked)
-        self._table_list.blockSignals(False)
-        self._update_table_count_ui()
-        self._refresh_column_and_table_selectors()
-        self._sync_controls_state()
-
-    def _invert_table_checks(self) -> None:
-        self._table_list.blockSignals(True)
-        for idx in range(self._table_list.count()):
-            item = self._table_list.item(idx)
-            if item is not None:
-                nxt = (
-                    Qt.CheckState.Unchecked
-                    if item.checkState() == Qt.CheckState.Checked
-                    else Qt.CheckState.Checked
-                )
-                item.setCheckState(nxt)
-        self._table_list.blockSignals(False)
-        self._update_table_count_ui()
-        self._refresh_column_and_table_selectors()
-        self._sync_controls_state()
-
-    def _rename_selected_table(self) -> None:
-        item = self._table_list.currentItem()
-        if item is None:
-            self.ctx.notify("请先在左侧点击选择一张表格", "warning")
-            return
-        tid = item.data(Qt.ItemDataRole.UserRole)
-        tbl = self._tables_by_id.get(tid)
-        if tbl is None:
-            return
-        new_name, ok = QInputDialog.getText(self, "重命名表格", "请输入新的表格名称：", text=tbl.name)
-        cleaned = new_name.strip()
-        if not ok or not cleaned:
-            return
-        tbl.rename(cleaned)
-        self._table_list.blockSignals(True)
-        self._format_list_item(item, tbl)
-        self._table_list.blockSignals(False)
-        if self._active_table_id == tid:
-            self._preview_title.setText(tbl.name)
-        self._refresh_column_and_table_selectors()
-        self.ctx.notify(f"已重命名为「{cleaned}」", "success")
-
-    def _remove_selected_table(self) -> None:
-        row = self._table_list.currentRow()
-        if row < 0:
-            self.ctx.notify("请先选择要移除的表格", "warning")
-            return
-        item = self._table_list.takeItem(row)
-        if item is None:
-            return
-        tid = item.data(Qt.ItemDataRole.UserRole)
-        self._tables_by_id.pop(tid, None)
-        self._tables = [t for t in self._tables if t.table_id != tid]
-        self._dedup_custom_keys.pop(tid, None)
-        self._merge_custom_keys.pop(tid, None)
-        if self._active_table_id == tid:
-            self._active_table_id = None
-            nxt = self._table_list.currentItem()
-            self._show_preview_for_table(nxt.data(Qt.ItemDataRole.UserRole) if nxt else None)
-        self._update_table_count_ui()
-        self._refresh_column_and_table_selectors()
-        self._sync_controls_state()
-
-    def _clear_all_tables(self) -> None:
-        if not self._tables:
-            return
-        self._table_list.clear()
-        self._tables.clear()
-        self._tables_by_id.clear()
-        self._dedup_custom_keys.clear()
-        self._merge_custom_keys.clear()
-        self._active_table_id = None
-        self._last_dedup_report = None
-        self._last_merge_result = None
-
-        for model in self._all_models:
-            model.clear()
-
-        self._show_preview_for_table(None)
-        self._reset_dedup_ui()
-        self._reset_merge_ui()
-        self._update_table_count_ui()
-        self._refresh_column_and_table_selectors()
-        self._sync_controls_state()
-        self.ctx.notify("已清空工作台全部表格", "info")
-
-    def _show_list_context_menu(self, pos) -> None:
-        item = self._table_list.itemAt(pos)
-        if item is None:
-            return
-        self._table_list.setCurrentItem(item)
-        tid = item.data(Qt.ItemDataRole.UserRole)
-        tbl = self._tables_by_id.get(tid)
-        if tbl is None:
-            return
-
-        menu = QMenu(self)
-        menu.addAction("预览此表", lambda: (self._show_preview_for_table(tid), self.switch_sub_tab(0)))
-        menu.addAction("重命名...", self._rename_selected_table)
-        menu.addSeparator()
-        menu.addAction("导出为 Excel (.xlsx)", lambda: self._export_single_table(tbl, "xlsx"))
-        menu.addAction("导出为 Word (.docx)", lambda: self._export_single_table(tbl, "docx"))
-        menu.addAction("导出为 CSV", lambda: self._export_single_table(tbl, "csv"))
-        menu.addSeparator()
-        menu.addAction("移除此表", self._remove_selected_table)
-        menu.exec(self._table_list.viewport().mapToGlobal(pos))
-
-    def _update_table_count_ui(self) -> None:
-        total = len(self._tables)
-        checked = len(self.checked_tables())
-        self._table_count_lbl.setText(f"{checked}/{total} 已选")
-        self._dedup_scope_lbl.setText(f"已勾选 {checked} 张表参与")
-        self._btn_pack_xlsx.setEnabled(total > 0)
-
-    def _refresh_column_and_table_selectors(self) -> None:
-        tables = self.checked_tables()
-
-        header_counts: dict[str, int] = {}
-        ordered_headers: list[str] = []
-        for t in tables:
-            seen_in_t: set[str] = set()
-            for h in t.headers:
-                if h not in seen_in_t:
-                    seen_in_t.add(h)
-                    header_counts[h] = header_counts.get(h, 0) + 1
-                    if h not in ordered_headers:
-                        ordered_headers.append(h)
-
-        n_tables = len(tables)
-        common_headers = [h for h in ordered_headers if n_tables > 0 and header_counts.get(h, 0) == n_tables]
-        other_headers = [h for h in ordered_headers if h not in common_headers]
-
-        for combo in (self._dedup_col_combo, self._merge_col_combo):
-            prev_val = combo.currentData()
-            combo.blockSignals(True)
-            combo.clear()
-            for h in common_headers:
-                label = f"{h} (全表共有)" if n_tables > 1 else h
-                combo.addItem(label, h)
-            for h in other_headers:
-                combo.addItem(f"{h} ({header_counts[h]}/{n_tables}表)", h)
-            if combo.count() == 0:
-                combo.addItem("（无可用列）", "")
-            idx = combo.findData(prev_val) if prev_val else -1
-            combo.setCurrentIndex(idx if idx >= 0 else 0)
-            combo.blockSignals(False)
-
-        prev_primary = self._merge_primary_combo.currentData()
-        self._merge_primary_combo.blockSignals(True)
-        self._merge_primary_combo.clear()
-        for t in tables:
-            self._merge_primary_combo.addItem(f"{t.name} ({t.row_count:,}行)", t.table_id)
-        if self._merge_primary_combo.count() == 0:
-            self._merge_primary_combo.addItem("（请勾选表格）", "")
-        p_idx = self._merge_primary_combo.findData(prev_primary) if prev_primary else -1
-        self._merge_primary_combo.setCurrentIndex(p_idx if p_idx >= 0 else 0)
-        self._merge_primary_combo.blockSignals(False)
-
-        valid_ids = {t.table_id for t in self._tables}
-        self._dedup_custom_keys = {k: v for k, v in self._dedup_custom_keys.items() if k in valid_ids}
-        self._merge_custom_keys = {k: v for k, v in self._merge_custom_keys.items() if k in valid_ids}
-        self._update_custom_key_button_labels()
-
-    def _update_custom_key_button_labels(self) -> None:
-        checked_ids = {t.table_id for t in self.checked_tables()}
-        d_cnt = sum(1 for tid in checked_ids if self._dedup_custom_keys.get(tid))
-        m_cnt = sum(1 for tid in checked_ids if self._merge_custom_keys.get(tid))
-        self._btn_dedup_per_table.setText(f"按表已配({d_cnt})" if d_cnt else "按表指定")
-        self._btn_merge_per_table.setText(f"按表已配({m_cnt})" if m_cnt else "按表指定")
 
     def _sync_controls_state(self) -> None:
+        has_tables = len(self._tables) > 0
         has_checked = len(self.checked_tables()) > 0
-        self._btn_run_dedup.setEnabled(has_checked)
-        self._btn_run_merge.setEnabled(has_checked)
+        has_active = self.active_table() is not None
+
+        left_busy = self._any_left_worker_running()
+        dedup_busy = self._is_worker_running(self._dedup_worker)
+        merge_busy = self._is_worker_running(self._merge_worker)
+        export_busy = self._is_worker_running(self._export_worker)
+        db_import_busy = self._is_worker_running(self._db_import_worker)
+        mut_locked = left_busy or dedup_busy or merge_busy
+
+        # Left-panel buttons & mutation guard
+        self._btn_add_files.setEnabled(not left_busy)
+        self._btn_add_with_opts.setEnabled(not left_busy)
+        self._btn_load_db.setEnabled(not left_busy)
+        self._btn_sel_all.setEnabled(has_tables and not mut_locked)
+        self._btn_invert.setEnabled(has_tables and not mut_locked)
+        self._btn_rename.setEnabled(has_tables and not mut_locked)
+        self._btn_move_up.setEnabled(len(self._tables) > 1 and not mut_locked)
+        self._btn_move_down.setEnabled(len(self._tables) > 1 and not mut_locked)
+        self._btn_remove.setEnabled(has_tables and not mut_locked)
+        self._btn_clear.setEnabled(has_tables and not mut_locked)
+        self._btn_pack_xlsx.setEnabled(has_tables and not export_busy)
+
+        # Preview tab controls
+        self._btn_prev_cols.setEnabled(has_active and not mut_locked)
+        self._btn_prev_single_dedup.setEnabled(has_active and not dedup_busy)
+        for btn in (
+            self._btn_prev_xlsx,
+            self._btn_prev_docx,
+            self._btn_prev_csv,
+            self._btn_prev_txt,
+        ):
+            btn.setEnabled(has_active and not export_busy)
+
+        # Dedup tab controls
+        self._btn_run_dedup.setEnabled(has_checked and not dedup_busy)
+        has_dedup_report = self._last_dedup_report is not None
+        self._btn_dedup_export_xlsx.setEnabled(has_dedup_report and not export_busy)
+        self._btn_dedup_export_docx.setEnabled(has_dedup_report and not export_busy)
+        self._btn_dedup_export_csv.setEnabled(has_dedup_report and not export_busy)
+
+        # Merge tab controls
+        self._btn_merge_cols.setEnabled(has_active and not mut_locked)
+        self._btn_run_merge.setEnabled(has_checked and not merge_busy)
+        has_merge_data = (
+            self._last_merge_result is not None
+            and (
+                self._last_merge_result.merged_table.row_count > 0
+                or self._last_merge_result.merged_table.col_count > 0
+            )
+        )
+        for btn in (
+            self._btn_merge_xlsx,
+            self._btn_merge_docx,
+            self._btn_merge_csv,
+            self._btn_merge_txt,
+        ):
+            btn.setEnabled(has_merge_data and not export_busy)
+        self._btn_merge_add_workspace.setEnabled(has_merge_data and not mut_locked)
+        self._btn_merge_write_db.setEnabled(
+            has_merge_data
+            and self._last_merge_result is not None
+            and self._last_merge_result.merged_table.row_count > 0
+            and not db_import_busy
+        )
+
         self._on_dedup_mode_changed()
         self._on_merge_mode_changed()
