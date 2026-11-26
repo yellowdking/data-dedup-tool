@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .models import ParseResult
 from .normalizer import extract_part, extract_tags, normalize_width
@@ -38,21 +38,20 @@ _RE_MULTI_SPACE = re.compile(r"\s+")
 # ----------------------------------------------------------------------
 
 
-def _resolve_table_key_columns(
+def _resolve_explicit_key_columns(
     table: DataTable,
     key_columns_map: Dict[str, Any],
-    *,
-    fallback_headers: Optional[Sequence[str]] = None,
-) -> List[int]:
-    """Resolve 0-based column indices to use as key columns for ``table``.
+) -> Tuple[List[int], bool]:
+    """Resolve explicitly configured key column indices for ``table``.
 
     Lookup order in ``key_columns_map``:
     1. ``table.table_id``
     2. ``table.name``
     3. ``"*"`` (global default)
 
-    When none match explicitly, falls back to ``fallback_headers`` if supplied,
-    or column 0 if the table has at least one column.
+    Returns ``(indices, has_explicit_spec)`` where ``has_explicit_spec`` is True
+    when ``key_columns_map`` specified at least one non-empty column name for
+    this table (even if none of those column names exist in ``table.headers``).
     """
     raw_spec: Any = None
     if key_columns_map:
@@ -76,6 +75,26 @@ def _resolve_table_key_columns(
         if idx >= 0 and idx not in indices:
             indices.append(idx)
 
+    return indices, bool(col_names)
+
+
+def _resolve_table_key_columns(
+    table: DataTable,
+    key_columns_map: Dict[str, Any],
+    *,
+    fallback_headers: Optional[Sequence[str]] = None,
+) -> List[int]:
+    """Resolve 0-based column indices to use as key columns for ``table``.
+
+    Lookup order in ``key_columns_map``:
+    1. ``table.table_id``
+    2. ``table.name``
+    3. ``"*"`` (global default)
+
+    When none match explicitly, falls back to ``fallback_headers`` if supplied,
+    or column 0 if the table has at least one column.
+    """
+    indices, _ = _resolve_explicit_key_columns(table, key_columns_map)
     if indices:
         return indices
 
@@ -120,17 +139,21 @@ def _normalize_value_key(
     return text
 
 
-def _extract_column_value_key(
+def _extract_column_value_key_parts(
     row: Sequence[str],
     col_indices: Sequence[int],
     *,
     ignore_case: bool = True,
     strip_whitespace: bool = True,
     ignore_punctuation: bool = False,
-) -> str:
-    """Build a normalized single or composite key from specified row columns."""
+) -> Tuple[Tuple[str, ...], str]:
+    """Build both a collision-free tuple key and display string from row columns.
+
+    Using ``tuple[str, ...]`` internally prevents composite-key collisions when
+    individual cell values contain ``" | "``.
+    """
     if not col_indices:
-        return ""
+        return (), ""
     parts: List[str] = []
     has_non_empty = False
     for idx in col_indices:
@@ -145,23 +168,37 @@ def _extract_column_value_key(
             has_non_empty = True
         parts.append(norm)
     if not has_non_empty:
-        return ""
-    if len(parts) == 1:
-        return parts[0]
-    return " | ".join(parts)
+        return (), ""
+    display = parts[0] if len(parts) == 1 else " | ".join(parts)
+    return tuple(parts), display
+
+
+def _extract_column_value_key(
+    row: Sequence[str],
+    col_indices: Sequence[int],
+    *,
+    ignore_case: bool = True,
+    strip_whitespace: bool = True,
+    ignore_punctuation: bool = False,
+) -> str:
+    """Build a normalized single or composite display key from specified row columns."""
+    _, display = _extract_column_value_key_parts(
+        row,
+        col_indices,
+        ignore_case=ignore_case,
+        strip_whitespace=strip_whitespace,
+        ignore_punctuation=ignore_punctuation,
+    )
+    return display
 
 
 @dataclass
 class _ExtractedRowKey:
     key_value: str
     parsed_code: str = ""
-    tags: List[str] = None  # type: ignore[assignment]
+    tags: List[str] = field(default_factory=list)
     part: str = ""
     parse_result: Optional[ParseResult] = None
-
-    def __post_init__(self) -> None:
-        if self.tags is None:
-            self.tags = []
 
     @property
     def tags_str(self) -> str:
@@ -176,16 +213,25 @@ def _extract_smart_code_for_row(
     *,
     preferred_col_indices: Sequence[int] = (),
     scan_all_columns: bool = True,
+    has_explicit_columns: Optional[bool] = None,
 ) -> _ExtractedRowKey:
     """Extract canonical catalog code, version tags, and part marker from a table row."""
+    explicit_flag = (
+        bool(preferred_col_indices)
+        if has_explicit_columns is None
+        else bool(has_explicit_columns)
+    )
     col_order: List[int] = []
     for idx in preferred_col_indices:
         if 0 <= idx < len(row) and idx not in col_order:
             col_order.append(idx)
-    if scan_all_columns or not preferred_col_indices:
+    if scan_all_columns or (not col_order and not explicit_flag):
         for idx in range(len(row)):
             if idx not in col_order:
                 col_order.append(idx)
+
+    if not col_order:
+        return _ExtractedRowKey(key_value="")
 
     matched_res: Optional[ParseResult] = None
     for idx in col_order:
@@ -297,31 +343,21 @@ def run_multi_table_dedup(
     common_headers = _find_common_headers(table_list)
 
     table_key_indices: Dict[str, List[int]] = {}
+    table_has_explicit_spec: Dict[str, bool] = {}
     for tbl in table_list:
         if cfg.mode == DEDUP_MODE_SMART_CODE:
-            explicit: List[int] = []
-            raw_spec = (
-                cfg.key_columns.get(tbl.table_id)
-                or cfg.key_columns.get(tbl.name)
-                or cfg.key_columns.get("*")
-            )
-            if isinstance(raw_spec, str) and raw_spec.strip():
-                idx = tbl.get_column_index(raw_spec.strip())
-                if idx >= 0:
-                    explicit.append(idx)
-            elif isinstance(raw_spec, (list, tuple)):
-                for col_name in raw_spec:
-                    idx = tbl.get_column_index(str(col_name).strip())
-                    if idx >= 0 and idx not in explicit:
-                        explicit.append(idx)
+            explicit, has_spec = _resolve_explicit_key_columns(tbl, cfg.key_columns)
             table_key_indices[tbl.table_id] = explicit
+            table_has_explicit_spec[tbl.table_id] = has_spec
         else:
             table_key_indices[tbl.table_id] = _resolve_table_key_columns(
                 tbl, cfg.key_columns, fallback_headers=common_headers
             )
+            table_has_explicit_spec[tbl.table_id] = False
 
-    key_to_rows: Dict[str, List[TableRowRef]] = {}
-    table_key_rows: Dict[str, Dict[str, List[TableRowRef]]] = {
+    key_to_rows: Dict[Tuple[str, ...], List[TableRowRef]] = {}
+    key_display: Dict[Tuple[str, ...], str] = {}
+    table_key_rows: Dict[str, Dict[Tuple[str, ...], List[TableRowRef]]] = {
         t.table_id: {} for t in table_list
     }
     unrecognized_rows: List[TableRowRef] = []
@@ -331,6 +367,7 @@ def run_multi_table_dedup(
     for tbl in table_list:
         total_rows += tbl.row_count
         key_cols = table_key_indices[tbl.table_id]
+        has_spec = table_has_explicit_spec[tbl.table_id]
         headers_copy = list(tbl.headers)
         col_n = len(headers_copy)
 
@@ -339,7 +376,8 @@ def run_multi_table_dedup(
             row_vals = _pad_row(raw_row, col_n) if col_n else [str(v) for v in raw_row]
 
             if cfg.mode == DEDUP_MODE_SMART_CODE:
-                assert parser is not None
+                if parser is None:
+                    parser = CodeParser()
                 extracted = _extract_smart_code_for_row(
                     tbl,
                     row_vals,
@@ -347,13 +385,15 @@ def run_multi_table_dedup(
                     parser,
                     preferred_col_indices=key_cols,
                     scan_all_columns=cfg.scan_all_columns_for_code,
+                    has_explicit_columns=has_spec,
                 )
                 key_val = extracted.key_value
+                match_key: Tuple[str, ...] = (key_val,) if key_val else ()
                 parsed_code = extracted.parsed_code
                 tags_str = extracted.tags_str
                 part = extracted.part
             else:
-                key_val = _extract_column_value_key(
+                match_key, key_val = _extract_column_value_key_parts(
                     row_vals,
                     key_cols,
                     ignore_case=cfg.ignore_case,
@@ -376,34 +416,37 @@ def run_multi_table_dedup(
                 part=part,
             )
 
-            if not key_val:
+            if not match_key:
                 unrecognized_rows.append(ref)
                 unrecognized_count_by_table[tbl.table_id] += 1
                 continue
 
-            key_to_rows.setdefault(key_val, []).append(ref)
-            table_key_rows[tbl.table_id].setdefault(key_val, []).append(ref)
+            key_display.setdefault(match_key, key_val)
+            key_to_rows.setdefault(match_key, []).append(ref)
+            table_key_rows[tbl.table_id].setdefault(match_key, []).append(ref)
 
     cross_table_groups: List[TableDuplicateGroup] = []
-    intersection_keys: List[str] = []
+    intersection_match_keys: List[Tuple[str, ...]] = []
     intersection_rows: List[TableRowRef] = []
     unique_by_table: Dict[str, List[TableRowRef]] = {t.table_id: [] for t in table_list}
-    cross_dup_keys: set[str] = set()
+    cross_dup_keys: set[Tuple[str, ...]] = set()
+    table_name_by_tid = {t.table_id: t.name for t in table_list}
 
     num_tables = len(table_list)
     all_table_ids = {t.table_id for t in table_list}
 
-    for key_val, refs in key_to_rows.items():
+    for match_key, refs in key_to_rows.items():
+        display_key = key_display[match_key]
         distinct_tids = list(dict.fromkeys(r.table_id for r in refs))
-        distinct_tnames = list(dict.fromkeys(r.table_name for r in refs))
+        distinct_tnames = [table_name_by_tid.get(tid, "") for tid in distinct_tids]
         t_count = len(distinct_tids)
 
         if t_count >= 2:
-            cross_dup_keys.add(key_val)
+            cross_dup_keys.add(match_key)
             if cfg.include_cross_table:
                 cross_table_groups.append(
                     TableDuplicateGroup(
-                        key_value=key_val,
+                        key_value=display_key,
                         is_cross_table=True,
                         table_names=distinct_tnames,
                         table_count=t_count,
@@ -412,14 +455,15 @@ def run_multi_table_dedup(
                     )
                 )
             if num_tables >= 2 and set(distinct_tids) == all_table_ids:
-                intersection_keys.append(key_val)
+                intersection_match_keys.append(match_key)
         elif t_count == 1:
             unique_by_table[distinct_tids[0]].extend(refs)
 
     cross_table_groups.sort(key=lambda g: (-g.table_count, -g.total_rows, g.key_value))
-    intersection_keys.sort()
-    for key_val in intersection_keys:
-        intersection_rows.extend(key_to_rows[key_val])
+    intersection_match_keys.sort(key=lambda mk: (key_display[mk], mk))
+    intersection_keys: List[str] = [key_display[mk] for mk in intersection_match_keys]
+    for mk in intersection_match_keys:
+        intersection_rows.extend(key_to_rows[mk])
 
     for tid in unique_by_table:
         unique_by_table[tid].sort(key=lambda r: r.row_index)
@@ -430,14 +474,14 @@ def run_multi_table_dedup(
 
     for tbl in table_list:
         per_key = table_key_rows[tbl.table_id]
-        for key_val, t_refs in per_key.items():
+        for match_key, t_refs in per_key.items():
             if len(t_refs) >= 2:
                 intra_dup_row_count_by_table[tbl.table_id] += len(t_refs)
                 intra_dup_group_count_by_table[tbl.table_id] += 1
                 if cfg.include_intra_table:
                     intra_table_groups.append(
                         TableDuplicateGroup(
-                            key_value=key_val,
+                            key_value=key_display[match_key],
                             is_cross_table=False,
                             table_names=[tbl.name],
                             table_count=1,
