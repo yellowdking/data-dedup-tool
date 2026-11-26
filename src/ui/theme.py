@@ -118,6 +118,67 @@ QLabel[role="muted"] {{
     color: {p['text_muted']};
 }}
 
+/* ===== Badge Pills ===== */
+QLabel[badge="true"], QLabel[badge="accent"], QLabel[badge="primary"], QLabel[badge="info"] {{
+    background-color: {p['accent_soft']};
+    color: {p['accent']};
+    border: 1px solid {p['border']};
+    border-radius: 10px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}}
+
+QLabel[badge="success"] {{
+    background-color: {p['success_soft']};
+    color: {p['success']};
+    border: 1px solid {p['border']};
+    border-radius: 10px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}}
+
+QLabel[badge="warning"] {{
+    background-color: {p['warning_soft']};
+    color: {p['warning']};
+    border: 1px solid {p['border']};
+    border-radius: 10px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}}
+
+QLabel[badge="danger"] {{
+    background-color: {p['danger_soft']};
+    color: {p['danger']};
+    border: 1px solid {p['border']};
+    border-radius: 10px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}}
+
+QLabel[badge="purple"] {{
+    background-color: {p['purple_soft']};
+    color: {p['purple']};
+    border: 1px solid {p['border']};
+    border-radius: 10px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}}
+
+QLabel[badge="muted"], QLabel[badge="neutral"] {{
+    background-color: {p['bg_surface_alt']};
+    color: {p['text_secondary']};
+    border: 1px solid {p['border']};
+    border-radius: 10px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+}}
+
 /* ===== Sidebar ===== */
 QFrame#Sidebar {{
     background-color: {p['bg_sidebar']};
@@ -285,6 +346,23 @@ QPushButton[variant="ghost"]:hover {{
     color: {p['text_primary']};
 }}
 
+QPushButton[variant="outline"] {{
+    background-color: transparent;
+    border: 1px solid {p['accent']};
+    color: {p['accent']};
+    font-weight: 600;
+}}
+
+QPushButton[variant="outline"]:hover {{
+    background-color: {p['accent_soft']};
+}}
+
+QPushButton[size="sm"], QPushButton[compact="true"] {{
+    padding: 4px 10px;
+    font-size: 12px;
+    min-height: 18px;
+}}
+
 /* ===== Inputs ===== */
 QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QComboBox {{
     background-color: {p['bg_input']};
@@ -351,6 +429,134 @@ QTabBar::tab:selected {{
     font-weight: 700;
 }}
 
+QTabWidget[subtabs="true"]::pane {{
+    border: 1px solid {p['border']};
+    border-radius: 8px;
+    background-color: {p['bg_surface']};
+    top: -1px;
+}}
+
+QTabWidget[subtabs="true"] QTabBar::tab {{
+    padding: 6px 12px;
+    font-size: 12px;
+    margin-right: 3px;
+}}
+
+QTabBar QToolButton {{
+    background-color: {p['bg_surface']};
+    color: {p['text_secondary']};
+    border: 1px solid {p['border']};
+    border-radius: 5px;
+    margin: 2px;
+}}
+
+QTabBar QToolButton:hover {{
+    background-color: {p['bg_hover']};
+    color: {p['text_primary']};
+    border-color: {p['border_strong']};
+}}
+
+/* ===== Group Box & Scroll Area ===== */
+QScrollArea {{
+    background: transparent;
+    border: none;
+}}
+
+QScrollArea > QWidget > QWidget {{
+    background: transparent;
+}}
+
+QGroupBox {{
+    background-color: {p['bg_surface']};
+    border: 1px solid {p['border']};
+    border-radius: 8px;
+    margin-top: 10px;
+    padding: 12px 10px 10px 10px;
+    font-weight: 600;
+    color: {p['text_primary']};
+}}
+
+QGroupBox::title {{
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 10px;
+    padding: 0 6px;
+    color: {p['text_secondary']};
+}}
+
+/* ===== Lists (Checkable Table List, etc.) ===== */
+QListWidget, QListView {{
+    background-color: {p['bg_surface']};
+    color: {p['text_primary']};
+    border: 1px solid {p['border']};
+    border-radius: 8px;
+    padding: 4px;
+    outline: none;
+}}
+
+QListWidget::item, QListView::item {{
+    padding: 7px 10px;
+    border-radius: 6px;
+    margin: 1px 0px;
+    color: {p['text_primary']};
+}}
+
+QListWidget::item:hover, QListView::item:hover {{
+    background-color: {p['bg_hover']};
+}}
+
+QListWidget::item:selected, QListView::item:selected {{
+    background-color: {p['bg_selected']};
+    color: {p['text_primary']};
+    font-weight: 600;
+}}
+
+/* ===== Multi-Table Studio Specific Polish ===== */
+QFrame#TablesSourcePanel {{
+    background-color: {p['bg_surface']};
+    border: 1px solid {p['border']};
+    border-radius: 10px;
+}}
+
+QListWidget#TablesSourceList {{
+    background-color: {p['bg_surface_alt']};
+    border: 1px solid {p['border']};
+    border-radius: 8px;
+    padding: 4px;
+}}
+
+QListWidget#TablesSourceList::item {{
+    background-color: {p['bg_surface']};
+    border: 1px solid transparent;
+    border-radius: 7px;
+    padding: 7px 8px;
+    margin: 2px 0px;
+}}
+
+QListWidget#TablesSourceList::item:hover {{
+    background-color: {p['bg_hover']};
+    border-color: {p['border']};
+}}
+
+QListWidget#TablesSourceList::item:selected {{
+    background-color: {p['bg_selected']};
+    border-color: {p['accent']};
+    color: {p['text_primary']};
+    font-weight: 600;
+}}
+
+QTabWidget#TablesWorkTabs::pane {{
+    border: 1px solid {p['border']};
+    border-radius: 10px;
+    background-color: {p['bg_surface']};
+    top: -1px;
+}}
+
+QTabWidget#TablesWorkTabs QTabBar::tab {{
+    padding: 8px 16px;
+    font-size: 13px;
+}}
+
 /* ===== Tables & Trees ===== */
 QTableView, QTableWidget, QTreeWidget {{
     background-color: {p['bg_surface']};
@@ -387,6 +593,13 @@ QHeaderView::section {{
 QHeaderView::section:hover {{
     background-color: {p['bg_hover']};
     color: {p['text_primary']};
+}}
+
+QTableCornerButton::section {{
+    background-color: {p['bg_surface_alt']};
+    border: none;
+    border-right: 1px solid {p['border']};
+    border-bottom: 1px solid {p['border']};
 }}
 
 /* ===== Progress Bar ===== */
@@ -478,6 +691,26 @@ QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{
 /* ===== Splitter & Status Bar ===== */
 QSplitter::handle {{
     background-color: {p['border']};
+    border-radius: 2px;
+}}
+
+QSplitter::handle:horizontal {{
+    width: 5px;
+    margin: 4px 2px;
+    background-color: transparent;
+    border-left: 1px solid {p['border']};
+}}
+
+QSplitter::handle:vertical {{
+    height: 5px;
+    margin: 2px 4px;
+    background-color: transparent;
+    border-top: 1px solid {p['border']};
+}}
+
+QSplitter::handle:hover {{
+    background-color: {p['accent_soft']};
+    border-color: {p['accent']};
 }}
 
 QStatusBar {{
