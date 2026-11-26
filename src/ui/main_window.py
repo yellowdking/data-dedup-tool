@@ -30,7 +30,11 @@ from src.ui.view_duplicates import DuplicatesView
 from src.ui.view_import import ImportView
 from src.ui.view_library import LibraryView
 from src.ui.view_settings import SettingsView
+from src.ui.view_tables import TablesView
 from src.ui.widgets import ScrollableDetailDialog, StatCard, ToastNotification
+
+
+APP_VERSION = "v1.1.0"
 
 
 class MainWindow(QMainWindow):
@@ -39,7 +43,7 @@ class MainWindow(QMainWindow):
     def __init__(self, ctx: AppContext, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.ctx = ctx
-        self.setWindowTitle(APP_NAME)
+        self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.setMinimumSize(1080, 700)
 
         icon_path = get_resource_path(Path("src") / "resources" / "app.ico")
@@ -70,9 +74,9 @@ class MainWindow(QMainWindow):
         # ---- Left Sidebar ----
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
-        sidebar.setFixedWidth(212)
+        sidebar.setFixedWidth(196)
         sb_layout = QVBoxLayout(sidebar)
-        sb_layout.setContentsMargins(14, 18, 14, 16)
+        sb_layout.setContentsMargins(12, 16, 12, 14)
         sb_layout.setSpacing(6)
 
         # Brand block
@@ -93,7 +97,7 @@ class MainWindow(QMainWindow):
         brand_text.setSpacing(1)
         title_lbl = QLabel(APP_NAME)
         title_lbl.setObjectName("AppBrandTitle")
-        sub_lbl = QLabel("智能编码查重工作台")
+        sub_lbl = QLabel("多表与多格式智能查重")
         sub_lbl.setObjectName("AppBrandSub")
         brand_text.addWidget(title_lbl)
         brand_text.addWidget(sub_lbl)
@@ -109,9 +113,10 @@ class MainWindow(QMainWindow):
         nav_defs = [
             ("📚  数据总库", 0),
             ("📥  批量导入", 1),
-            ("🔍  快速查重", 2),
-            ("🧩  重复项中心", 3),
-            ("⚙️  规则测试 && 设置", 4),
+            ("📊  多表工作台", 2),
+            ("🔍  快速查重", 3),
+            ("🧩  重复项中心", 4),
+            ("⚙️  规则与设置", 5),
         ]
         self._nav_buttons: list[QPushButton] = []
         for label, idx in nav_defs:
@@ -123,6 +128,7 @@ class MainWindow(QMainWindow):
             sb_layout.addWidget(btn)
             self._nav_buttons.append(btn)
 
+        self._dup_nav_btn = self._nav_buttons[4]
         self._nav_buttons[0].setChecked(True)
         self._nav_group.idClicked.connect(self.switch_view)
 
@@ -134,7 +140,7 @@ class MainWindow(QMainWindow):
         self._theme_btn.clicked.connect(self._toggle_theme)
         sb_layout.addWidget(self._theme_btn)
 
-        ver_lbl = QLabel("v1.0.0 · 本地离线安全运行")
+        ver_lbl = QLabel(f"{APP_VERSION} · 本地离线安全运行")
         ver_lbl.setProperty("role", "muted")
         ver_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sb_layout.addWidget(ver_lbl)
@@ -203,12 +209,14 @@ class MainWindow(QMainWindow):
         self._stack = QStackedWidget()
         self.library_view = LibraryView(self.ctx, self)
         self.import_view = ImportView(self.ctx, self)
+        self.tables_view = TablesView(self.ctx, self)
         self.compare_view = CompareView(self.ctx, self)
         self.duplicates_view = DuplicatesView(self.ctx, self)
         self.settings_view = SettingsView(self.ctx, self)
 
         self._stack.addWidget(self.library_view)
         self._stack.addWidget(self.import_view)
+        self._stack.addWidget(self.tables_view)
         self._stack.addWidget(self.compare_view)
         self._stack.addWidget(self.duplicates_view)
         self._stack.addWidget(self.settings_view)
@@ -221,7 +229,7 @@ class MainWindow(QMainWindow):
         self._toast = ToastNotification(self)
 
     def switch_view(self, index: int) -> None:
-        titles = ["数据总库", "批量导入", "快速查重", "重复项中心", "规则测试 & 设置"]
+        titles = ["数据总库", "批量导入", "多表工作台", "快速查重", "重复项中心", "规则与设置"]
         if 0 <= index < self._stack.count():
             self._stack.setCurrentIndex(index)
             self._page_title.setText(titles[index])
@@ -243,7 +251,7 @@ class MainWindow(QMainWindow):
             if stats.duplicate_groups > 0
             else "🧩  重复项中心"
         )
-        self._nav_buttons[3].setText(dup_label)
+        self._dup_nav_btn.setText(dup_label)
 
     def _refresh_db_combo(self, *_args) -> None:
         current_path = str(Path(self.ctx.db.db_path).resolve())
@@ -312,6 +320,8 @@ class MainWindow(QMainWindow):
         app = QApplication.instance()
         if app is not None:
             app.setStyleSheet(build_stylesheet(theme))
+        if hasattr(self, "tables_view") and hasattr(self.tables_view, "apply_theme"):
+            self.tables_view.apply_theme(theme)
         if theme == "dark":
             self._theme_btn.setText("☀️ 切换浅色模式")
         else:
