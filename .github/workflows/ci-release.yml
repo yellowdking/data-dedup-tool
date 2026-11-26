@@ -86,18 +86,11 @@ jobs:
             Write-Error "Executable not found: $asciiExe"
             exit 1
           }
-          $tmpDataDir = Join-Path $env:RUNNER_TEMP "dedup_ci_smoke"
-          if (Test-Path $tmpDataDir) { Remove-Item $tmpDataDir -Recurse -Force }
-          New-Item -ItemType Directory -Path $tmpDataDir -Force | Out-Null
-          $env:QT_QPA_PLATFORM = "offscreen"
-          & $asciiExe --smoke-test --data-dir $tmpDataDir
-          $exitCode = $LASTEXITCODE
-          Remove-Item $tmpDataDir -Recurse -Force -ErrorAction SilentlyContinue
-          if ($exitCode -ne 0) {
-            Write-Error "Frozen EXE --smoke-test failed with exit code $exitCode"
-            exit $exitCode
+          python -c "from pathlib import Path; from scripts.build_exe import run_frozen_smoke_test; raise SystemExit(run_frozen_smoke_test(Path('dist/data-dedup-tool.exe')))"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Frozen EXE --smoke-test failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
           }
-          Write-Host "Frozen EXE --smoke-test passed (exit code 0)."
 
       - name: Verify EXE metadata and prepare release assets + SHA256SUMS
         shell: pwsh
