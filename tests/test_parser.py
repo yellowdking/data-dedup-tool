@@ -460,6 +460,7 @@ def test_custom_rule_overrides_builtin_and_persists(tmp_path: Path) -> None:
 
 def test_normalizer_helpers() -> None:
     assert normalize_width("ＡＢＣ－００１") == "ABC-001"
+    assert normalize_width("【ＡＢＣ－００１＃／（）＿】") == "[ABC-001#/()_]"
     assert normalize_serial_number("000123") == "123"
     assert normalize_serial_number("00001", from_raw_cid=True) == "001"
     assert normalize_serial_number("0123") == "0123"
@@ -467,3 +468,129 @@ def test_normalizer_helpers() -> None:
     assert extract_part("ABC-123_CD2.mp4") == "CD2"
     assert "字幕" in extract_tags("ABC-123 中文字幕.mp4")
     assert parse_code("ABC-123.mp4").canonical_code == "ABC-123"
+
+
+# ---------------------------------------------------------------------------
+# 13. v1.1.0 Hardening: full-width normalization, composite #/No., adjacent CJK,
+#     and office/Excel false-positive guards
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "raw, expected_code",
+    [
+        ("ＡＢＣ－００１.mp4", "ABC-001"),
+        ("ＡＢＣ－００１．ｍｐ４", "ABC-001"),
+        ("ＦＣ２－ＰＰＶ－１２３４５６７.mp4", "FC2-PPV-1234567"),
+        ("ＦＣ２　ＰＰＶ＃１２３４５６７.mkv", "FC2-PPV-1234567"),
+        ("【归档】ＰＲＪ＿００４２（４Ｋ）.mp4", "PRJ-0042"),
+        ("（精选）ＤＯＣ－８８８／完整版.mkv", "DOC-888"),
+    ],
+)
+def test_v11_fullwidth_normalization_and_matching(
+    parser: CodeParser, raw: str, expected_code: str
+) -> None:
+    res = parser.parse_single(raw)
+    assert res.recognized is True
+    assert res.canonical_code == expected_code
+
+
+def test_v11_fullwidth_extension_and_tag(parser: CodeParser) -> None:
+    res = parser.parse_single("【归档】ＰＲＪ＿００４２（４Ｋ）．ｍｐ４")
+    assert res.canonical_code == "PRJ-0042"
+    assert res.file_ext == ".mp4"
+    assert "4K" in res.tags
+
+
+@pytest.mark.parametrize(
+    "raw, expected_code",
+    [
+        ("FC2-PPV#1234567.mp4", "FC2-PPV-1234567"),
+        ("FC2 PPV #1234567.mp4", "FC2-PPV-1234567"),
+        ("FC2 PPV # 1234567.mkv", "FC2-PPV-1234567"),
+        ("FC2-PPV-No.1234567.mp4", "FC2-PPV-1234567"),
+        ("FC2 PPV No. 1234567.mp4", "FC2-PPV-1234567"),
+        ("FC2#1234567.mp4", "FC2-PPV-1234567"),
+        ("FC2-PPV №1234567.mp4", "FC2-PPV-1234567"),
+    ],
+)
+def test_v11_composite_hash_and_no_separators(
+    parser: CodeParser, raw: str, expected_code: str
+) -> None:
+    res = parser.parse_single(raw)
+    assert res.recognized is True
+    assert res.canonical_code == expected_code
+    assert res.prefix == "FC2-PPV"
+
+
+@pytest.mark.parametrize(
+    "raw, expected_code, expected_tag, expected_part",
+    [
+        ("ABC-123中字.mp4", "ABC-123", "字幕", ""),
+        ("测试前缀ABC-123高清版.mkv", "ABC-123", "", ""),
+        ("【收藏】XYZ-0098完整版.mp4", "XYZ-0098", "", ""),
+        ("项目清单PRJ-0042中文字幕版.mkv", "PRJ-0042", "字幕", ""),
+        ("归档ABC-123-C中文标题.mp4", "ABC-123", "字幕", ""),
+        ("归档ABC-123-UC完整版.mp4", "ABC-123", "特殊版", ""),
+        ("归档ABC-123-CD1高清版.mp4", "ABC-123", "", "CD1"),
+        ("归档ABC-123-A中文.mp4", "ABC-123", "", "A"),
+        ("测试FC2-PPV#1234567中字.mp4", "FC2-PPV-1234567", "字幕", ""),
+        ("前缀300AAA-123高清4K版.mkv", "300AAA-123", "4K", ""),
+    ],
+)
+def test_v11_adjacent_cjk_boundaries_tags_and_parts(
+    parser: CodeParser,
+    raw: str,
+    expected_code: str,
+    expected_tag: str,
+    expected_part: str,
+) -> None:
+    res = parser.parse_single(raw)
+    assert res.recognized is True
+    assert res.canonical_code == expected_code
+    if expected_tag:
+        assert expected_tag in res.tags
+    if expected_part:
+        assert res.part == expected_part
+
+
+@pytest.mark.parametrize(
+    "office_noise",
+    [
+        "2024-05-12",
+        "2026-11-26",
+        "2025/01/15",
+        "2024.05.12",
+        "2026-11-26T14:30:22Z",
+        "20240512",
+        "2024年05月12日",
+        "14:30:22",
+        "09:05",
+        "138-1234-5678",
+        "13812345678",
+        "+86-138-1234-5678",
+        "010-88886666",
+        "400-800-1234",
+        "¥128.00",
+        "￥1,280.50",
+        "$99.99",
+        "USD 128.00",
+        "CNY 256.00",
+        "RMB128",
+        "No.001",
+        "TEL-123456",
+        "FAX-8888",
+        "alice123@company.com",
+    ],
+)
+def test_v11_office_date_price_phone_false_positive_rejection(
+    parser: CodeParser, office_noise: str
+) -> None:
+    res = parser.parse_single(office_noise)
+    assert res.recognized is False
+    assert res.canonical_code == ""
+
+
+def test_v11_mixed_office_row_keeps_real_code_only(parser: CodeParser) -> None:
+    row_text = "2026-11-26 | ABC-123中字 | ¥128.00 | 138-1234-5678 | alice123@company.com"
+    results = parser.parse_line(row_text)
+    assert [r.canonical_code for r in results] == ["ABC-123"]
+    assert "字幕" in results[0].tags
