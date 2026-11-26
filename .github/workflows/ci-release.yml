@@ -15,6 +15,9 @@ jobs:
   test-and-build:
     name: Test & Build Windows EXE
     runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
 
     steps:
       - name: Checkout repository
@@ -57,26 +60,29 @@ jobs:
       - name: Verify built executable and prepare release assets
         shell: pwsh
         run: |
-          $exe = "dist\数据查重程序.exe"
-          if (-not (Test-Path $exe)) {
-            Write-Error "Executable not found: $exe"
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $asciiExe = "dist\data-dedup-tool.exe"
+          if (-not (Test-Path $asciiExe)) {
+            Write-Error "Executable not found: $asciiExe"
             exit 1
           }
-          $item = Get-Item $exe
+          $item = Get-Item $asciiExe
           if ($item.Length -lt 1MB) {
             Write-Error "Executable size is unexpectedly small: $($item.Length) bytes"
             exit 1
           }
-          Copy-Item $exe "dist\data-dedup-tool-windows-x64.exe" -Force
-          Compress-Archive -Path $exe -DestinationPath "dist\data-dedup-tool-windows-x64.zip" -Force
-          Write-Host ("Verified {0} ({1:N2} MB)" -f $item.FullName, ($item.Length / 1MB))
+          Copy-Item $asciiExe "dist\data-dedup-tool-windows-x64.exe" -Force
+          python -c "import zipfile; zf = zipfile.ZipFile('dist/data-dedup-tool-windows-x64.zip', 'w', compression=zipfile.ZIP_DEFLATED); zf.write('dist/data-dedup-tool.exe', arcname='\u6570\u636e\u67e5\u91cd\u7a0b\u5e8f.exe'); zf.close()"
+          $zipItem = Get-Item "dist\data-dedup-tool-windows-x64.zip"
+          Write-Host ("Verified EXE: {0} ({1:N2} MB)" -f $item.Name, ($item.Length / 1MB))
+          Write-Host ("Verified ZIP: {0} ({1:N2} MB)" -f $zipItem.Name, ($zipItem.Length / 1MB))
 
       - name: Upload Windows EXE artifact
         uses: actions/upload-artifact@v4
         with:
           name: data-dedup-tool-windows-exe
           path: |
-            dist/数据查重程序.exe
+            dist/data-dedup-tool-windows-x64.exe
             dist/data-dedup-tool-windows-x64.zip
           if-no-files-found: error
 

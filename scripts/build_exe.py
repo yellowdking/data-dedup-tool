@@ -1,16 +1,32 @@
-"""Helper script to package 数据查重程序 into a single-file Windows executable."""
+"""Helper script to package data-dedup-tool into a single-file Windows executable."""
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SPEC_FILE = PROJECT_ROOT / "build.spec"
-DIST_EXE = PROJECT_ROOT / "dist" / "数据查重程序.exe"
+DIST_ASCII_EXE = PROJECT_ROOT / "dist" / "data-dedup-tool.exe"
+DIST_CN_EXE = PROJECT_ROOT / "dist" / "数据查重程序.exe"
 ICON_FILE = PROJECT_ROOT / "src" / "resources" / "app.ico"
+
+
+def _utf8_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
 
 
 def ensure_icon() -> None:
@@ -25,7 +41,7 @@ def ensure_icon() -> None:
     for script_path, cmd in candidates:
         if script_path.exists():
             print("Generating application icon:", " ".join(cmd))
-            res = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
+            res = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=_utf8_env())
             if res.returncode != 0:
                 print(f"Warning: icon generator exited with code {res.returncode}", file=sys.stderr)
             break
@@ -54,17 +70,20 @@ def main() -> int:
         str(SPEC_FILE),
     ]
     print("Running:", " ".join(cmd))
-    result = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
+    result = subprocess.run(cmd, cwd=str(PROJECT_ROOT), env=_utf8_env())
     if result.returncode != 0:
         print(f"PyInstaller failed with exit code {result.returncode}", file=sys.stderr)
         return result.returncode
 
-    if not DIST_EXE.exists():
-        print(f"Error: expected output executable not found at {DIST_EXE}", file=sys.stderr)
+    if not DIST_ASCII_EXE.exists():
+        print(f"Error: expected output executable not found at {DIST_ASCII_EXE}", file=sys.stderr)
         return 1
 
-    size_mb = DIST_EXE.stat().st_size / (1024 * 1024)
-    print(f"Build succeeded: {DIST_EXE} ({size_mb:.2f} MB)")
+    shutil.copy2(DIST_ASCII_EXE, DIST_CN_EXE)
+
+    size_mb = DIST_ASCII_EXE.stat().st_size / (1024 * 1024)
+    print(f"Build succeeded: {DIST_ASCII_EXE} ({size_mb:.2f} MB)")
+    print(f"Localized copy created: {DIST_CN_EXE.name} ({size_mb:.2f} MB)")
     return 0
 
 

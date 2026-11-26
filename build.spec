@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller build specification for 数据查重程序 (Windows single-file GUI)."""
+"""PyInstaller build specification for data-dedup-tool (Windows single-file GUI)."""
 
 from pathlib import Path
 
@@ -79,7 +79,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="数据查重程序",
+    name="data-dedup-tool",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
