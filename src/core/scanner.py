@@ -8,17 +8,19 @@ reconstruction and companion-file classification. All terminology is strictly ne
 from __future__ import annotations
 
 import csv
-import datetime as _dt
 import io
-import math
 import os
 import re
 from pathlib import Path
 from typing import Callable, Collection, Optional, Sequence, Union
 
+from .io_utils import (
+    normalize_cell_text,
+    normalize_companion_extensions,
+    read_text_auto_encoding,
+)
 from .models import ScannedItem
-from .normalizer import is_companion_extension, split_known_extension
-
+from .normalizer import split_known_extension
 
 # Supported document extensions accepted by `scan_document_file`.
 SUPPORTED_DOCUMENT_EXTENSIONS: frozenset[str] = frozenset(
@@ -34,19 +36,6 @@ SUPPORTED_DOCUMENT_EXTENSIONS: frozenset[str] = frozenset(
     }
 )
 
-_RE_FLOAT_INT_STR = re.compile(r"^(-?\d+)\.0+$")
-
-
-# Encodings tried in order when decoding unknown TXT/CSV files on Windows.
-_CANDIDATE_ENCODINGS: tuple[str, ...] = (
-    "utf-8-sig",
-    "utf-8",
-    "gb18030",
-    "big5",
-    "cp932",
-    "utf-16",
-)
-
 # Directories skipped during local filesystem scans.
 _IGNORED_SYSTEM_DIRS: frozenset[str] = frozenset(
     {
@@ -60,21 +49,23 @@ _IGNORED_SYSTEM_DIRS: frozenset[str] = frozenset(
 )
 
 # Tree-drawing detection and parsing patterns.
-_RE_TREE_BRANCH = re.compile(r"^([│|\s]*)(?:[├└][─━-]+\s*|\+---\\?|\+---|\+---|\\---)(.+)$")
-_RE_TREE_BRANCH_ALT = re.compile(r"^([│|\s]*)(?:├──|└──|├───|└───|\+---|\\---)\s*(.+)$")
-_RE_TREE_LEAF = re.compile(r"^([│|][\s│|]*|\s{2,})([^\s│|├└+\\].*)$")
+# Match 3-dash (`├───`/`└───`) or longer before 2-dash (`├──`/`└──`) cleanly via `{2,}`.
+_RE_TREE_BRANCH = re.compile(r"^([│|\s]*)(?:[├└][─━-]{2,}|\+---|\\---)\s*(.+)$")
+# Match leaf lines with vertical bars (including space-prefixed `    │   file.mp4`) or 2+ spaces.
+_RE_TREE_LEAF = re.compile(r"^([\s│|]*[│|][\s│|]*|\s{2,})([^\s│|├└+\\].*)$")
 _RE_TREE_HEADER = re.compile(
     r"^(?:Folder PATH listing|Volume serial number|卷\s+.+?\s+的文件夹\s*PATH\s*列表|卷序列号为)",
     re.IGNORECASE,
 )
 _RE_DRIVE_ROOT = re.compile(r"^[A-Za-z]:[\\/.]*$")
 
-# Windows `dir` listing patterns.
+# Windows `dir` listing patterns (supports ISO/CJK YYYY/MM/DD, US MM/DD/YYYY AM/PM, EU DD.MM.YYYY, and 上午/下午).
 _RE_DIR_HEADER_EN = re.compile(r"^\s*Directory of\s+(.+?)\s*$", re.IGNORECASE)
 _RE_DIR_HEADER_CN = re.compile(r"^\s*(.+?)\s*的目录\s*$")
 _RE_DIR_ENTRY = re.compile(
-    r"^\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?\s+"
-    r"(<DIR>|[\d,]+)\s+(.+?)\s*$",
+    r"^\s*(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\s+"
+    r"(?:(?:上午|下午)\s*)?\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?\s+"
+    r"(<DIR>|[\d,.\u00a0]+)\s+(.+?)\s*$",
     re.IGNORECASE,
 )
 _RE_DIR_SUMMARY = re.compile(
@@ -83,33 +74,18 @@ _RE_DIR_SUMMARY = re.compile(
     re.IGNORECASE,
 )
 
-# Everything / custom tab-separated lines (path\tsize\tdate) or size suffix.
+# Separators, numeric size tokens, slash dates, and Word table row locators.
 _RE_PURE_SEPARATOR = re.compile(r"^[\s\-_=*#~│├└+|\\/.]+$")
 _RE_SIZE_ONLY = re.compile(r"^\d+(?:,\d{3})*$")
+_RE_SLASH_DATE = re.compile(r"(?<![A-Za-z0-9])(?:19|20)\d{2}/\d{1,2}/\d{1,2}(?![A-Za-z0-9])")
+_RE_WORD_TABLE_ROW_LOC = re.compile(r"^(表格\d+(?:\.\d+)*\s+行\d+)(?:\s*列\d+)?$")
 
-
-def read_text_auto_encoding(file_path: Union[str, Path]) -> tuple[str, str]:
-    """Read a text file by auto-detecting BOM and trying common Windows/Asian encodings."""
-    path = Path(file_path)
-    raw_bytes = path.read_bytes()
-    if not raw_bytes:
-        return "", "utf-8"
-
-    # Explicit BOM checks first.
-    if raw_bytes.startswith(b"\xff\xfe") or raw_bytes.startswith(b"\xfe\xff"):
-        return raw_bytes.decode("utf-16"), "utf-16"
-    if raw_bytes.startswith(b"\xef\xbb\xbf"):
-        return raw_bytes.decode("utf-8-sig"), "utf-8-sig"
-
-    for enc in _CANDIDATE_ENCODINGS:
-        if enc in ("utf-8-sig", "utf-16"):
-            continue
-        try:
-            return raw_bytes.decode(enc), enc
-        except UnicodeDecodeError:
-            continue
-
-    return raw_bytes.decode("utf-8", errors="replace"), "utf-8-replace"
+# CSV / TSV column header candidates (tier 1 filename/code columns beat tier 2 path columns).
+_PRIMARY_NAME_HEADERS: frozenset[str] = frozenset(
+    {"filename", "file", "name", "文件名", "原始文件名", "编码", "项目编码", "编号", "代码", "code"}
+)
+_PATH_NAME_HEADERS: frozenset[str] = frozenset({"path", "full_path", "路径", "文件路径"})
+_SIZE_HEADERS: frozenset[str] = frozenset({"size", "file_size", "大小", "文件大小"})
 
 
 def detect_input_format(lines: Sequence[str], file_ext: str = "") -> str:
@@ -125,7 +101,7 @@ def detect_input_format(lines: Sequence[str], file_ext: str = "") -> str:
     tree_hits = sum(
         1
         for ln in non_empty
-        if _RE_TREE_BRANCH_ALT.match(ln)
+        if _RE_TREE_BRANCH.match(ln)
         or _RE_TREE_HEADER.match(ln.strip())
         or ln.lstrip().startswith(("├──", "└──", "│   ", "+---", "\\---"))
     )
@@ -149,22 +125,50 @@ def detect_input_format(lines: Sequence[str], file_ext: str = "") -> str:
 
 
 def _extract_path_components(path_str: str) -> tuple[str, str, str]:
-    """Extract `(file_name, parent_dir, full_path)` from a path-like string."""
+    """Extract `(file_name, parent_dir, full_path)` from a path-like string.
+
+    Avoids misclassifying slash-separated codes (`ABC-123/DEF-456/GHI-789`),
+    calendar dates (`ABC-123 2024/05/12 DEF-456`), or mid-line URLs as POSIX paths.
+    """
     s = path_str.strip().strip('"').strip("'")
     if not s:
         return "", "", ""
 
-    # Determine if `s` is genuinely a path rather than a multi-code line like `ABC-123 / DEF-456`.
-    is_win_path = bool(re.match(r"^[A-Za-z]:[\\/]", s)) or s.startswith("\\\\") or ("\\" in s and " \\ " not in s)
-    is_posix_path = s.startswith("/") or (
-        "/" in s
-        and " / " not in s
-        and not re.match(r"^https?://", s, re.IGNORECASE)
-        and bool(split_known_extension(s.rsplit("/", 1)[-1])[1] or s.count("/") >= 2)
+    s_low = s.lower()
+    if "http://" in s_low or "https://" in s_low:
+        return s, "", ""
+
+    is_win_path = (
+        bool(re.match(r"^[A-Za-z]:[\\/]", s))
+        or s.startswith("\\\\")
+        or s.startswith("//")
+        or ("\\" in s and " \\ " not in s)
     )
+    is_posix_path = False
+    if not is_win_path:
+        if s.startswith("/") and " / " not in s:
+            is_posix_path = True
+        elif "/" in s and " / " not in s and not _RE_SLASH_DATE.search(s):
+            if s.startswith(("./", "../")):
+                is_posix_path = True
+            else:
+                last_seg = s.rsplit("/", 1)[-1]
+                _, ext = split_known_extension(last_seg)
+                if ext:
+                    is_posix_path = True
 
     if is_win_path or is_posix_path:
         norm = s.replace("\\", "/").rstrip("/")
+        # Strip leading UNC //server/share so share name does not become parent_dir.
+        if s.startswith(("\\\\", "//")):
+            unc_parts = [p for p in norm.split("/") if p]
+            if len(unc_parts) <= 2:
+                return s, "", s
+            rel_parts = unc_parts[2:]
+            file_name = rel_parts[-1]
+            parent_dir = rel_parts[-2] if len(rel_parts) >= 2 else ""
+            return file_name, parent_dir, s
+
         parts = [p for p in norm.split("/") if p]
         if not parts:
             return s, "", s
@@ -177,6 +181,16 @@ def _extract_path_components(path_str: str) -> tuple[str, str, str]:
     return s, "", ""
 
 
+def _is_single_file_candidate(file_name: str, full_path: str) -> bool:
+    """Return True if a non-filesystem text item looks like a single filename or file path."""
+    if full_path:
+        return True
+    s = file_name.strip()
+    if not s or " | " in s or "://" in s:
+        return False
+    return not any(ch.isspace() for ch in s)
+
+
 def _make_item(
     raw_text: str,
     file_name: str,
@@ -186,9 +200,24 @@ def _make_item(
     source_type: str,
     line_number: int,
     file_size: int = 0,
+    companion_set: Optional[frozenset[str]] = None,
     companion_extensions: Optional[Collection[str]] = None,
+    is_file_entry: Optional[bool] = None,
 ) -> ScannedItem:
-    _, ext = split_known_extension(file_name)
+    comp_set = (
+        companion_set
+        if companion_set is not None
+        else normalize_companion_extensions(companion_extensions)
+    )
+    if is_file_entry is None:
+        is_file_entry = _is_single_file_candidate(file_name, full_path)
+
+    ext = ""
+    is_companion = False
+    if is_file_entry:
+        _, ext = split_known_extension(file_name)
+        is_companion = bool(ext and ext in comp_set)
+
     return ScannedItem(
         raw_text=raw_text,
         file_name=file_name,
@@ -199,7 +228,7 @@ def _make_item(
         line_number=line_number,
         file_size=file_size,
         file_ext=ext,
-        is_companion=is_companion_extension(ext, companion_extensions),
+        is_companion=is_companion,
     )
 
 
@@ -209,6 +238,7 @@ def _scan_tree_lines(
     companion_extensions: Optional[Collection[str]] = None,
 ) -> list[ScannedItem]:
     """Parse Windows `tree /f`, `tree /f /a`, and Unix `tree` outputs with parent reconstruction."""
+    comp_set = normalize_companion_extensions(companion_extensions)
     # Pre-tokenize each meaningful tree line into (line_no, raw, depth, name, has_branch).
     tokens: list[tuple[int, str, int, str, bool]] = []
     root_prefix = ""
@@ -228,7 +258,7 @@ def _scan_tree_lines(
             root_prefix = stripped.rstrip("\\/")
             continue
 
-        m_branch = _RE_TREE_BRANCH_ALT.match(line)
+        m_branch = _RE_TREE_BRANCH.match(line)
         if m_branch:
             prefix_str, name = m_branch.group(1), m_branch.group(2).strip()
             depth = len(prefix_str)
@@ -251,7 +281,7 @@ def _scan_tree_lines(
     # Directory stack holds tuples of `(depth, dir_name)`.
     dir_stack: list[tuple[int, str]] = []
 
-    for i, (line_no, raw, depth, name, has_branch) in enumerate(tokens):
+    for i, (line_no, raw, depth, name, _has_branch) in enumerate(tokens):
         # Pop directories that are at the same or deeper level than current node.
         while dir_stack and dir_stack[-1][0] >= depth:
             dir_stack.pop()
@@ -277,7 +307,8 @@ def _scan_tree_lines(
                 source_name=source_name,
                 source_type="tree",
                 line_number=line_no,
-                companion_extensions=companion_extensions,
+                companion_set=comp_set,
+                is_file_entry=True,
             )
         )
 
@@ -289,7 +320,8 @@ def _scan_dir_lines(
     source_name: str,
     companion_extensions: Optional[Collection[str]] = None,
 ) -> list[ScannedItem]:
-    """Parse Windows `dir` / `dir /s` text listings."""
+    """Parse Windows `dir` / `dir /s` text listings (CN, US AM/PM, and EU locales)."""
+    comp_set = normalize_companion_extensions(companion_extensions)
     items: list[ScannedItem] = []
     current_dir = ""
 
@@ -311,10 +343,9 @@ def _scan_dir_lines(
             if name in {".", ".."}:
                 continue
             if size_or_dir.upper() == "<DIR>":
-                # Keep directory entry only if it might carry a code on its own.
                 continue
             file_size = 0
-            digits = size_or_dir.replace(",", "")
+            digits = re.sub(r"[,.\u00a0\s]", "", size_or_dir)
             if digits.isdigit():
                 file_size = int(digits)
             parent_dir = Path(current_dir).name if current_dir else ""
@@ -329,11 +360,38 @@ def _scan_dir_lines(
                     source_type="txt",
                     line_number=idx,
                     file_size=file_size,
-                    companion_extensions=companion_extensions,
+                    companion_set=comp_set,
+                    is_file_entry=True,
                 )
             )
 
     return items
+
+
+def _detect_tabular_columns(header: Sequence[str]) -> tuple[Optional[int], Optional[int], bool]:
+    """Detect `(name_col, size_col, header_matched)` with tier-1 filename priority over path."""
+    name_col: Optional[int] = None
+    path_col: Optional[int] = None
+    size_col: Optional[int] = None
+    header_matched = False
+
+    for i, col in enumerate(header):
+        if col in _PRIMARY_NAME_HEADERS:
+            if name_col is None:
+                name_col = i
+            header_matched = True
+        elif col in _PATH_NAME_HEADERS:
+            if path_col is None:
+                path_col = i
+            header_matched = True
+        elif col in _SIZE_HEADERS:
+            if size_col is None:
+                size_col = i
+            header_matched = True
+
+    if name_col is None:
+        name_col = path_col
+    return name_col, size_col, header_matched
 
 
 def _scan_csv_text(
@@ -341,57 +399,119 @@ def _scan_csv_text(
     source_name: str,
     companion_extensions: Optional[Collection[str]] = None,
 ) -> list[ScannedItem]:
-    """Parse CSV and Everything EFU file lists."""
+    """Parse CSV and Everything EFU file lists without dropping codes in multi-column tables."""
+    comp_set = normalize_companion_extensions(companion_extensions)
     items: list[ScannedItem] = []
     reader = csv.reader(io.StringIO(text))
-    rows = list(reader)
-    if not rows:
+    first_row = next(reader, None)
+    if first_row is None:
         return items
 
-    name_col = 0
-    size_col: Optional[int] = None
-    start_row = 0
+    header = [c.strip().lower() for c in first_row]
+    name_col, size_col, header_matched = _detect_tabular_columns(header)
 
-    header = [c.strip().lower() for c in rows[0]]
-    name_candidates = {"filename", "file", "name", "path", "full_path", "文件名", "路径", "编码", "原始文件名"}
-    size_candidates = {"size", "file_size", "大小", "文件大小"}
-
-    header_matched = False
-    for i, col in enumerate(header):
-        if col in name_candidates:
-            name_col = i
-            header_matched = True
-        elif col in size_candidates:
-            size_col = i
-            header_matched = True
-    if header_matched:
-        start_row = 1
-
-    for row_idx, row in enumerate(rows[start_row:], start=start_row + 1):
-        if not row or name_col >= len(row):
-            continue
-        cell = row[name_col].strip()
-        if not cell or _RE_PURE_SEPARATOR.match(cell):
-            continue
+    def _process_row(row_idx: int, row: list[str]) -> None:
+        if not row:
+            return
         file_size = 0
         if size_col is not None and size_col < len(row):
             raw_sz = row[size_col].strip().replace(",", "")
             if raw_sz.isdigit():
                 file_size = int(raw_sz)
-        file_name, parent_dir, full_path = _extract_path_components(cell)
+
+        if name_col is not None and name_col < len(row):
+            cell = row[name_col].strip()
+            if not cell or _RE_PURE_SEPARATOR.match(cell):
+                return
+            file_name, parent_dir, full_path = _extract_path_components(cell)
+            items.append(
+                _make_item(
+                    raw_text=cell,
+                    file_name=file_name,
+                    parent_dir=parent_dir,
+                    full_path=full_path,
+                    source_name=source_name,
+                    source_type="csv",
+                    line_number=row_idx,
+                    file_size=file_size,
+                    companion_set=comp_set,
+                )
+            )
+            return
+
+        # No filename/path header matched: scan ALL columns (excluding numeric size column).
+        non_empty: list[str] = []
+        for col_idx, raw_cell in enumerate(row):
+            if size_col is not None and col_idx == size_col:
+                continue
+            cleaned_cell = normalize_cell_text(raw_cell)
+            if cleaned_cell and not _RE_PURE_SEPARATOR.match(cleaned_cell):
+                non_empty.append(cleaned_cell)
+        if not non_empty:
+            return
+        if len(non_empty) == 1:
+            cell = non_empty[0]
+            file_name, parent_dir, full_path = _extract_path_components(cell)
+            items.append(
+                _make_item(
+                    raw_text=cell,
+                    file_name=file_name,
+                    parent_dir=parent_dir,
+                    full_path=full_path,
+                    source_name=source_name,
+                    source_type="csv",
+                    line_number=row_idx,
+                    file_size=file_size,
+                    companion_set=comp_set,
+                )
+            )
+            return
+
+        # Check if col 0 is an Everything-style full path with trailing numeric size.
+        f0, p0, fp0 = _extract_path_components(non_empty[0])
+        if fp0:
+            if not file_size:
+                for extra in non_empty[1:]:
+                    cleaned_sz = extra.replace(",", "")
+                    if _RE_SIZE_ONLY.match(extra) and cleaned_sz.isdigit():
+                        file_size = int(cleaned_sz)
+                        break
+            items.append(
+                _make_item(
+                    raw_text=",".join(non_empty),
+                    file_name=f0,
+                    parent_dir=p0,
+                    full_path=fp0,
+                    source_name=source_name,
+                    source_type="csv",
+                    line_number=row_idx,
+                    file_size=file_size,
+                    companion_set=comp_set,
+                    is_file_entry=True,
+                )
+            )
+            return
+
+        combined = " | ".join(non_empty)
         items.append(
             _make_item(
-                raw_text=cell,
-                file_name=file_name,
-                parent_dir=parent_dir,
-                full_path=full_path,
+                raw_text=combined,
+                file_name=combined,
+                parent_dir="",
+                full_path="",
                 source_name=source_name,
                 source_type="csv",
                 line_number=row_idx,
                 file_size=file_size,
-                companion_extensions=companion_extensions,
+                companion_set=comp_set,
+                is_file_entry=False,
             )
         )
+
+    if not header_matched:
+        _process_row(1, first_row)
+    for row_idx, row in enumerate(reader, start=2):
+        _process_row(row_idx, row)
 
     return items
 
@@ -402,7 +522,8 @@ def _scan_plain_lines(
     source_type: str,
     companion_extensions: Optional[Collection[str]] = None,
 ) -> list[ScannedItem]:
-    """Parse plain text lists, full file paths, and tab-separated Everything exports."""
+    """Parse plain text lists, full file paths, and tab-separated Everything/Excel pastes."""
+    comp_set = normalize_companion_extensions(companion_extensions)
     items: list[ScannedItem] = []
 
     for idx, raw_line in enumerate(lines, start=1):
@@ -411,20 +532,80 @@ def _scan_plain_lines(
             continue
 
         file_size = 0
-        target = stripped
 
-        # Handle tab-separated Everything/Excel copy-paste (e.g. `D:\Dir\ABC-123.mp4\t123456\t2024-01-01`).
+        # Handle tab-separated Everything exports AND Excel copy-paste rows cleanly.
         if "\t" in stripped:
             cols = [c.strip() for c in stripped.split("\t") if c.strip()]
-            if cols:
-                target = cols[0]
-                for extra in cols[1:]:
-                    cleaned_sz = extra.replace(",", "")
-                    if _RE_SIZE_ONLY.match(extra) and cleaned_sz.isdigit():
-                        file_size = int(cleaned_sz)
-                        break
+            if not cols:
+                continue
+            for extra in cols[1:]:
+                cleaned_sz = extra.replace(",", "")
+                if _RE_SIZE_ONLY.match(extra) and cleaned_sz.isdigit():
+                    file_size = int(cleaned_sz)
+                    break
 
-        file_name, parent_dir, full_path = _extract_path_components(target)
+            f0, p0, fp0 = _extract_path_components(cols[0])
+            if fp0:
+                items.append(
+                    _make_item(
+                        raw_text=stripped,
+                        file_name=f0,
+                        parent_dir=p0,
+                        full_path=fp0,
+                        source_name=source_name,
+                        source_type=source_type,
+                        line_number=idx,
+                        file_size=file_size,
+                        companion_set=comp_set,
+                        is_file_entry=True,
+                    )
+                )
+                continue
+
+            if len(cols) == 1:
+                items.append(
+                    _make_item(
+                        raw_text=stripped,
+                        file_name=f0,
+                        parent_dir=p0,
+                        full_path=fp0,
+                        source_name=source_name,
+                        source_type=source_type,
+                        line_number=idx,
+                        file_size=file_size,
+                        companion_set=comp_set,
+                    )
+                )
+                continue
+
+            # Multi-column pasted TSV (e.g. Excel rows `1\tABC-123\t4K 中文字幕`):
+            # preserve ALL columns joined by ` | ` so codes & tags in any column are captured.
+            path_parent = ""
+            path_full = ""
+            for col in cols:
+                _, p_c, fp_c = _extract_path_components(col)
+                if fp_c:
+                    path_parent = p_c
+                    path_full = fp_c
+                    break
+            combined = " | ".join(cols)
+            items.append(
+                _make_item(
+                    raw_text=stripped,
+                    file_name=combined,
+                    parent_dir=path_parent,
+                    full_path=path_full,
+                    source_name=source_name,
+                    source_type=source_type,
+                    line_number=idx,
+                    file_size=file_size,
+                    companion_set=comp_set,
+                    is_file_entry=False,
+                )
+            )
+            continue
+
+        file_name, parent_dir, full_path = _extract_path_components(stripped)
         items.append(
             _make_item(
                 raw_text=stripped,
@@ -435,7 +616,7 @@ def _scan_plain_lines(
                 source_type=source_type,
                 line_number=idx,
                 file_size=file_size,
-                companion_extensions=companion_extensions,
+                companion_set=comp_set,
             )
         )
 
@@ -486,42 +667,6 @@ def scan_file(
     )
 
 
-def normalize_cell_text(value: object) -> str:
-    """Convert an Excel/Word cell value into a clean string.
-
-    - `None` -> `""`
-    - `bool` -> `"TRUE"` / `"FALSE"`
-    - integer-valued `float` (e.g. `1234567.0`) -> `"1234567"` (preserving real decimals like `3.14`)
-    - `datetime` / `date` -> ISO date/datetime string
-    - stringified float-int (e.g. `"1234567.0"`) -> `"1234567"`
-    """
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return "TRUE" if value else "FALSE"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        if not math.isfinite(value):
-            return ""
-        if value.is_integer():
-            return str(int(value))
-        return format(value, "g")
-    if isinstance(value, _dt.datetime):
-        if value.hour == 0 and value.minute == 0 and value.second == 0:
-            return value.strftime("%Y-%m-%d")
-        return value.strftime("%Y-%m-%d %H:%M:%S")
-    if isinstance(value, _dt.date):
-        return value.strftime("%Y-%m-%d")
-    text = str(value).strip()
-    if not text:
-        return ""
-    m = _RE_FLOAT_INT_STR.match(text)
-    if m:
-        return m.group(1)
-    return text
-
-
 def _emit_doc_text_lines(
     raw_text: str,
     *,
@@ -529,7 +674,7 @@ def _emit_doc_text_lines(
     location: str,
     source_type: str,
     line_number: int,
-    companion_extensions: Optional[Collection[str]] = None,
+    companion_set: frozenset[str],
 ) -> list[ScannedItem]:
     """Split a normalized document text block (handling embedded newlines) into ScannedItems."""
     if not raw_text:
@@ -550,7 +695,7 @@ def _emit_doc_text_lines(
                 source_name=source_badge,
                 source_type=source_type,
                 line_number=line_number,
-                companion_extensions=companion_extensions,
+                companion_set=companion_set,
             )
         )
     return items
@@ -563,15 +708,14 @@ def _coerce_row_cells_to_items(
     location: str,
     source_type: str,
     row_number: int,
-    companion_extensions: Optional[Collection[str]] = None,
+    companion_set: frozenset[str],
 ) -> list[ScannedItem]:
     """Convert non-empty normalized cells from a single spreadsheet/table row into ScannedItems.
 
     - Single non-empty cell: splits embedded newlines (`\\n`) into individual items so pasted
       multi-line lists or paths inside one cell scan cleanly.
     - Multiple non-empty cells: flattens internal newlines and joins row cells with `" | "`
-      so row-level codes and tags stay associated without creating noisy unrecognized rows
-      for auxiliary date/price/index columns.
+      (never flagged as companion even if the trailing cell is `cover.jpg` or `readme.txt`).
     """
     non_empty = [c for c in cells if c and not _RE_PURE_SEPARATOR.match(c)]
     if not non_empty:
@@ -583,7 +727,7 @@ def _coerce_row_cells_to_items(
             location=location,
             source_type=source_type,
             line_number=row_number,
-            companion_extensions=companion_extensions,
+            companion_set=companion_set,
         )
 
     parts: list[str] = []
@@ -604,7 +748,8 @@ def _coerce_row_cells_to_items(
             source_name=source_badge,
             source_type=source_type,
             line_number=row_number,
-            companion_extensions=companion_extensions,
+            companion_set=companion_set,
+            is_file_entry=False,
         )
     ]
 
@@ -638,9 +783,6 @@ def _extract_location_and_line(entry: dict, fallback_idx: int) -> tuple[str, int
     return loc, line_no
 
 
-_RE_WORD_TABLE_ROW_LOC = re.compile(r"^(表格\d+(?:\.\d+)*\s+行\d+)(?:\s*列\d+)?$")
-
-
 def scan_word_file(
     file_path: Union[str, Path],
     companion_extensions: Optional[Collection[str]] = None,
@@ -653,148 +795,67 @@ def scan_word_file(
     if ext == ".doc":
         raise ValueError("暂不支持旧版 .doc 格式，请先用 Word 或 WPS 另存为 .docx 后再导入。")
 
-    # Prefer shared `doc_reader.extract_word_text_items` when available.
-    doc_entries: Optional[list[dict]] = None
-    try:
-        from .doc_reader import extract_word_text_items  # type: ignore[import-not-found]
+    from .doc_reader import extract_word_text_items
 
-        doc_entries = extract_word_text_items(path)
-    except ImportError:
-        doc_entries = None
+    comp_set = normalize_companion_extensions(companion_extensions)
+    doc_entries = extract_word_text_items(path)
 
     items: list[ScannedItem] = []
-    if doc_entries is not None:
-        # Group consecutive cells belonging to the same Word table row (e.g. "表格1 行2列1", "表格1 行2列2")
-        # into a single row badge ("表格1 行2") so codes and tags stay associated without column noise.
-        pending_row_loc: Optional[str] = None
-        pending_row_line: int = 0
-        pending_row_cells: list[str] = []
+    pending_row_loc: Optional[str] = None
+    pending_row_line: int = 0
+    pending_row_cells: list[str] = []
 
-        def _flush_pending_row() -> None:
-            nonlocal pending_row_loc, pending_row_line, pending_row_cells
-            if pending_row_loc is not None and pending_row_cells:
-                items.extend(
-                    _coerce_row_cells_to_items(
-                        pending_row_cells,
-                        file_path=path,
-                        location=pending_row_loc,
-                        source_type="word",
-                        row_number=pending_row_line,
-                        companion_extensions=companion_extensions,
-                    )
-                )
-            pending_row_loc = None
-            pending_row_line = 0
-            pending_row_cells = []
-
-        for idx, entry in enumerate(doc_entries, start=1):
-            if not isinstance(entry, dict):
-                continue
-            raw_val = entry.get("text")
-            if raw_val is None:
-                raw_val = entry.get("content", "")
-            text = normalize_cell_text(raw_val)
-            if not text:
-                continue
-            loc, line_no = _extract_location_and_line(entry, idx)
-            kind = str(entry.get("kind", "")).lower()
-            m_tbl = _RE_WORD_TABLE_ROW_LOC.match(loc)
-            if kind == "table_cell" or m_tbl:
-                row_loc = m_tbl.group(1) if m_tbl else loc
-                if pending_row_loc == row_loc:
-                    pending_row_cells.append(text)
-                else:
-                    _flush_pending_row()
-                    pending_row_loc = row_loc
-                    pending_row_line = line_no
-                    pending_row_cells = [text]
-            else:
-                _flush_pending_row()
-                items.extend(
-                    _emit_doc_text_lines(
-                        text,
-                        file_path=path,
-                        location=loc,
-                        source_type="word",
-                        line_number=line_no,
-                        companion_extensions=companion_extensions,
-                    )
-                )
-        _flush_pending_row()
-        return items
-
-    # Built-in fallback using python-docx directly.
-    try:
-        import docx  # type: ignore[import-untyped]
-    except ImportError as exc:
-        raise RuntimeError("缺少 python-docx 依赖，无法读取 Word (.docx) 文件。") from exc
-
-    document = docx.Document(str(path))
-    seq = 0
-
-    # Headers and footers (deduplicated across linked sections).
-    seen_hf: set[str] = set()
-    for sec_idx, section in enumerate(document.sections, start=1):
-        for hf_label, hf_obj in (("页眉", section.header), ("页脚", section.footer)):
-            if hf_obj is None:
-                continue
-            for p in hf_obj.paragraphs:
-                txt = normalize_cell_text(p.text)
-                if not txt or txt in seen_hf:
-                    continue
-                seen_hf.add(txt)
-                seq += 1
-                items.extend(
-                    _emit_doc_text_lines(
-                        txt,
-                        file_path=path,
-                        location=f"{hf_label}{sec_idx}",
-                        source_type="word",
-                        line_number=seq,
-                        companion_extensions=companion_extensions,
-                    )
-                )
-
-    # Body paragraphs.
-    for para_idx, para in enumerate(document.paragraphs, start=1):
-        txt = normalize_cell_text(para.text)
-        if not txt:
-            continue
-        items.extend(
-            _emit_doc_text_lines(
-                txt,
-                file_path=path,
-                location=f"段落{para_idx}",
-                source_type="word",
-                line_number=para_idx,
-                companion_extensions=companion_extensions,
-            )
-        )
-
-    # Embedded tables (deduplicating merged cells via underlying XML element identity).
-    for tbl_idx, table in enumerate(document.tables, start=1):
-        seen_tc: set[int] = set()
-        for row_idx, row in enumerate(table.rows, start=1):
-            row_cells: list[str] = []
-            for cell in row.cells:
-                tc_id = id(cell._tc)
-                if tc_id in seen_tc:
-                    continue
-                seen_tc.add(tc_id)
-                cell_txt = normalize_cell_text(cell.text)
-                if cell_txt:
-                    row_cells.append(cell_txt)
+    def _flush_pending_row() -> None:
+        nonlocal pending_row_loc, pending_row_line, pending_row_cells
+        if pending_row_loc is not None and pending_row_cells:
             items.extend(
                 _coerce_row_cells_to_items(
-                    row_cells,
+                    pending_row_cells,
                     file_path=path,
-                    location=f"表格{tbl_idx} 行{row_idx}",
+                    location=pending_row_loc,
                     source_type="word",
-                    row_number=row_idx,
-                    companion_extensions=companion_extensions,
+                    row_number=pending_row_line,
+                    companion_set=comp_set,
                 )
             )
+        pending_row_loc = None
+        pending_row_line = 0
+        pending_row_cells = []
 
+    for idx, entry in enumerate(doc_entries, start=1):
+        if not isinstance(entry, dict):
+            continue
+        raw_val = entry.get("text")
+        if raw_val is None:
+            raw_val = entry.get("content", "")
+        text = normalize_cell_text(raw_val)
+        if not text:
+            continue
+        loc, line_no = _extract_location_and_line(entry, idx)
+        kind = str(entry.get("kind", "")).lower()
+        m_tbl = _RE_WORD_TABLE_ROW_LOC.match(loc)
+        if kind == "table_cell" or m_tbl:
+            row_loc = m_tbl.group(1) if m_tbl else loc
+            if pending_row_loc == row_loc:
+                pending_row_cells.append(text)
+            else:
+                _flush_pending_row()
+                pending_row_loc = row_loc
+                pending_row_line = line_no
+                pending_row_cells = [text]
+        else:
+            _flush_pending_row()
+            items.extend(
+                _emit_doc_text_lines(
+                    text,
+                    file_path=path,
+                    location=loc,
+                    source_type="word",
+                    line_number=line_no,
+                    companion_set=comp_set,
+                )
+            )
+    _flush_pending_row()
     return items
 
 
@@ -815,123 +876,71 @@ def scan_excel_file(
     if ext == ".xls":
         raise ValueError("暂不支持旧版 .xls 格式，请先用 Excel 或 WPS 另存为 .xlsx 后再导入。")
 
-    # Prefer shared `doc_reader.extract_excel_text_items` when available.
-    excel_entries: Optional[list[dict]] = None
-    try:
-        from .doc_reader import extract_excel_text_items  # type: ignore[import-not-found]
+    from .doc_reader import extract_excel_text_items
 
-        excel_entries = extract_excel_text_items(path, sheet_names=sheet_names)
-    except ImportError:
-        excel_entries = None
+    comp_set = normalize_companion_extensions(companion_extensions)
+    excel_entries = extract_excel_text_items(path, sheet_names=sheet_names)
 
     items: list[ScannedItem] = []
-    if excel_entries is not None:
-        # When `doc_reader.extract_excel_text_items` provides `cells`, each entry is already a
-        # complete row or pre-split single-cell multiline item — emit directly without re-merging.
-        # Otherwise, group consecutive cell-level entries sharing `(location, line_no)`.
-        pending_loc: Optional[str] = None
-        pending_line: int = 0
-        pending_cells: list[str] = []
+    pending_loc: Optional[str] = None
+    pending_line: int = 0
+    pending_cells: list[str] = []
 
-        def _flush_pending() -> None:
-            nonlocal pending_loc, pending_line, pending_cells
-            if pending_loc is not None and pending_cells:
-                items.extend(
-                    _coerce_row_cells_to_items(
-                        pending_cells,
-                        file_path=path,
-                        location=pending_loc,
-                        source_type="excel",
-                        row_number=pending_line,
-                        companion_extensions=companion_extensions,
-                    )
+    def _flush_pending() -> None:
+        nonlocal pending_loc, pending_line, pending_cells
+        if pending_loc is not None and pending_cells:
+            items.extend(
+                _coerce_row_cells_to_items(
+                    pending_cells,
+                    file_path=path,
+                    location=pending_loc,
+                    source_type="excel",
+                    row_number=pending_line,
+                    companion_set=comp_set,
                 )
-            pending_loc = None
-            pending_line = 0
-            pending_cells = []
+            )
+        pending_loc = None
+        pending_line = 0
+        pending_cells = []
 
-        for idx, entry in enumerate(excel_entries, start=1):
-            if not isinstance(entry, dict):
+    for idx, entry in enumerate(excel_entries, start=1):
+        if not isinstance(entry, dict):
+            continue
+        loc, line_no = _extract_location_and_line(entry, idx)
+        raw_cells = entry.get("cells")
+        if isinstance(raw_cells, (list, tuple)):
+            _flush_pending()
+            norm_cells = [normalize_cell_text(c) for c in raw_cells]
+            norm_cells = [c for c in norm_cells if c]
+            if not norm_cells:
                 continue
-            loc, line_no = _extract_location_and_line(entry, idx)
-            raw_cells = entry.get("cells")
-            if isinstance(raw_cells, (list, tuple)):
-                _flush_pending()
-                norm_cells = [normalize_cell_text(c) for c in raw_cells]
-                norm_cells = [c for c in norm_cells if c]
-                if not norm_cells:
-                    continue
-                items.extend(
-                    _coerce_row_cells_to_items(
-                        norm_cells,
-                        file_path=path,
-                        location=loc,
-                        source_type="excel",
-                        row_number=line_no,
-                        companion_extensions=companion_extensions,
-                    )
+            items.extend(
+                _coerce_row_cells_to_items(
+                    norm_cells,
+                    file_path=path,
+                    location=loc,
+                    source_type="excel",
+                    row_number=line_no,
+                    companion_set=comp_set,
                 )
-                continue
+            )
+            continue
 
-            raw_val = entry.get("text")
-            if raw_val is None:
-                raw_val = entry.get("content", "")
-            text = normalize_cell_text(raw_val)
-            if not text:
-                continue
-            if pending_loc == loc and pending_line == line_no:
-                pending_cells.append(text)
-            else:
-                _flush_pending()
-                pending_loc = loc
-                pending_line = line_no
-                pending_cells = [text]
+        raw_val = entry.get("text")
+        if raw_val is None:
+            raw_val = entry.get("content", "")
+        text = normalize_cell_text(raw_val)
+        if not text:
+            continue
+        if pending_loc == loc and pending_line == line_no:
+            pending_cells.append(text)
+        else:
+            _flush_pending()
+            pending_loc = loc
+            pending_line = line_no
+            pending_cells = [text]
 
-        _flush_pending()
-        return items
-
-    # Built-in fallback using openpyxl directly.
-    try:
-        import openpyxl  # type: ignore[import-untyped]
-    except ImportError as exc:
-        raise RuntimeError("缺少 openpyxl 依赖，无法读取 Excel (.xlsx) 文件。") from exc
-
-    wb = openpyxl.load_workbook(str(path), data_only=True, read_only=False)
-    try:
-        target_sheets = list(sheet_names) if sheet_names is not None else list(wb.sheetnames)
-        for sheet_name in target_sheets:
-            if sheet_name not in wb.sheetnames:
-                continue
-            ws = wb[sheet_name]
-            # Track non-origin coordinates of merged ranges so merged strings are never duplicated.
-            merged_skip: set[tuple[int, int]] = set()
-            for merged_range in ws.merged_cells.ranges:
-                for r in range(merged_range.min_row, merged_range.max_row + 1):
-                    for c in range(merged_range.min_col, merged_range.max_col + 1):
-                        if r != merged_range.min_row or c != merged_range.min_col:
-                            merged_skip.add((r, c))
-
-            for row_idx, row in enumerate(ws.iter_rows(values_only=False), start=1):
-                row_cells: list[str] = []
-                for col_idx, cell in enumerate(row, start=1):
-                    if (row_idx, col_idx) in merged_skip:
-                        continue
-                    cell_txt = normalize_cell_text(cell.value)
-                    if cell_txt:
-                        row_cells.append(cell_txt)
-                items.extend(
-                    _coerce_row_cells_to_items(
-                        row_cells,
-                        file_path=path,
-                        location=f"{sheet_name} 行{row_idx}",
-                        source_type="excel",
-                        row_number=row_idx,
-                        companion_extensions=companion_extensions,
-                    )
-                )
-    finally:
-        wb.close()
-
+    _flush_pending()
     return items
 
 
@@ -941,32 +950,21 @@ def _scan_tsv_text(
     companion_extensions: Optional[Collection[str]] = None,
 ) -> list[ScannedItem]:
     """Parse tab-separated `.tsv` files cleanly (supporting both Everything TSV and table TSV)."""
+    comp_set = normalize_companion_extensions(companion_extensions)
     items: list[ScannedItem] = []
     reader = csv.reader(io.StringIO(text), delimiter="\t")
-    rows = list(reader)
-    if not rows:
+    first_row = next(reader, None)
+    if first_row is None:
         return items
 
-    header = [c.strip().lower() for c in rows[0]]
-    name_candidates = {"filename", "file", "name", "path", "full_path", "文件名", "路径", "编码", "原始文件名"}
-    size_candidates = {"size", "file_size", "大小", "文件大小"}
+    header = [c.strip().lower() for c in first_row]
+    name_col, size_col, header_matched = _detect_tabular_columns(header)
 
-    name_col: Optional[int] = None
-    size_col: Optional[int] = None
-    start_row = 0
-    for i, col in enumerate(header):
-        if col in name_candidates and name_col is None:
-            name_col = i
-            start_row = 1
-        elif col in size_candidates and size_col is None:
-            size_col = i
-            start_row = 1
-
-    for row_idx, row in enumerate(rows[start_row:], start=start_row + 1):
+    def _process_row(row_idx: int, row: list[str]) -> None:
         cells = [normalize_cell_text(c) for c in row]
         non_empty = [c for c in cells if c and not _RE_PURE_SEPARATOR.match(c)]
         if not non_empty:
-            continue
+            return
 
         file_size = 0
         if size_col is not None and size_col < len(cells):
@@ -987,21 +985,21 @@ def _scan_tsv_text(
                     source_type="tsv",
                     line_number=row_idx,
                     file_size=file_size,
-                    companion_extensions=companion_extensions,
+                    companion_set=comp_set,
                 )
             )
-            continue
+            return
 
         # No explicit header match: preserve Everything-style path\tsize rows or join multi-column rows.
         first_cell = non_empty[0]
-        _, parent_dir, full_path = _extract_path_components(first_cell)
+        file_name, parent_dir, full_path = _extract_path_components(first_cell)
         if full_path:
-            for extra in non_empty[1:]:
-                cleaned_sz = extra.replace(",", "")
-                if _RE_SIZE_ONLY.match(extra) and cleaned_sz.isdigit():
-                    file_size = int(cleaned_sz)
-                    break
-            file_name, parent_dir, full_path = _extract_path_components(first_cell)
+            if not file_size:
+                for extra in non_empty[1:]:
+                    cleaned_sz = extra.replace(",", "")
+                    if _RE_SIZE_ONLY.match(extra) and cleaned_sz.isdigit():
+                        file_size = int(cleaned_sz)
+                        break
             items.append(
                 _make_item(
                     raw_text="\t".join(non_empty),
@@ -1012,24 +1010,48 @@ def _scan_tsv_text(
                     source_type="tsv",
                     line_number=row_idx,
                     file_size=file_size,
-                    companion_extensions=companion_extensions,
+                    companion_set=comp_set,
+                    is_file_entry=True,
                 )
             )
-        else:
-            combined = " | ".join(non_empty) if len(non_empty) > 1 else first_cell
+            return
+
+        if len(non_empty) == 1:
             items.append(
                 _make_item(
-                    raw_text=combined,
-                    file_name=combined,
+                    raw_text=first_cell,
+                    file_name=first_cell,
                     parent_dir="",
                     full_path="",
                     source_name=source_name,
                     source_type="tsv",
                     line_number=row_idx,
                     file_size=file_size,
-                    companion_extensions=companion_extensions,
+                    companion_set=comp_set,
                 )
             )
+            return
+
+        combined = " | ".join(non_empty)
+        items.append(
+            _make_item(
+                raw_text=combined,
+                file_name=combined,
+                parent_dir="",
+                full_path="",
+                source_name=source_name,
+                source_type="tsv",
+                line_number=row_idx,
+                file_size=file_size,
+                companion_set=comp_set,
+                is_file_entry=False,
+            )
+        )
+
+    if not header_matched:
+        _process_row(1, first_row)
+    for row_idx, row in enumerate(reader, start=2):
+        _process_row(row_idx, row)
 
     return items
 
@@ -1089,63 +1111,80 @@ def scan_folder(
     progress_callback: Optional[Callable[[int, str], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> list[ScannedItem]:
-    """Recursively scan a local directory and emit a `ScannedItem` per discovered file."""
+    """Recursively scan a local directory using `os.scandir()` and emit a `ScannedItem` per file."""
     root = Path(folder_path)
     if not root.is_dir():
         raise NotADirectoryError(f"找不到目录: {root}")
 
+    comp_set = normalize_companion_extensions(companion_extensions)
     items: list[ScannedItem] = []
     source_name = str(root)
     count = 0
 
-    def _on_walk_error(_err: OSError) -> None:
-        # Silently skip unreadable system folders instead of aborting the whole scan.
-        return
+    # Iterative DFS stack of `(dir_path, is_root)`.
+    stack: list[tuple[Path, bool]] = [(root, True)]
 
-    for dirpath, dirnames, filenames in os.walk(root, onerror=_on_walk_error):
+    while stack:
         if cancel_check and cancel_check():
             break
+        current_dir, is_root = stack.pop()
+        parent_name = "" if is_root else current_dir.name
+        subdirs: list[Path] = []
 
-        # Prune ignored system directories in place.
-        dirnames[:] = [
-            d for d in dirnames if d.lower() not in _IGNORED_SYSTEM_DIRS
-        ]
-        if not recursive:
-            dirnames.clear()
+        try:
+            with os.scandir(current_dir) as it:
+                for entry in it:
+                    if cancel_check and cancel_check():
+                        break
+                    name = entry.name
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if recursive and name.lower() not in _IGNORED_SYSTEM_DIRS:
+                                subdirs.append(Path(entry.path))
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                    except OSError:
+                        continue
 
-        current_dir = Path(dirpath)
-        parent_name = current_dir.name
+                    try:
+                        file_size = entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        file_size = 0
 
-        for fname in filenames:
-            if cancel_check and cancel_check():
-                break
-            full = current_dir / fname
-            try:
-                file_size = full.stat().st_size
-            except OSError:
-                file_size = 0
+                    _, ext = split_known_extension(name)
+                    if not ext:
+                        if name.startswith(".") and "." not in name[1:]:
+                            ext = name.lower()
+                        elif "." in name:
+                            ext = Path(name).suffix.lower()
 
-            _, ext = split_known_extension(fname)
-            if not ext and "." in fname:
-                ext = full.suffix.lower()
+                    items.append(
+                        ScannedItem(
+                            raw_text=name,
+                            file_name=name,
+                            parent_dir=parent_name,
+                            full_path=entry.path,
+                            source_name=source_name,
+                            source_type="folder",
+                            line_number=0,
+                            file_size=file_size,
+                            file_ext=ext,
+                            is_companion=bool(ext and ext in comp_set),
+                        )
+                    )
+                    count += 1
+                    if progress_callback and count % 50 == 0:
+                        progress_callback(count, name)
+        except OSError:
+            # Silently skip unreadable system folders instead of aborting the whole scan.
+            continue
 
-            items.append(
-                ScannedItem(
-                    raw_text=fname,
-                    file_name=fname,
-                    parent_dir=parent_name,
-                    full_path=str(full),
-                    source_name=source_name,
-                    source_type="folder",
-                    line_number=0,
-                    file_size=file_size,
-                    file_ext=ext,
-                    is_companion=is_companion_extension(ext, companion_extensions),
-                )
-            )
-            count += 1
-            if progress_callback and count % 50 == 0:
-                progress_callback(count, fname)
+        # Push subdirs in reverse sorted order for deterministic traversal.
+        if subdirs:
+            subdirs.sort(key=lambda p: p.name.lower(), reverse=True)
+            for sub in subdirs:
+                stack.append((sub, False))
 
     if progress_callback:
         progress_callback(count, root.name)
