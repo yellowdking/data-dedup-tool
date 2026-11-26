@@ -17,6 +17,7 @@ from src.core.dedup import (
     commit_preview,
     compare_two_sources,
     compare_with_db,
+    database_records_to_parse_results,
     execute_duplicate_cleanup,
     plan_duplicate_cleanup,
     preview_import,
@@ -459,7 +460,13 @@ class TestExporters:
             cmp_ab_xlsx = tmp_path / "cmp_ab.xlsx"
             export_compare_result_excel(cmp_ab, cmp_ab_xlsx)
             wb = openpyxl.load_workbook(cmp_ab_xlsx)
-            assert wb.sheetnames == ["交集(重复)", "仅A有", "仅B有", "未识别", "比对汇总"]
+            assert wb.sheetnames == [
+                "覆盖率总览",
+                "目标清单逐条核对",
+                "缺失清单(仅目标B有)",
+                "已包含对照(A∩B)",
+                "仅基准A独有",
+            ]
             wb.close()
 
             cmp_ab_csv = tmp_path / "cmp_ab.csv"
@@ -510,3 +517,183 @@ class TestExporters:
         assert ws.cell(2, 9).value == "清单.txt"
         assert ws.cell(2, 14).value == "备注含控制字符"
         wb.close()
+
+
+# ----------------------------------------------------------------------
+# 6. v1.3.0 Dual-List Coverage & Missing-Item Comparison
+# ----------------------------------------------------------------------
+
+
+class TestDualListCoverageComparison:
+    def test_smart_code_checklist_order_tags_names_and_full_coverage(self) -> None:
+        list_a = [
+            _parsed("PRJ-002", file_name="PRJ-002_4K.mp4", tags=["4K"]),
+            _parsed("PRJ-002", file_name="PRJ-002_字幕版.mkv", tags=["字幕"]),
+            _parsed("PRJ-001", file_name="PRJ-001_FHD.mp4", tags=["FHD"]),
+            _parsed("EXTRA-999", file_name="EXTRA-999.mp4"),
+        ]
+        # Target List B deliberately unordered (PRJ-003 -> PRJ-002 -> PRJ-001 -> dup PRJ-002)
+        list_b = [
+            _parsed("PRJ-003", raw_text="#1 PRJ-003 缺失项示例"),
+            _parsed("PRJ-002", raw_text="#2 PRJ-002 命中两份"),
+            _parsed("PRJ-001", raw_text="#3 PRJ-001 命中一份"),
+            _parsed("PRJ-002", raw_text="#4 PRJ-002 重复出现不重复计数"),
+            _parsed("", raw_text="=== 无效说明行 ===", recognized=False),
+        ]
+
+        res = compare_two_sources(list_a, list_b, "基准库A", "目标榜单B")
+
+        assert res.mode == "ab"
+        assert res.match_mode == "smart_code"
+        assert res.source_a_name == "基准库A"
+        assert res.source_b_name == "目标榜单B"
+        assert res.unique_a_count == 3
+        assert res.unique_b_count == 3
+        assert res.hit_b_count == 2
+        assert res.missing_b_count == 1
+        assert pytest.approx(res.coverage_rate, rel=1e-4) == (200.0 / 3.0)
+        assert res.is_fully_covered is False
+        # Exact Target List B order preserved!
+        assert res.missing_b_codes == ["PRJ-003"]
+        assert res.matched_b_codes == ["PRJ-002", "PRJ-001"]
+        assert [e.order_index for e in res.target_checklist] == [1, 2, 3]
+        assert [e.canonical_code for e in res.target_checklist] == ["PRJ-003", "PRJ-002", "PRJ-001"]
+        assert [e.status for e in res.target_checklist] == ["missing", "matched", "matched"]
+
+        # Matched entry carries A's count, filenames, combined tags, and items
+        entry_2 = res.target_checklist[1]
+        assert entry_2.matched_a_count == 2
+        assert entry_2.matched_a_names == ["PRJ-002_4K.mp4", "PRJ-002_字幕版.mkv"]
+        assert entry_2.matched_a_tags == "4K,字幕"
+        assert len(entry_2.matched_a_items) == 2
+
+        # 100% coverage verdict
+        res_full = compare_two_sources(list_a, [_parsed("PRJ-002"), _parsed("PRJ-001")])
+        assert res_full.coverage_rate == 100.0
+        assert res_full.is_fully_covered is True
+        assert res_full.missing_b_count == 0
+
+        # Empty target list is NOT fully covered
+        res_empty = compare_two_sources(list_a, [])
+        assert res_empty.coverage_rate == 0.0
+        assert res_empty.is_fully_covered is False
+
+    def test_exact_line_mode_strings_and_parse_results(self) -> None:
+        base_lines = ["  财务部-张三  ", "研发部-李四", "Alpha Project", "  "]
+        target_lines = ["alpha project", "运营部-王五", "财务部-张三", "ALPHA PROJECT"]
+
+        res_ci = compare_two_sources(
+            base_lines,
+            target_lines,
+            "现有人员",
+            "应到人员",
+            match_mode="exact_line",
+            ignore_case=True,
+            strip_whitespace=True,
+        )
+        assert res_ci.match_mode == "exact_line"
+        assert res_ci.unique_a_count == 3
+        assert res_ci.unique_b_count == 3
+        assert res_ci.hit_b_count == 2
+        assert res_ci.missing_b_count == 1
+        assert res_ci.matched_b_codes == ["alpha project", "财务部-张三"]
+        assert res_ci.missing_b_codes == ["运营部-王五"]
+        assert len(res_ci.unrecognized_a) == 1
+
+        # Case-sensitive exact_line mode
+        res_cs = compare_two_sources(
+            ["Alpha", "Beta"],
+            ["alpha", "Beta"],
+            match_mode="exact_line",
+            ignore_case=False,
+        )
+        assert res_cs.matched_b_codes == ["Beta"]
+        assert res_cs.missing_b_codes == ["alpha"]
+
+        # ParseResult inputs with unrecognized plain text are compared without mutation
+        pr_a = ParseResult(raw_text="普通办公条目A", recognized=False)
+        pr_b = ParseResult(raw_text="普通办公条目A", recognized=False)
+        res_pr = compare_two_sources([pr_a], [pr_b], match_mode="exact_line")
+        assert res_pr.is_fully_covered is True
+        assert pr_a.recognized is False
+        assert pr_a.canonical_code == ""
+
+        with pytest.raises(ValueError, match="不支持的比对模式"):
+            compare_two_sources([], [], match_mode="invalid_mode")
+
+    def test_5000_db_vs_250_ranked_target_coverage_and_speed(self, tmp_path: Path) -> None:
+        import time
+
+        from src.core.parser import CodeParser
+
+        with DatabaseRepository(tmp_path / "bench5000.db") as db:
+            records = []
+            # 220 codes that will match Target List B (plus 4,780 other library items = 5,000 total)
+            for i in range(1, 221):
+                tags = ["4K", "字幕"] if i % 2 == 0 else ["FHD"]
+                records.append(
+                    _record(
+                        f"CAT-{i:03d}",
+                        file_name=f"archive_CAT-{i:03d}_{'4K_中字' if i % 2 == 0 else 'FHD'}.mp4",
+                        tags=tags,
+                        source_name="主归档库",
+                    )
+                )
+            for j in range(1, 4781):
+                records.append(
+                    _record(
+                        f"LIB-{j:04d}",
+                        file_name=f"LIB-{j:04d}.mkv",
+                        source_name="主归档库",
+                    )
+                )
+            db.add_records(records)
+            assert db.count_records() == 5000
+
+            t_load0 = time.perf_counter()
+            items_a = database_records_to_parse_results(db)
+            t_load = time.perf_counter() - t_load0
+            assert len(items_a) == 5000
+            assert t_load < 0.5  # Fast SQLite-to-ParseResult without regex parsing
+
+        # Build 250-item ranked target list with heavy ranking noise: 220 present + 30 missing
+        parser = CodeParser()
+        raw_target_lines = []
+        for rank in range(1, 251):
+            code = f"CAT-{rank:03d}" if rank <= 220 else f"MISS-{rank:03d}"
+            if rank % 5 == 0:
+                line = f"#{rank} TOP250 No.{rank} {code} 年度精选条目"
+            elif rank % 5 == 1:
+                line = f"{rank:03d}. {code} 归档说明"
+            elif rank % 5 == 2:
+                line = f"Rank {rank} PAGE12 {code} 标题文本"
+            elif rank % 5 == 3:
+                line = f"第{rank}名 NO.{rank:03d} {code}"
+            else:
+                line = f"Top {rank:02d}: ITEM01 {code}"
+            raw_target_lines.append(line)
+
+        items_b = []
+        for idx, line in enumerate(raw_target_lines, start=1):
+            parsed = parser.parse_line(line, source_name="目标TOP250.txt", line_number=idx)
+            # Zero ranking-token false positives: every line yields exactly 1 real code
+            assert len(parsed) == 1, f"Line {idx} ({line!r}) produced {[p.canonical_code for p in parsed]}"
+            items_b.extend(parsed)
+
+        t_cmp0 = time.perf_counter()
+        res = compare_two_sources(items_a, items_b, "当前总库(5000条)", "目标TOP250.txt")
+        t_cmp = time.perf_counter() - t_cmp0
+
+        assert t_cmp < 1.0, f"5000-vs-250 compare took too long: {t_cmp:.3f}s"
+        assert res.unique_a_count == 5000
+        assert res.unique_b_count == 250
+        assert res.hit_b_count == 220
+        assert res.missing_b_count == 30
+        assert pytest.approx(res.coverage_rate, abs=1e-6) == 88.0
+        assert res.is_fully_covered is False
+        assert len(res.target_checklist) == 250
+        assert [e.order_index for e in res.target_checklist] == list(range(1, 251))
+        assert res.missing_b_codes == [f"MISS-{r:03d}" for r in range(221, 251)]
+        assert res.target_checklist[1].canonical_code == "CAT-002"
+        assert res.target_checklist[1].matched_a_tags == "4K,字幕"
+        assert "archive_CAT-002_4K_中字.mp4" in res.target_checklist[1].matched_a_names
