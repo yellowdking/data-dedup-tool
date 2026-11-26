@@ -1,4 +1,4 @@
-"""View 3: 快速查重 — Non-mutating DB comparison & A-vs-B cross comparison."""
+"""View 3: 快速查重 — Non-mutating DB comparison & Dual-List Coverage Comparison."""
 
 from __future__ import annotations
 
@@ -6,16 +6,21 @@ from pathlib import Path
 from typing import Any, Optional
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
+    QMenu,
     QProgressBar,
     QPushButton,
     QSplitter,
+    QTableView,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -23,17 +28,21 @@ from PySide6.QtWidgets import (
 
 from src.core.config import normalize_extension
 from src.core.dedup import compare_with_db
-from src.core.models import CompareResult, DataRecord, ImportBatch, ScannedItem
+from src.core.exporter import (
+    export_codes_txt,
+    export_compare_result_csv,
+    export_compare_result_excel,
+)
+from src.core.models import CompareResult, DataRecord, ImportBatch, ParseResult, ScannedItem
 from src.core.scanner import scan_document_file
 from src.ui.app_context import AppContext
-from src.ui.table_models import CompareTableModel
-from src.ui.view_compare_ab import (
+from src.ui.compare_ab_models import (
     _COMPARE_FILE_FILTER,
-    CompareABMixin,
-    _ABIntersectionTableModel,
     _DroppablePlainTextEdit,
     _stop_worker_safely,
 )
+from src.ui.table_models import CompareTableModel
+from src.ui.view_compare_ab import CompareABMixin
 from src.ui.widgets import ScrollableDetailDialog, WorkerThread
 
 _OFFICE_EXTENSIONS: frozenset[str] = frozenset({".docx", ".xlsx", ".xlsm"})
@@ -42,7 +51,7 @@ _MAX_PREVIEW_CHARS: int = 120_000
 
 
 class CompareView(CompareABMixin, QWidget):
-    """Quick comparison view supporting (a) DB non-mutating check and (b) A-vs-B cross-check."""
+    """Quick comparison view supporting (A) non-mutating DB check and (B) Dual-List Coverage Audit."""
 
     def __init__(self, ctx: AppContext, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -65,18 +74,8 @@ class CompareView(CompareABMixin, QWidget):
         self._model_db_new = self._create_cmp_model(False, theme)
         self._model_db_unrec = self._create_cmp_model(False, theme)
 
-        # Mode B state
-        self._ab_result: Optional[CompareResult] = None
-        self._file_a_path: str = ""
-        self._file_b_path: str = ""
-        self._ab_worker: Optional[WorkerThread] = None
-        self._ab_gen: int = 0
-        self._ab_cancel_handled_gen: int = -1
-
-        self._model_ab_inter = _ABIntersectionTableModel(parent=self, theme=theme)
-        self._model_ab_only_a = self._create_cmp_model(False, theme)
-        self._model_ab_only_b = self._create_cmp_model(False, theme)
-        self._model_ab_unrec = self._create_cmp_model(False, theme)
+        # Mode B state & virtualized models
+        self._init_ab_state(theme)
 
         # Shared export worker
         self._export_worker: Optional[WorkerThread] = None
@@ -95,16 +94,22 @@ class CompareView(CompareABMixin, QWidget):
 
     def _setup_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 16, 20, 16)
-        root.setSpacing(10)
+        root.setContentsMargins(16, 12, 16, 12)
+        root.setSpacing(8)
 
         self._mode_tabs = QTabWidget()
-        self._mode_tabs.addTab(self._build_db_compare_tab(), "与当前库比对（不入库）")
-        self._mode_tabs.addTab(self._build_ab_compare_tab(), "双文件交叉比对（A vs B）")
+        self._mode_tabs.addTab(
+            self._build_db_compare_tab(),
+            "模式 A：快速查重（查当前总库）",
+        )
+        self._mode_tabs.addTab(
+            self._build_ab_compare_tab(),
+            "模式 B：双列表覆盖率对比（查全 / 找缺失）",
+        )
         root.addWidget(self._mode_tabs, 1)
 
     # ------------------------------------------------------------------
-    # Lifecycle, theme & context hooks
+    # Lifecycle, theme, shortcut & context hooks
     # ------------------------------------------------------------------
 
     def shutdown(self) -> None:
@@ -124,13 +129,19 @@ class CompareView(CompareABMixin, QWidget):
             self._model_db_matched,
             self._model_db_new,
             self._model_db_unrec,
-            self._model_ab_inter,
-            self._model_ab_only_a,
-            self._model_ab_only_b,
-            self._model_ab_unrec,
         ):
             if hasattr(model, "set_theme"):
                 model.set_theme(theme)
+        self._apply_ab_theme(theme)
+
+    def focus_search(self) -> None:
+        """Handle Ctrl+F shortcut: focus Mode B checklist search or Mode A input."""
+        if self._mode_tabs.currentIndex() == 1:
+            self._ab_result_tabs.setCurrentIndex(0)
+            self._ab_checklist_search.setFocus()
+            self._ab_checklist_search.selectAll()
+        else:
+            self._db_input.setFocus()
 
     def _sync_settings(self) -> None:
         checked = self.ctx.config.ignore_companion_files
@@ -162,7 +173,7 @@ class CompareView(CompareABMixin, QWidget):
         except RuntimeError:
             return False
 
-    def _on_db_switched(self, _db_path: str) -> None:
+    def _on_db_switched(self, db_path: str) -> None:
         if self._is_worker_running(self._db_worker):
             self._cancel_db_worker()
         self._db_compare_result = None
@@ -178,8 +189,10 @@ class CompareView(CompareABMixin, QWidget):
         self._btn_copy_new.setEnabled(False)
         self._btn_export_db_cmp.setEnabled(False)
         self._db_summary.setText("数据库已切换，比对结果已清空 — 请重新点击「开始快速查重」")
+        self._on_ab_db_switched(db_path)
 
     def _on_data_changed(self) -> None:
+        self._on_ab_data_changed()
         if self._self_importing:
             return
         if self._db_compare_result is not None:
@@ -202,7 +215,6 @@ class CompareView(CompareABMixin, QWidget):
 
         splitter = QSplitter(Qt.Orientation.Vertical)
 
-        # Top input panel
         top_card = QFrame()
         top_card.setProperty("card", True)
         top_layout = QVBoxLayout(top_card)
@@ -253,10 +265,8 @@ class CompareView(CompareABMixin, QWidget):
         )
         self._db_input.setMinimumHeight(115)
         top_layout.addWidget(self._db_input)
-
         splitter.addWidget(top_card)
 
-        # Bottom results panel
         bottom_widget = QWidget()
         bottom_layout = QVBoxLayout(bottom_widget)
         bottom_layout.setContentsMargins(0, 4, 0, 0)
@@ -394,7 +404,6 @@ class CompareView(CompareABMixin, QWidget):
             return bool(w is not None and w.is_cancelled)
 
         def _task() -> Optional[dict[str, Any]]:
-            # Single read for ALL file types (zero double-read!)
             scanned = scan_document_file(p, companion_extensions=comp_exts)
             if _is_cancelled():
                 return None
@@ -679,3 +688,144 @@ class CompareView(CompareABMixin, QWidget):
         if self._import_worker is worker:
             self._import_worker = None
         self._set_db_busy(False)
+
+    # ------------------------------------------------------------------
+    # Shared Table & Export Helpers (used by Mode A & Mode B)
+    # ------------------------------------------------------------------
+
+    def _make_table(self, model: CompareTableModel) -> QTableView:
+        tv = QTableView()
+        tv.setModel(model)
+        tv.setAlternatingRowColors(True)
+        tv.setWordWrap(False)
+        tv.setSortingEnabled(True)
+        tv.horizontalHeader().setSortIndicator(-1, Qt.SortOrder.AscendingOrder)
+        tv.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        tv.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        tv.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tv.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        tv.customContextMenuRequested.connect(
+            lambda pos, t=tv, m=model: self._show_table_menu(t, m, pos)
+        )
+        tv.verticalHeader().setDefaultSectionSize(30)
+        tv.verticalHeader().setVisible(False)
+        tv.horizontalHeader().setStretchLastSection(True)
+        tv.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        widths = [118, 215, 240, 90, 62] if model._with_matches else [118, 62, 72, 54, 245, 220]
+        for idx, width in enumerate(widths):
+            if idx < model.columnCount():
+                tv.setColumnWidth(idx, width)
+        return tv
+
+    def _show_table_menu(self, tv: QTableView, model: CompareTableModel, pos: Any) -> None:
+        sel = tv.selectionModel()
+        if sel is None:
+            return
+        all_rows = model.rows()
+        selected_rows = [
+            all_rows[idx.row()] for idx in sel.selectedRows() if 0 <= idx.row() < len(all_rows)
+        ]
+        if not selected_rows:
+            return
+        items: list[ParseResult] = [r[0] if isinstance(r, tuple) else r for r in selected_rows]
+
+        menu = QMenu(self)
+        act_code = QAction(f"复制标准编码 ({len(items)} 条)", self)
+        act_code.triggered.connect(lambda: self._copy_selected_items(items, "code"))
+        menu.addAction(act_code)
+
+        act_name = QAction("复制文件名 / 原始文本", self)
+        act_name.triggered.connect(lambda: self._copy_selected_items(items, "name"))
+        menu.addAction(act_name)
+        menu.exec(tv.viewport().mapToGlobal(pos))
+
+    def _copy_selected_items(self, items: list[ParseResult], field_name: str) -> None:
+        if field_name == "code":
+            lines = [it.canonical_code for it in items if it.canonical_code]
+        else:
+            lines = [it.file_name or it.raw_text for it in items]
+        QApplication.clipboard().setText("\n".join(lines))
+        self.ctx.notify(f"已复制 {len(lines)} 条到剪贴板", "success")
+
+    def _pick_export_path(
+        self, title: str, default_name: str, file_filter: str, explicit_path: Optional[str]
+    ) -> tuple[str, str]:
+        if explicit_path:
+            return explicit_path, ""
+        default_dir = Path(self.ctx.config.default_export_dir or Path.home())
+        save_path, selected_filter = QFileDialog.getSaveFileName(
+            self, title, str(default_dir / default_name), file_filter
+        )
+        if save_path:
+            try:
+                self.ctx.config.default_export_dir = str(Path(save_path).parent)
+                self.ctx.config_manager.save()
+            except OSError:
+                pass
+        return save_path, selected_filter
+
+    def _export_compare(self, result: Optional[CompareResult]) -> None:
+        if result is None:
+            return
+        if result.mode == "ab":
+            self.export_ab_full_report()
+            return
+        if self._is_worker_running(self._export_worker):
+            self.ctx.notify("正在导出文件，请稍候...", "warning")
+            return
+
+        path, sel_filter = self._pick_export_path(
+            "导出比对结果",
+            "快速查重结果.xlsx",
+            "Excel 工作簿 (*.xlsx);;CSV 表格 (*.csv);;新数据编码清单 (*.txt)",
+            None,
+        )
+        if not path:
+            return
+        self._disable_export_buttons()
+        self.ctx.notify(f"正在后台导出 {Path(path).name}...", "info")
+
+        def _task() -> str:
+            low = path.lower()
+            if low.endswith(".csv") or "CSV" in sel_filter:
+                export_compare_result_csv(result, path)
+            elif low.endswith(".txt") or "TXT" in sel_filter.upper():
+                export_codes_txt(result.not_in_db, path, unique=True, sort_codes=True)
+            else:
+                export_compare_result_excel(result, path)
+            return path
+
+        self._start_export_worker(_task)
+
+    def _disable_export_buttons(self) -> None:
+        self._btn_export_db_cmp.setEnabled(False)
+        self._btn_export_ab.setEnabled(False)
+        self._btn_export_missing.setEnabled(False)
+
+    def _start_export_worker(self, task_fn: Any) -> None:
+        worker = WorkerThread(task_fn, parent=self)
+        self._export_worker = worker
+        worker.succeeded.connect(self._on_export_succeeded)
+        worker.failed.connect(self._on_export_failed)
+        worker.finished.connect(lambda w=worker: self._on_export_finished(w))
+        if not hasattr(worker, "safe_stop"):
+            worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_export_succeeded(self, save_path: str) -> None:
+        self._restore_export_buttons()
+        self.ctx.notify(f"导出成功：{Path(save_path).name}", "success")
+
+    def _on_export_failed(self, detail: str) -> None:
+        self._restore_export_buttons()
+        ScrollableDetailDialog("导出失败", "导出比对结果时发生错误：", detail, parent=self).exec()
+
+    def _on_export_finished(self, worker: WorkerThread) -> None:
+        if self._export_worker is worker:
+            self._export_worker = None
+        self._restore_export_buttons()
+
+    def _restore_export_buttons(self) -> None:
+        self._btn_export_db_cmp.setEnabled(self._db_compare_result is not None)
+        self._btn_export_ab.setEnabled(self._ab_result is not None)
+        self._btn_export_missing.setEnabled(bool(self._ab_result and self._ab_result.missing_b_codes))
