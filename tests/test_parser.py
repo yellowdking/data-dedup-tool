@@ -840,3 +840,68 @@ def test_v12_builtin_rules_ui_metadata_purely_synthetic_neutral(parser: CodePars
     assert parser.parse_single("T28-123.mp4").canonical_code == "T28-123"
     assert parser.parse_single("S2M-001.mp4").canonical_code == "S2M-001"
     assert parser.parse_single("4k2_cat00123.mp4").canonical_code == "CAT-123"
+
+
+# ---------------------------------------------------------------------------
+# 15. v1.3.0 Ranking-List & Numbered-List Noise Hardening
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "ranking_noise",
+    [
+        "TOP250",
+        "TOP100",
+        "TOP10",
+        "TOP50",
+        "TOP 250",
+        "Top 01",
+        "TOP.005",
+        "TOP-250",
+        "RANK01",
+        "RANK05",
+        "RANK123",
+        "Rank 12",
+        "Rank 100",
+        "RANK-05",
+        "NO12",
+        "NO123",
+        "NO-12",
+        "NO.12",
+        "NO.005",
+        "No.25",
+        "ITEM01",
+        "ITEM001",
+        "ITEM-01",
+        "PAGE12",
+        "PAGE123",
+        "PAGE-12",
+        "TOP250-001",
+        "RANK05-123",
+    ],
+)
+def test_v13_ranking_noise_tokens_rejected(parser: CodeParser, ranking_noise: str) -> None:
+    res = parser.parse_single(ranking_noise)
+    assert res.recognized is False, f"Unexpected match {res.canonical_code!r} for {ranking_noise!r}"
+    assert res.canonical_code == ""
+
+
+@pytest.mark.parametrize(
+    "ranked_line, expected_code",
+    [
+        ("1. ABC-123 标题说明...", "ABC-123"),
+        ("001. PRJ-0042 归档项目", "PRJ-0042"),
+        ("#25 XYZ-999 推荐内容", "XYZ-999"),
+        ("Top 01: ABC-123 年度精选", "ABC-123"),
+        ("Rank 12 ABC-123 示例条目", "ABC-123"),
+        ("RANK05 DEF-456 说明", "DEF-456"),
+        ("No.12 ABC-123 标题", "ABC-123"),
+        ("NO.005 PRJ-042 清单", "PRJ-042"),
+        ("第1名 ABC-123 精选", "ABC-123"),
+        ("#25 TOP250 No.25 ABC-123 标题", "ABC-123"),
+        ("TOP100 RANK123 PAGE12 ITEM01 118abc00123.mp4", "ABC-123"),
+    ],
+)
+def test_v13_ranking_prefix_lines_extract_only_real_code(
+    parser: CodeParser, ranked_line: str, expected_code: str
+) -> None:
+    results = parser.parse_line(ranked_line)
+    assert [r.canonical_code for r in results] == [expected_code]
