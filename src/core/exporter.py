@@ -16,7 +16,14 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from .models import CompareResult, DataRecord, DuplicateGroup, LibraryStats, ParseResult
+from .models import (
+    ChecklistEntry,
+    CompareResult,
+    DataRecord,
+    DuplicateGroup,
+    LibraryStats,
+    ParseResult,
+)
 
 try:
     from openpyxl import Workbook
@@ -121,6 +128,8 @@ class ExportError(Exception):
 _HEADER_FILL_HEX = "1F4E78"
 _ZEBRA_FILL_HEX = "F4F7FA"
 _DUP_HIGHLIGHT_HEX = "FFF3CD"
+_MATCHED_FILL_HEX = "E8F5E9"
+_MISSING_FILL_HEX = "FDECEC"
 _BORDER_COLOR_HEX = "D9E1E8"
 
 
@@ -228,6 +237,7 @@ def _write_styled_sheet(
     rows: Sequence[Sequence[object]],
     *,
     highlight_row_indices: Optional[set[int]] = None,
+    row_fill_overrides: Optional[Dict[int, str]] = None,
     escape_formulas: bool = True,
     progress_callback: Optional[Callable[[int, int], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
@@ -260,6 +270,7 @@ def _write_styled_sheet(
     highlight_fill = PatternFill(
         start_color=_DUP_HIGHLIGHT_HEX, end_color=_DUP_HIGHLIGHT_HEX, fill_type="solid"
     )
+    override_fills: Dict[str, Any] = {}
     thin_side = Side(border_style="thin", color=_BORDER_COLOR_HEX)
     cell_border = Border(
         left=thin_side, right=thin_side, top=thin_side, bottom=thin_side
@@ -298,6 +309,15 @@ def _write_styled_sheet(
             for v in row_values
         ]
         ws.append(safe_row)
+        override_hex = row_fill_overrides.get(data_idx) if row_fill_overrides else None
+        row_override_fill = None
+        if override_hex:
+            row_override_fill = override_fills.get(override_hex)
+            if row_override_fill is None:
+                row_override_fill = PatternFill(
+                    start_color=override_hex, end_color=override_hex, fill_type="solid"
+                )
+                override_fills[override_hex] = row_override_fill
         is_highlighted = bool(highlight_row_indices and data_idx in highlight_row_indices)
         is_zebra = (data_idx % 2) == 1
         for col_idx, val in enumerate(safe_row, start=1):
@@ -307,7 +327,9 @@ def _write_styled_sheet(
             cell.font = body_font
             cell.alignment = body_align
             cell.border = cell_border
-            if is_highlighted:
+            if row_override_fill is not None:
+                cell.fill = row_override_fill
+            elif is_highlighted:
                 cell.fill = highlight_fill
             elif is_zebra:
                 cell.fill = zebra_fill
@@ -490,13 +512,14 @@ def export_records_csv(
 
 
 def export_codes_txt(
-    items: Iterable[DataRecord | ParseResult | str],
+    items: Iterable[DataRecord | ParseResult | ChecklistEntry | str],
     output_path: str | Path,
     *,
     unique: bool = True,
     sort_codes: bool = True,
+    uppercase: bool = True,
 ) -> Path:
-    """Export canonical codes to a plain UTF-8 ``.txt`` file (one code per line)."""
+    """Export canonical codes (or exact lines) to a plain UTF-8 ``.txt`` file (one per line)."""
     target = Path(output_path)
     _check_target_writable(target)
 
@@ -505,21 +528,19 @@ def export_codes_txt(
 
     for item in items:
         if isinstance(item, str):
-            code = sanitize_xml_text(item).replace("\r", " ").replace("\n", " ").strip().upper()
+            raw_val = item
         else:
-            code = (
-                sanitize_xml_text(item.canonical_code)
-                .replace("\r", " ")
-                .replace("\n", " ")
-                .strip()
-                .upper()
-            )
+            raw_val = item.canonical_code
+        code = sanitize_xml_text(raw_val).replace("\r", " ").replace("\n", " ").strip()
+        if uppercase:
+            code = code.upper()
         if not code:
             continue
         if unique:
-            if code in seen:
+            dedup_key = code.upper() if uppercase else code
+            if dedup_key in seen:
                 continue
-            seen.add(code)
+            seen.add(dedup_key)
         codes.append(code)
 
     if sort_codes:
@@ -682,6 +703,64 @@ _PARSE_HEADERS = [
 ]
 
 
+def _resolve_ab_checklist(result: CompareResult) -> List[ChecklistEntry]:
+    """Return ``result.target_checklist`` or synthesize a compatible checklist for manual results."""
+    if result.target_checklist:
+        return list(result.target_checklist)
+
+    a_by_code: Dict[str, List[ParseResult]] = {}
+    for item in result.intersection_a:
+        code = item.canonical_code.strip().upper()
+        if code:
+            a_by_code.setdefault(code, []).append(item)
+
+    entries: List[ChecklistEntry] = []
+    seen: set[str] = set()
+    order_idx = 0
+    for item in (*result.intersection_b, *result.only_in_b):
+        code = item.canonical_code.strip().upper()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        order_idx += 1
+        matched_a = a_by_code.get(code, [])
+        if matched_a:
+            names = list(dict.fromkeys((i.file_name or i.raw_text or code) for i in matched_a))
+            tags = ",".join(dict.fromkeys(t for i in matched_a for t in i.tags if t))
+            entries.append(
+                ChecklistEntry(
+                    order_index=order_idx,
+                    canonical_code=code,
+                    status="matched",
+                    target_text=item.raw_text or item.file_name or code,
+                    target_item=item,
+                    matched_a_count=len(matched_a),
+                    matched_a_names=names,
+                    matched_a_tags=tags,
+                    matched_a_items=list(matched_a),
+                )
+            )
+        else:
+            entries.append(
+                ChecklistEntry(
+                    order_index=order_idx,
+                    canonical_code=code,
+                    status="missing",
+                    target_text=item.raw_text or item.file_name or code,
+                    target_item=item,
+                )
+            )
+    return entries
+
+
+def _checklist_status_label(status: str) -> str:
+    if status == "matched":
+        return "已包含"
+    if status == "missing":
+        return "缺失"
+    return "未识别"
+
+
 def export_compare_result_excel(
     result: CompareResult,
     output_path: str | Path,
@@ -689,7 +768,7 @@ def export_compare_result_excel(
     progress_callback: Optional[Callable[[int, int], None]] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
 ) -> Path:
-    """Export a DB comparison or A-vs-B cross-comparison result to styled ``.xlsx``."""
+    """Export a DB comparison or 5-sheet A-vs-B coverage comparison report to styled ``.xlsx``."""
     _require_openpyxl()
     target = Path(output_path)
     _check_target_writable(target)
@@ -697,90 +776,148 @@ def export_compare_result_excel(
     wb = Workbook()
 
     if result.mode == "ab":
-        ws_inter = wb.active
-        ws_inter.title = "交集(重复)"
-        inter_rows: List[List[object]] = []
-        a_by_code: Dict[str, List[ParseResult]] = {}
-        b_by_code: Dict[str, List[ParseResult]] = {}
-        for item in result.intersection_a:
-            a_by_code.setdefault(item.canonical_code.strip().upper(), []).append(item)
-        for item in result.intersection_b:
-            b_by_code.setdefault(item.canonical_code.strip().upper(), []).append(item)
+        checklist = _resolve_ab_checklist(result)
+        unique_a = result.unique_a_count or len(
+            {
+                i.canonical_code.strip().upper()
+                for i in (*result.intersection_a, *result.only_in_a)
+                if i.canonical_code.strip()
+            }
+        )
+        unique_b = result.unique_b_count or sum(
+            1 for e in checklist if e.status in {"matched", "missing"}
+        )
+        hit_b = (
+            result.hit_b_count
+            if result.target_checklist
+            else sum(1 for e in checklist if e.status == "matched")
+        )
+        missing_b = (
+            result.missing_b_count
+            if result.target_checklist
+            else sum(1 for e in checklist if e.status == "missing")
+        )
+        coverage_pct = (100.0 * hit_b / unique_b) if unique_b > 0 else 0.0
+        if unique_b == 0:
+            verdict = "目标清单为空"
+        elif missing_b == 0:
+            verdict = "已全部包含（100% 覆盖，无缺失）"
+        else:
+            verdict = f"部分覆盖（已包含 {hit_b}/{unique_b}，缺失 {missing_b} 项）"
 
-        for code in result.intersection_codes:
-            a_names = " | ".join(
-                (i.file_name or i.raw_text) for i in a_by_code.get(code, [])
-            )
-            b_names = " | ".join(
-                (i.file_name or i.raw_text) for i in b_by_code.get(code, [])
-            )
-            inter_rows.append(
+        mode_label = "智能编码比对" if result.match_mode == "smart_code" else "精确文本行比对"
+
+        # Sheet 1: 覆盖率总览
+        ws_overview = wb.active
+        ws_overview.title = "覆盖率总览"
+        _write_styled_sheet(
+            ws_overview,
+            ["统计指标", "数值"],
+            [
+                ["比对模式", mode_label],
+                ["基准清单 A", result.source_a_name or "基准清单A"],
+                ["目标清单 B", result.source_b_name or "目标清单B"],
+                ["基准 A 唯一项数", unique_a],
+                ["目标 B 唯一项数", unique_b],
+                ["已包含数量 (A∩B)", hit_b],
+                ["缺失数量 (仅目标B有)", missing_b],
+                ["仅基准 A 独有条目数", len(result.only_in_a)],
+                ["目标覆盖率", f"{coverage_pct:.2f}%"],
+                ["覆盖结论", verdict],
+                ["基准 A 未识别数", len(result.unrecognized_a)],
+                ["目标 B 未识别数", len(result.unrecognized_b)],
+            ],
+            cancel_check=cancel_check,
+        )
+
+        # Sheet 2: 目标清单逐条核对
+        ws_checklist = wb.create_sheet("目标清单逐条核对")
+        checklist_rows: List[List[object]] = []
+        checklist_fills: Dict[int, str] = {}
+        missing_rows: List[List[object]] = []
+        matched_rows_ab: List[List[object]] = []
+
+        for idx, entry in enumerate(checklist):
+            names_str = " | ".join(entry.matched_a_names)
+            checklist_rows.append(
                 [
-                    code,
-                    len(a_by_code.get(code, [])),
-                    a_names,
-                    len(b_by_code.get(code, [])),
-                    b_names,
+                    entry.order_index,
+                    _checklist_status_label(entry.status),
+                    entry.canonical_code,
+                    entry.target_text,
+                    entry.matched_a_count,
+                    names_str,
+                    entry.matched_a_tags,
                 ]
             )
+            if entry.status == "matched":
+                checklist_fills[idx] = _MATCHED_FILL_HEX
+                matched_rows_ab.append(
+                    [
+                        entry.canonical_code,
+                        entry.target_text,
+                        entry.matched_a_count,
+                        names_str,
+                        entry.matched_a_tags,
+                    ]
+                )
+            elif entry.status == "missing":
+                checklist_fills[idx] = _MISSING_FILL_HEX
+                src_label = (
+                    entry.target_item.source_name
+                    if entry.target_item and entry.target_item.source_name
+                    else (result.source_b_name or "目标清单B")
+                )
+                missing_rows.append(
+                    [
+                        entry.order_index,
+                        entry.canonical_code,
+                        entry.target_text,
+                        src_label,
+                    ]
+                )
+
         _write_styled_sheet(
-            ws_inter,
+            ws_checklist,
             [
+                "序号",
+                "状态",
                 "标准编码",
-                f"{result.source_a_name or '来源A'}数量",
-                f"{result.source_a_name or '来源A'}条目",
-                f"{result.source_b_name or '来源B'}数量",
-                f"{result.source_b_name or '来源B'}条目",
+                "目标原始文本",
+                "基准A命中数",
+                "基准A匹配文件名",
+                "基准A标签",
             ],
-            inter_rows,
+            checklist_rows,
+            row_fill_overrides=checklist_fills,
             progress_callback=progress_callback,
             cancel_check=cancel_check,
         )
 
-        ws_a = wb.create_sheet("仅A有")
+        # Sheet 3: 缺失清单(仅目标B有)
+        ws_missing = wb.create_sheet("缺失清单(仅目标B有)")
         _write_styled_sheet(
-            ws_a,
+            ws_missing,
+            ["序号", "标准编码", "目标原始文本", "来源"],
+            missing_rows,
+            cancel_check=cancel_check,
+        )
+
+        # Sheet 4: 已包含对照(A∩B)
+        ws_matched_ab = wb.create_sheet("已包含对照(A∩B)")
+        _write_styled_sheet(
+            ws_matched_ab,
+            ["标准编码", "目标原始文本", "基准A命中数", "基准A文件名", "基准A标签"],
+            matched_rows_ab,
+            cancel_check=cancel_check,
+        )
+
+        # Sheet 5: 仅基准A独有
+        ws_only_a = wb.create_sheet("仅基准A独有")
+        _write_styled_sheet(
+            ws_only_a,
             _PARSE_HEADERS,
             [_parse_result_row(i, result.source_a_name) for i in result.only_in_a],
-            cancel_check=cancel_check,
-        )
-
-        ws_b = wb.create_sheet("仅B有")
-        _write_styled_sheet(
-            ws_b,
-            _PARSE_HEADERS,
-            [_parse_result_row(i, result.source_b_name) for i in result.only_in_b],
-            cancel_check=cancel_check,
-        )
-
-        ws_unrec = wb.create_sheet("未识别")
-        unrec_rows = [
-            [result.source_a_name or "来源A", i.line_number, i.raw_text, i.note]
-            for i in result.unrecognized_a
-        ] + [
-            [result.source_b_name or "来源B", i.line_number, i.raw_text, i.note]
-            for i in result.unrecognized_b
-        ]
-        _write_styled_sheet(
-            ws_unrec,
-            ["来源", "行号", "原始文本", "说明"],
-            unrec_rows,
-            cancel_check=cancel_check,
-        )
-
-        ws_sum = wb.create_sheet("比对汇总")
-        _write_styled_sheet(
-            ws_sum,
-            ["统计项", "数值"],
-            [
-                ["来源A", result.source_a_name or "来源A"],
-                ["来源B", result.source_b_name or "来源B"],
-                ["交集编码数", len(result.intersection_codes)],
-                ["仅A有条目数", len(result.only_in_a)],
-                ["仅B有条目数", len(result.only_in_b)],
-                ["A未识别数", len(result.unrecognized_a)],
-                ["B未识别数", len(result.unrecognized_b)],
-            ],
             cancel_check=cancel_check,
         )
     else:
@@ -947,4 +1084,53 @@ def export_compare_result_csv(
                 ["未识别", "", "", "", item.raw_text, result.source_a_name, item.note]
             )
 
+    return _write_csv_safely(target, headers, rows)
+
+
+def export_checklist_csv(
+    entries: Sequence[ChecklistEntry],
+    output_path: str | Path,
+    *,
+    only_missing: bool = False,
+    source_b_name: str = "",
+) -> Path:
+    """Export target checklist entries (all or missing-only) to a UTF-8-SIG ``.csv`` file."""
+    target = Path(output_path)
+    _check_target_writable(target)
+
+    if only_missing:
+        headers = ["序号", "标准编码", "目标原始文本", "来源"]
+        rows: List[List[object]] = []
+        for entry in entries:
+            if entry.status != "missing":
+                continue
+            src = (
+                entry.target_item.source_name
+                if entry.target_item and entry.target_item.source_name
+                else (source_b_name or "目标清单B")
+            )
+            rows.append([entry.order_index, entry.canonical_code, entry.target_text, src])
+        return _write_csv_safely(target, headers, rows)
+
+    headers = [
+        "序号",
+        "状态",
+        "标准编码",
+        "目标原始文本",
+        "基准A命中数",
+        "基准A匹配文件名",
+        "基准A标签",
+    ]
+    rows = [
+        [
+            entry.order_index,
+            _checklist_status_label(entry.status),
+            entry.canonical_code,
+            entry.target_text,
+            entry.matched_a_count,
+            " | ".join(entry.matched_a_names),
+            entry.matched_a_tags,
+        ]
+        for entry in entries
+    ]
     return _write_csv_safely(target, headers, rows)
