@@ -44,7 +44,7 @@ from src.ui.view_settings import SettingsView
 from src.ui.view_tables import TablesView
 from src.ui.widgets import ScrollableDetailDialog, StatCard, ToastNotification
 
-_FALLBACK_VERSION = "1.2.0"
+_FALLBACK_VERSION = "1.3.0"
 
 
 def _resolve_app_version() -> str:
@@ -85,7 +85,7 @@ class MainWindow(QMainWindow):
         "数据总库",
         "批量导入",
         "多表工作台",
-        "快速查重",
+        "快速查重与对比",
         "重复项中心",
         "规则与设置",
     ]
@@ -171,20 +171,20 @@ class MainWindow(QMainWindow):
         self._nav_group = QButtonGroup(self)
         self._nav_group.setExclusive(True)
         nav_defs = [
-            ("📚  数据总库", 0, "Ctrl+1"),
-            ("📥  批量导入", 1, "Ctrl+2"),
-            ("📊  多表工作台", 2, "Ctrl+3"),
-            ("🔍  快速查重", 3, "Ctrl+4"),
-            ("🧩  重复项中心", 4, "Ctrl+5"),
-            ("⚙️  规则与设置", 5, "Ctrl+6"),
+            ("📚  数据总库", 0, "Ctrl+1", "数据总库 (Ctrl+1)"),
+            ("📥  批量导入", 1, "Ctrl+2", "批量导入 (Ctrl+2)"),
+            ("📊  多表工作台", 2, "Ctrl+3", "多表工作台 (Ctrl+3)"),
+            ("🔍  查重与对比", 3, "Ctrl+4", "快速查重与双列表覆盖率对比 (Ctrl+4)"),
+            ("🧩  重复项中心", 4, "Ctrl+5", "重复项中心 (Ctrl+5)"),
+            ("⚙️  规则与设置", 5, "Ctrl+6", "规则与设置 (Ctrl+6)"),
         ]
         self._nav_buttons: list[QPushButton] = []
-        for label, idx, shortcut_hint in nav_defs:
+        for label, idx, _shortcut_hint, tooltip in nav_defs:
             btn = QPushButton(label)
             btn.setProperty("nav", True)
             btn.setCheckable(True)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setToolTip(f"{self._VIEW_TITLES[idx]} ({shortcut_hint})")
+            btn.setToolTip(tooltip)
             self._nav_group.addButton(btn, idx)
             sb_layout.addWidget(btn)
             self._nav_buttons.append(btn)
