@@ -28,6 +28,7 @@ from .normalizer import (
     is_false_positive,
     is_plausible_six_digit_date,
     normalize_serial_number,
+    normalize_width,
     split_known_extension,
 )
 from .rules import RuleRegistry
@@ -83,9 +84,9 @@ class _CandidateMatch:
     confidence: float
 
 
-# Composite prefix pattern (supports -, _, ., and space separators).
+# Composite prefix pattern (supports -, _, ., space, #, and No. separators).
 _RE_COMPOSITE_FC2 = re.compile(
-    r"(?<![A-Za-z0-9])FC2(?:[-_.\s]*PPV)?[-_.\s]*(\d{5,7})(?![0-9])",
+    r"(?<![A-Za-z0-9])FC2(?:[-_.\s#]*PPV)?[-_.\s]*(?:(?:No\.?|#)[-_.\s]*)?(\d{5,7})(?![0-9])",
     re.IGNORECASE,
 )
 
@@ -538,7 +539,7 @@ class CodeParser:
 
         display_name = raw_text
         if not file_ext:
-            _, detected_ext = split_known_extension(display_name)
+            _, detected_ext = split_known_extension(normalize_width(display_name))
             file_ext = detected_ext
 
         cleaned = clean_text(display_name)
@@ -595,7 +596,13 @@ class CodeParser:
             return results
 
         # Stage 3: parent-folder fallback when filename has no recognizable code.
-        for ancestor in self._get_ancestor_candidates(parent_dir, full_path):
+        # For Word/Excel document entries, never climb the host document's own disk path.
+        fallback_full_path = full_path
+        if source_type in {"word", "excel"} and full_path.lower().endswith(
+            (".docx", ".xlsx", ".xlsm", ".doc", ".xls")
+        ):
+            fallback_full_path = ""
+        for ancestor in self._get_ancestor_candidates(parent_dir, fallback_full_path):
             ancestor_cleaned = clean_text(ancestor)
             ancestor_cands = self._collect_candidates(ancestor_cleaned)
             if ancestor_cands:
