@@ -13,13 +13,15 @@ from src.core.config import (
     DEFAULT_COMPANION_EXTENSIONS,
     AppConfig,
     ConfigManager,
+    WindowGeometry,
     get_app_base_dir,
     get_resource_path,
     get_user_data_dir,
     is_frozen,
     normalize_extension,
 )
-from src.core.database import DatabaseError, DatabaseRepository
+from src.core.database import SCHEMA_VERSION, DatabaseError, DatabaseRepository
+from src.core.io_utils import DEFAULT_COMPANION_EXTENSIONS as IO_COMPANION_EXTS
 from src.core.models import DataRecord, ImportBatch
 
 
@@ -155,6 +157,114 @@ class TestConfigManager:
         assert ".jpg" in mgr.get_companion_extension_set()
         mgr.config.ignore_companion_files = False
         assert mgr.get_companion_extension_set() == set()
+
+    def test_single_bad_field_preserves_other_settings_and_guards_bools(
+        self, tmp_path: Path
+    ) -> None:
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(
+            json.dumps(
+                {
+                    "theme": "dark",
+                    "max_recent_dbs": "not-a-number",
+                    "backup_keep_count": True,
+                    "default_dedup_strategy": "unknown_strategy",
+                    "window_geometry": {
+                        "width": "broken",
+                        "height": 920,
+                        "x": True,
+                        "y": False,
+                        "maximized": "true",
+                        "qt_geometry_b64": "QUJD",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        mgr = ConfigManager(config_path=cfg_file, data_dir=tmp_path)
+        assert not (tmp_path / "config.corrupt.json").exists()
+        assert mgr.config.theme == "dark"
+        assert mgr.config.max_recent_dbs == 10
+        assert mgr.config.backup_keep_count == 5
+        assert mgr.config.default_dedup_strategy == "keep_highest_tag_score"
+        assert mgr.config.window_geometry.width == 1280
+        assert mgr.config.window_geometry.height == 920
+        assert mgr.config.window_geometry.x is None
+        assert mgr.config.window_geometry.y is None
+        assert mgr.config.window_geometry.maximized is True
+        assert mgr.config.window_geometry.qt_geometry_b64 == "QUJD"
+
+        # Invalid theme falls back cleanly
+        cfg_invalid = AppConfig.from_dict({"theme": "neon", "window_geometry": "bad"})
+        assert cfg_invalid.theme == "light"
+        assert isinstance(cfg_invalid.window_geometry, WindowGeometry)
+
+    def test_portable_mode_relative_paths_and_explicit_config_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Passing explicit config_path without data_dir must NOT call get_user_data_dir()
+        called = False
+
+        def _fail_user_dir(*args, **kwargs):
+            nonlocal called
+            called = True
+            raise AssertionError("get_user_data_dir should not be called")
+
+        monkeypatch.setattr("src.core.config.get_user_data_dir", _fail_user_dir)
+        explicit_cfg = tmp_path / "isolated" / "custom.json"
+        mgr_iso = ConfigManager(config_path=explicit_cfg)
+        assert called is False
+        assert mgr_iso.data_dir == explicit_cfg.parent.resolve()
+
+        # Portable mode: stores relative paths for files inside data_dir
+        drive_e = tmp_path / "drive_e" / "app"
+        data_e = drive_e / "user_data"
+        data_e.mkdir(parents=True)
+        (drive_e / "portable.flag").write_text("1", encoding="utf-8")
+
+        mgr = ConfigManager(data_dir=data_e)
+        ext_db = tmp_path / "external_shared.db"
+        mgr.add_recent_db(ext_db, set_current=False)
+        mgr.add_recent_db(data_e / "databases" / "default.db", set_current=True)
+        mgr.save()
+
+        raw_saved = json.loads((data_e / "config.json").read_text(encoding="utf-8"))
+        assert raw_saved["current_db_path"] == "databases/default.db"
+        assert raw_saved["custom_rules_path"] == "custom_rules.json"
+        assert raw_saved["recent_db_paths"][0] == "databases/default.db"
+        assert Path(raw_saved["recent_db_paths"][1]) == ext_db.resolve()
+
+        # Simulate moving portable folder to a new drive/location
+        drive_f = tmp_path / "drive_f" / "app"
+        data_f = drive_f / "user_data"
+        data_f.mkdir(parents=True)
+        (drive_f / "portable.flag").write_text("1", encoding="utf-8")
+        (data_f / "config.json").write_text(
+            (data_e / "config.json").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        moved = ConfigManager(data_dir=data_f)
+        assert Path(moved.config.current_db_path) == (data_f / "databases" / "default.db").resolve()
+        assert Path(moved.config.custom_rules_path) == (data_f / "custom_rules.json").resolve()
+
+    def test_reset_to_defaults_non_frozen_paths_and_single_source_extensions(
+        self, tmp_path: Path
+    ) -> None:
+        assert set(DEFAULT_COMPANION_EXTENSIONS) == set(IO_COMPANION_EXTS)
+        assert get_resource_path("pyproject.toml") == get_app_base_dir() / "pyproject.toml"
+
+        mgr = ConfigManager(data_dir=tmp_path)
+        mgr.config.theme = "dark"
+        mgr.update_window_geometry(qt_geometry_b64="BASE64DATA")
+        mgr.save()
+        reloaded = ConfigManager(data_dir=tmp_path)
+        assert reloaded.config.window_geometry.qt_geometry_b64 == "BASE64DATA"
+
+        reloaded.reset_to_defaults()
+        assert reloaded.config.theme == "light"
+        assert reloaded.config.window_geometry.qt_geometry_b64 == ""
+        assert Path(reloaded.config.current_db_path).parent == (tmp_path / "databases").resolve()
 
 
 # ----------------------------------------------------------------------
@@ -354,3 +464,180 @@ class TestDatabaseRepository:
             assert repo.count_records() == 1
             assert repo.get_batch(b1.id) is None
             assert repo.get_batch(b2.id) is not None
+
+    def test_backup_isolation_prefix_collision_and_brackets(self, tmp_path: Path) -> None:
+        db_short = tmp_path / "work.db"
+        db_long = tmp_path / "work_2026.db"
+        db_bracket = tmp_path / "lib_[1].db"
+
+        with DatabaseRepository(db_long, backup_keep_count=3) as repo_long:
+            repo_long.add_record(_make_record("LONG-001"))
+            bak_long = repo_long.create_backup(reason="manual")
+            assert bak_long is not None and bak_long.is_file()
+
+        with DatabaseRepository(db_short, backup_keep_count=1) as repo_short:
+            repo_short.add_record(_make_record("SHORT-001"))
+            repo_short.create_backup(reason="first")
+            repo_short.create_backup(reason="second")
+
+            # work.db must NEVER see or delete work_2026.db's backup!
+            assert bak_long.exists()
+            short_baks = repo_short.list_backups()
+            assert len(short_baks) == 1
+            assert all(b.name.startswith("work_20") is False for b in short_baks) or all(
+                b != bak_long for b in short_baks
+            )
+
+        with DatabaseRepository(db_bracket, backup_keep_count=1) as repo_br:
+            repo_br.add_record(_make_record("BR-001"))
+            b1 = repo_br.create_backup(reason="one")
+            b2 = repo_br.create_backup(reason="two")
+            assert b1 is not None and b2 is not None
+            listed = repo_br.list_backups()
+            assert len(listed) == 1
+            assert listed[0] == b2
+            assert not b1.exists()
+
+    def test_restore_rejects_corrupt_bak_and_works_under_wal_reader(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "live.db"
+        with DatabaseRepository(db_path, auto_backup=True) as repo:
+            repo.add_records([_make_record("KEEP-001"), _make_record("KEEP-002")])
+            good_bak = repo.create_backup(reason="good")
+            assert good_bak is not None
+
+            # Corrupt garbage file must be rejected WITHOUT damaging live DB
+            bad_bak = tmp_path / "corrupt.db.bak"
+            bad_bak.write_bytes(b"NOT A SQLITE FILE")
+            with pytest.raises(DatabaseError):
+                repo.restore_backup(bad_bak)
+            assert repo.count_records() == 2
+
+            # Valid SQLite file missing required tables must also be rejected
+            empty_sqlite = tmp_path / "empty_schema.db.bak"
+            c = sqlite3.connect(str(empty_sqlite))
+            c.execute("CREATE TABLE other (x INT)")
+            c.commit()
+            c.close()
+            with pytest.raises(DatabaseError):
+                repo.restore_backup(empty_sqlite)
+            assert repo.count_records() == 2
+
+            # Mutate live DB, hold a concurrent WAL reader, then restore cleanly
+            repo.add_record(_make_record("EXTRA-003"))
+            assert repo.count_records() == 3
+
+            reader = sqlite3.connect(str(db_path))
+            try:
+                assert reader.execute("SELECT COUNT(*) FROM records").fetchone()[0] == 3
+                repo.restore_backup(good_bak)
+                assert repo.count_records() == 2
+            finally:
+                reader.close()
+
+    def test_no_redundant_backup_on_noop_deletes_and_remove_db_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        db_path = tmp_path / "noop.db"
+        with DatabaseRepository(db_path, auto_backup=True) as repo:
+            assert repo.delete_records([]) == 0
+            assert repo.delete_records([99999]) == 0
+            assert repo.delete_by_batch(99999) == 0
+            assert repo.clear_all_records() == 0
+            assert repo.list_backups() == []
+
+        # _remove_db_files must surface OSError as DatabaseError (never silently swallow)
+        wal_path = Path(f"{db_path}-wal")
+        wal_path.write_bytes(b"locked")
+
+        orig_unlink = Path.unlink
+
+        def _deny_wal(self: Path, *args, **kwargs):
+            if self.name.endswith("-wal"):
+                raise PermissionError("file locked")
+            return orig_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", _deny_wal)
+        with pytest.raises(DatabaseError, match="无法删除数据库文件"):
+            DatabaseRepository._remove_db_files(db_path)
+
+    def test_like_escape_multipart_consistency_empty_code_sort_and_schema_guard(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "edge.db"
+        with DatabaseRepository(db_path, auto_backup=False) as repo:
+            repo.add_records(
+                [
+                    _make_record("ABC-001", file_name="ABC-001.mp4", tags=["4K"]),
+                    _make_record("ABC-002", file_name="ABC_001.mp4", tags=["4_"]),
+                    _make_record("PCT-001", file_name="100%real.mp4"),
+                    _make_record("PCT-002", file_name="1000real.mp4"),
+                    # Singleton with part -> NOT a multipart group!
+                    _make_record("SOLO-001", file_name="SOLO-001-CD1.mp4", part="CD1"),
+                    # Same-part duplicates -> NOT a multipart group!
+                    _make_record("SAME-001", file_name="SAME-001-CD1-a.mp4", part="CD1"),
+                    _make_record("SAME-001", file_name="SAME-001-CD1-b.mp4", part="CD1"),
+                    # True multipart group (CD1 + CD2)
+                    _make_record("MP-001", file_name="MP-001-CD1.mp4", part="CD1"),
+                    _make_record("MP-001", file_name="MP-001-CD2.mp4", part="CD2"),
+                    # 3 empty canonical_code rows must NOT outrank real duplicates
+                    _make_record("", file_name="unrec1.txt"),
+                    _make_record("", file_name="unrec2.txt"),
+                    _make_record("", file_name="unrec3.txt"),
+                ]
+            )
+
+            # Escaped LIKE wildcards
+            assert [r.file_name for r in repo.query_records(search="ABC_001")] == ["ABC_001.mp4"]
+            assert [r.file_name for r in repo.query_records(search="100%")] == ["100%real.mp4"]
+            assert [r.canonical_code for r in repo.query_records(tag="4_")] == ["ABC-002"]
+
+            # Multipart filter aligns strictly with get_stats()
+            stats = repo.get_stats()
+            assert stats.possible_multipart_groups == 1
+            mp_rows = repo.query_records(filter_mode="multipart")
+            assert {r.canonical_code for r in mp_rows} == {"MP-001"}
+            assert len(mp_rows) == 2
+
+            # sort_by="duplicate_count" DESC puts real duplicates before empty canonical_code rows
+            ordered = repo.query_records(sort_by="duplicate_count", sort_desc=True)
+            assert ordered[0].canonical_code in ("MP-001", "SAME-001")
+            assert ordered[-1].canonical_code == ""
+
+        # Schema downgrade protection
+        future_db = tmp_path / "future.db"
+        conn = sqlite3.connect(str(future_db))
+        conn.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute(
+            "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)",
+            (str(int(SCHEMA_VERSION) + 5),),
+        )
+        conn.commit()
+        conn.close()
+        with pytest.raises(DatabaseError, match="高于当前程序支持版本"):
+            DatabaseRepository(future_db)
+
+    def test_edge_error_paths_chunked_ids_and_batch_filter(self, tmp_path: Path) -> None:
+        with DatabaseRepository(tmp_path / "misc.db", auto_backup=False) as repo:
+            # update_record edge cases
+            with pytest.raises(ValueError):
+                repo.update_record(_make_record("NO-ID"))
+            missing = _make_record("MISSING-1")
+            missing.id = 999999
+            assert repo.update_record(missing) is False
+
+            # > 800 IDs chunked get_records_by_ids + batch_id filtering
+            saved, b1 = repo.add_records(
+                [_make_record(f"ID-{i:04d}") for i in range(850)],
+                batch=ImportBatch(source_name="big.txt", total_count=850),
+            )
+            assert b1 is not None and b1.id is not None
+            fetched = repo.get_records_by_ids([r.id for r in saved if r.id is not None])
+            assert len(fetched) == 850
+            assert repo.count_records(batch_id=b1.id) == 850
+            assert repo.count_records(batch_id=b1.id + 999) == 0
+
+        # Closed DB raises DatabaseError
+        with pytest.raises(DatabaseError, match="已关闭"):
+            repo.count_records()
