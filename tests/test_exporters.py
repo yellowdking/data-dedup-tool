@@ -34,6 +34,7 @@ from src.core.exporter import (
     _sanitize_csv_value,
     _sanitize_excel_value,
     _write_styled_sheet,
+    export_checklist_csv,
     export_codes_txt,
     export_compare_result_csv,
     export_compare_result_excel,
@@ -851,3 +852,128 @@ class TestFastWordExportAndReports:
         wb_rec = openpyxl.load_workbook(rec_xlsx)
         assert wb_rec.sheetnames == ["数据清单", "汇总统计"]
         wb_rec.close()
+
+    def test_v13_five_sheet_ab_coverage_excel_csv_and_ordered_missing_txt(
+        self, tmp_path: Path
+    ) -> None:
+        from src.core.dedup import compare_two_sources
+
+        items_a = [
+            ParseResult(
+                canonical_code="PRJ-002",
+                prefix="PRJ",
+                number="002",
+                raw_text="PRJ-002_4K.mp4",
+                file_name="=CMD|'/C calc'!A0",
+                tags=["4K", "字幕"],
+                recognized=True,
+            ),
+            ParseResult(
+                canonical_code="ONLY-A01",
+                prefix="ONLY",
+                number="A01",
+                raw_text="ONLY-A01.mp4",
+                file_name="ONLY-A01.mp4",
+                recognized=True,
+            ),
+        ]
+        items_b = [
+            ParseResult(
+                canonical_code="MISS-099",
+                prefix="MISS",
+                number="099",
+                raw_text="#1 MISS-099 缺失项",
+                source_name="目标清单B",
+                recognized=True,
+            ),
+            ParseResult(
+                canonical_code="PRJ-002",
+                prefix="PRJ",
+                number="002",
+                raw_text="#2 PRJ-002 已包含项",
+                source_name="目标清单B",
+                recognized=True,
+            ),
+            ParseResult(
+                canonical_code="MISS-001",
+                prefix="MISS",
+                number="001",
+                raw_text="=EVIL_TARGET_ROW",
+                source_name="目标清单B",
+                recognized=True,
+            ),
+        ]
+        cmp_res = compare_two_sources(items_a, items_b, "基准库A", "目标清单B")
+
+        out_xlsx = tmp_path / "coverage_5sheet.xlsx"
+        export_compare_result_excel(cmp_res, out_xlsx)
+
+        wb = openpyxl.load_workbook(out_xlsx, data_only=False)
+        assert wb.sheetnames == [
+            "覆盖率总览",
+            "目标清单逐条核对",
+            "缺失清单(仅目标B有)",
+            "已包含对照(A∩B)",
+            "仅基准A独有",
+        ]
+
+        # Sheet 1: 覆盖率总览
+        ws_sum = wb["覆盖率总览"]
+        summary_map = {ws_sum.cell(r, 1).value: ws_sum.cell(r, 2).value for r in range(2, ws_sum.max_row + 1)}
+        assert summary_map["基准 A 唯一项数"] == 2
+        assert summary_map["目标 B 唯一项数"] == 3
+        assert summary_map["已包含数量 (A∩B)"] == 1
+        assert summary_map["缺失数量 (仅目标B有)"] == 2
+        assert summary_map["目标覆盖率"] == "33.33%"
+        assert "缺失 2 项" in str(summary_map["覆盖结论"])
+
+        # Sheet 2: 目标清单逐条核对 (order preserved + green/red tints + formula safe)
+        ws_chk = wb["目标清单逐条核对"]
+        assert ws_chk.max_row == 4
+        assert [ws_chk.cell(r, 1).value for r in (2, 3, 4)] == [1, 2, 3]
+        assert [ws_chk.cell(r, 2).value for r in (2, 3, 4)] == ["缺失", "已包含", "缺失"]
+        assert [ws_chk.cell(r, 3).value for r in (2, 3, 4)] == ["MISS-099", "PRJ-002", "MISS-001"]
+        assert ws_chk.cell(2, 1).fill.start_color.rgb.endswith("FDECEC")
+        assert ws_chk.cell(3, 1).fill.start_color.rgb.endswith("E8F5E9")
+        assert ws_chk.cell(3, 6).data_type == "s"
+        assert ws_chk.cell(3, 6).value == "'=CMD|'/C calc'!A0"
+        assert ws_chk.cell(3, 7).value == "4K,字幕"
+        assert ws_chk.cell(4, 4).data_type == "s"
+        assert ws_chk.cell(4, 4).value == "'=EVIL_TARGET_ROW"
+
+        # Sheet 3: 缺失清单(仅目标B有)
+        ws_miss = wb["缺失清单(仅目标B有)"]
+        assert ws_miss.max_row == 3
+        assert [ws_miss.cell(r, 2).value for r in (2, 3)] == ["MISS-099", "MISS-001"]
+
+        # Sheet 4: 已包含对照(A∩B)
+        ws_hit = wb["已包含对照(A∩B)"]
+        assert ws_hit.max_row == 2
+        assert ws_hit.cell(2, 1).value == "PRJ-002"
+        assert ws_hit.cell(2, 5).value == "4K,字幕"
+
+        # Sheet 5: 仅基准A独有
+        ws_only_a = wb["仅基准A独有"]
+        assert ws_only_a.max_row == 2
+        assert ws_only_a.cell(2, 1).value == "ONLY-A01"
+        wb.close()
+
+        # Checklist CSV (only_missing=True & full)
+        miss_csv = tmp_path / "missing_only.csv"
+        export_checklist_csv(cmp_res.target_checklist, miss_csv, only_missing=True, source_b_name="目标清单B")
+        assert miss_csv.read_bytes().startswith(b"\xef\xbb\xbf")
+        with open(miss_csv, "r", encoding="utf-8-sig", newline="") as f:
+            miss_rows = list(csv.reader(f))
+        assert len(miss_rows) == 3
+        assert miss_rows[1][1] == "MISS-099"
+        assert miss_rows[2][2] == "'=EVIL_TARGET_ROW"
+
+        # Ordered missing codes TXT (preserves Target B order, does not re-sort)
+        miss_txt = tmp_path / "missing_ordered.txt"
+        export_codes_txt(cmp_res.missing_b_codes, miss_txt, unique=True, sort_codes=False)
+        assert miss_txt.read_text(encoding="utf-8").splitlines() == ["MISS-099", "MISS-001"]
+
+        # Exact-line TXT preserves original casing when uppercase=False
+        exact_txt = tmp_path / "exact_missing.txt"
+        export_codes_txt(["Alpha Line", "Beta Line"], exact_txt, unique=True, sort_codes=False, uppercase=False)
+        assert exact_txt.read_text(encoding="utf-8").splitlines() == ["Alpha Line", "Beta Line"]
