@@ -116,11 +116,11 @@ def preview_import(
             if _is_distinct_multipart(part_key, combined_parts):
                 possible_multiparts.append(item)
                 batch_seen_parts.setdefault(code, set()).add(part_key)
+            elif seen_in_batch is not None and part_key in seen_in_batch:
+                batch_duplicates.append(item)
             elif part_key in db_parts:
                 db_duplicates.append((item, db_records))
                 batch_seen_parts.setdefault(code, set()).add(part_key)
-            elif seen_in_batch is not None and part_key in seen_in_batch:
-                batch_duplicates.append(item)
             else:
                 db_duplicates.append((item, db_records))
                 batch_seen_parts.setdefault(code, set()).add(part_key)
@@ -165,7 +165,7 @@ def commit_preview(
     include_batch_duplicates: bool = False,
     extra_items: Optional[Sequence[ParseResult]] = None,
     source_name: str = "",
-    source_type: str = "txt",
+    source_type: str = "",
 ) -> Tuple[List[DataRecord], ImportBatch]:
     """Commit selected categories from a ``DedupPreview`` into the database."""
     selected: List[ParseResult] = list(preview.new_items)
@@ -196,7 +196,8 @@ def commit_preview(
         unrecognized_count=len(preview.unrecognized),
     )
     saved, saved_batch = db.add_records(records, batch=batch)
-    assert saved_batch is not None
+    if saved_batch is None:
+        raise RuntimeError("保存导入批次元数据失败")
     return saved, saved_batch
 
 
@@ -419,15 +420,16 @@ def plan_duplicate_cleanup(
 
             for bucket in part_buckets.values():
                 if len(bucket) == 1:
-                    assert bucket[0].id is not None
-                    group_keep.append(bucket[0].id)
+                    rid = bucket[0].id
+                    if rid is not None:
+                        group_keep.append(rid)
                 else:
                     keeper = _pick_keeper(bucket, strategy)
-                    assert keeper.id is not None
-                    group_keep.append(keeper.id)
+                    keeper_id = keeper.id
+                    if keeper_id is not None:
+                        group_keep.append(keeper_id)
                     for rec in bucket:
-                        assert rec.id is not None
-                        if rec.id != keeper.id:
+                        if rec.id is not None and rec.id != keeper_id:
                             group_delete.append(rec.id)
 
             if not group_delete:
@@ -435,11 +437,11 @@ def plan_duplicate_cleanup(
                 protected_groups.append(group.canonical_code)
         else:
             keeper = _pick_keeper(valid_records, strategy)
-            assert keeper.id is not None
-            group_keep.append(keeper.id)
+            keeper_id = keeper.id
+            if keeper_id is not None:
+                group_keep.append(keeper_id)
             for rec in valid_records:
-                assert rec.id is not None
-                if rec.id != keeper.id:
+                if rec.id is not None and rec.id != keeper_id:
                     group_delete.append(rec.id)
 
         all_keep_ids.extend(group_keep)

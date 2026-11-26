@@ -10,49 +10,31 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from .io_utils import DEFAULT_COMPANION_EXTENSIONS_LIST
+
 APP_NAME = "数据查重程序"
 APP_DIR_NAME = "DataDedupTool"
 
-DEFAULT_COMPANION_EXTENSIONS: List[str] = [
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".bmp",
-    ".gif",
-    ".webp",
-    ".ico",
-    ".tiff",
-    ".nfo",
-    ".srt",
-    ".ass",
-    ".ssa",
-    ".sub",
-    ".idx",
-    ".vtt",
-    ".sup",
-    ".lrc",
-    ".txt",
-    ".url",
-    ".lnk",
-    ".ini",
-    ".db",
-    ".torrent",
-    ".json",
-    ".xml",
-    ".log",
-    ".md5",
-    ".sha1",
-    ".sha256",
-    ".sfv",
-    ".par2",
-    ".mht",
-    ".html",
-    ".htm",
-]
+DEFAULT_COMPANION_EXTENSIONS: List[str] = list(DEFAULT_COMPANION_EXTENSIONS_LIST)
+
+_VALID_THEMES = {"light", "dark", "system"}
+_VALID_DEDUP_STRATEGIES = {
+    "keep_earliest",
+    "keep_latest",
+    "keep_highest_tag_score",
+    "keep_longest_name",
+}
+_PORTABLE_PATH_FIELDS = (
+    "current_db_path",
+    "custom_rules_path",
+    "default_import_dir",
+    "default_export_dir",
+)
 
 
 def is_frozen() -> bool:
@@ -146,6 +128,58 @@ def normalize_extension(ext: str) -> str:
     return cleaned
 
 
+def _safe_int(
+    value: Any,
+    default: int,
+    *,
+    min_val: Optional[int] = None,
+    max_val: Optional[int] = None,
+) -> int:
+    """Safely parse an integer field, rejecting booleans and invalid values."""
+    if value is None or isinstance(value, bool):
+        parsed = default
+    else:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+    if min_val is not None and parsed < min_val:
+        parsed = min_val
+    if max_val is not None and parsed > max_val:
+        parsed = max_val
+    return parsed
+
+
+def _safe_opt_int(value: Any) -> Optional[int]:
+    """Safely parse an optional integer (rejects bools and non-int types)."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _safe_bool(value: Any, default: bool) -> bool:
+    """Safely parse a boolean field with sensible string/numeric handling."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        low = value.strip().lower()
+        if low in ("true", "1", "yes", "on"):
+            return True
+        if low in ("false", "0", "no", "off"):
+            return False
+    return default
+
+
+def _safe_str(value: Any, default: str = "") -> str:
+    if isinstance(value, str):
+        return value.strip()
+    return default
+
+
 @dataclass
 class WindowGeometry:
     """Stored desktop window dimensions and position."""
@@ -161,13 +195,14 @@ class WindowGeometry:
     def from_dict(cls, data: Optional[Dict[str, Any]]) -> "WindowGeometry":
         if not isinstance(data, dict):
             return cls()
+        raw_b64 = data.get("qt_geometry_b64")
         return cls(
-            width=max(640, int(data.get("width", 1280) or 1280)),
-            height=max(480, int(data.get("height", 800) or 800)),
-            x=data.get("x") if isinstance(data.get("x"), int) else None,
-            y=data.get("y") if isinstance(data.get("y"), int) else None,
-            maximized=bool(data.get("maximized", False)),
-            qt_geometry_b64=str(data.get("qt_geometry_b64", "") or ""),
+            width=_safe_int(data.get("width"), 1280, min_val=640),
+            height=_safe_int(data.get("height"), 800, min_val=480),
+            x=_safe_opt_int(data.get("x")),
+            y=_safe_opt_int(data.get("y")),
+            maximized=_safe_bool(data.get("maximized"), False),
+            qt_geometry_b64=raw_b64 if isinstance(raw_b64, str) else "",
         )
 
 
@@ -197,20 +232,21 @@ class AppConfig:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AppConfig":
-        """Create an ``AppConfig`` from a parsed JSON dictionary safely."""
+        """Create an ``AppConfig`` from a parsed JSON dictionary with per-field fallbacks."""
         if not isinstance(data, dict):
             return cls()
 
-        theme = str(data.get("theme", "light") or "light").lower()
-        if theme not in ("light", "dark", "system"):
-            theme = "light"
+        raw_theme = _safe_str(data.get("theme"), "light").lower()
+        theme = raw_theme if raw_theme in _VALID_THEMES else "light"
 
         raw_exts = data.get("companion_extensions")
         if isinstance(raw_exts, list):
             normalized_exts: List[str] = []
-            seen = set()
+            seen: set[str] = set()
             for item in raw_exts:
-                ext = normalize_extension(str(item))
+                if not isinstance(item, str):
+                    continue
+                ext = normalize_extension(item)
                 if ext and ext not in seen:
                     seen.add(ext)
                     normalized_exts.append(ext)
@@ -220,32 +256,40 @@ class AppConfig:
         raw_recent = data.get("recent_db_paths")
         recent: List[str] = []
         if isinstance(raw_recent, list):
-            seen_paths = set()
+            seen_paths: set[str] = set()
             for item in raw_recent:
-                path_str = str(item).strip()
+                if not isinstance(item, str):
+                    continue
+                path_str = item.strip()
                 if path_str and path_str not in seen_paths:
                     seen_paths.add(path_str)
                     recent.append(path_str)
 
-        max_recent = max(1, min(50, int(data.get("max_recent_dbs", 10) or 10)))
-        backup_keep = max(1, min(50, int(data.get("backup_keep_count", 5) or 5)))
+        max_recent = _safe_int(data.get("max_recent_dbs"), 10, min_val=1, max_val=50)
+        backup_keep = _safe_int(data.get("backup_keep_count"), 5, min_val=1, max_val=50)
+
+        raw_strategy = _safe_str(
+            data.get("default_dedup_strategy"), "keep_highest_tag_score"
+        )
+        strategy = (
+            raw_strategy
+            if raw_strategy in _VALID_DEDUP_STRATEGIES
+            else "keep_highest_tag_score"
+        )
 
         return cls(
-            current_db_path=str(data.get("current_db_path", "") or ""),
+            current_db_path=_safe_str(data.get("current_db_path"), ""),
             recent_db_paths=recent[:max_recent],
             max_recent_dbs=max_recent,
             theme=theme,
-            ignore_companion_files=bool(data.get("ignore_companion_files", True)),
+            ignore_companion_files=_safe_bool(data.get("ignore_companion_files"), True),
             companion_extensions=normalized_exts,
-            custom_rules_path=str(data.get("custom_rules_path", "") or ""),
-            auto_backup=bool(data.get("auto_backup", True)),
+            custom_rules_path=_safe_str(data.get("custom_rules_path"), ""),
+            auto_backup=_safe_bool(data.get("auto_backup"), True),
             backup_keep_count=backup_keep,
-            default_dedup_strategy=str(
-                data.get("default_dedup_strategy", "keep_highest_tag_score")
-                or "keep_highest_tag_score"
-            ),
-            default_import_dir=str(data.get("default_import_dir", "") or ""),
-            default_export_dir=str(data.get("default_export_dir", "") or ""),
+            default_dedup_strategy=strategy,
+            default_import_dir=_safe_str(data.get("default_import_dir"), ""),
+            default_export_dir=_safe_str(data.get("default_export_dir"), ""),
             window_geometry=WindowGeometry.from_dict(data.get("window_geometry")),
         )
 
@@ -258,18 +302,77 @@ class ConfigManager:
         config_path: Optional[str | Path] = None,
         data_dir: Optional[str | Path] = None,
     ) -> None:
-        self._data_dir = Path(data_dir) if data_dir is not None else get_user_data_dir()
-        self._data_dir.mkdir(parents=True, exist_ok=True)
-        self.config_path = (
-            Path(config_path)
-            if config_path is not None
-            else get_default_config_path(self._data_dir)
-        )
+        if data_dir is not None:
+            self._data_dir = Path(data_dir).expanduser().resolve()
+            self._data_dir.mkdir(parents=True, exist_ok=True)
+            self.config_path = (
+                Path(config_path).expanduser().resolve()
+                if config_path is not None
+                else get_default_config_path(self._data_dir)
+            )
+        elif config_path is not None:
+            self.config_path = Path(config_path).expanduser().resolve()
+            self._data_dir = self.config_path.parent
+            self._data_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self._data_dir = get_user_data_dir().resolve()
+            self._data_dir.mkdir(parents=True, exist_ok=True)
+            self.config_path = get_default_config_path(self._data_dir)
+
         self.config: AppConfig = self.load()
 
     @property
     def data_dir(self) -> Path:
         return self._data_dir
+
+    def is_portable(self) -> bool:
+        """Return True if running in portable mode (``portable.flag`` present)."""
+        if is_frozen() and (get_app_base_dir() / "portable.flag").exists():
+            return True
+        if (self._data_dir / "portable.flag").exists():
+            return True
+        if (self._data_dir.parent / "portable.flag").exists():
+            return True
+        return False
+
+    def _resolve_stored_path(self, raw_path: str) -> str:
+        """Resolve a stored path (converting relative paths against ``self._data_dir``)."""
+        cleaned = str(raw_path or "").strip()
+        if not cleaned:
+            return ""
+        p = Path(cleaned)
+        if not p.is_absolute():
+            return str((self._data_dir / p).resolve())
+        return cleaned
+
+    def _to_portable_path(self, raw_path: str) -> str:
+        """Convert paths inside ``self._data_dir`` to POSIX relative paths in portable mode."""
+        cleaned = str(raw_path or "").strip()
+        if not cleaned or not self.is_portable():
+            return cleaned
+        try:
+            resolved = Path(cleaned).resolve()
+            rel = resolved.relative_to(self._data_dir)
+            return rel.as_posix()
+        except (ValueError, OSError):
+            return cleaned
+
+    def _resolve_config_paths(self, cfg: AppConfig) -> AppConfig:
+        for attr in _PORTABLE_PATH_FIELDS:
+            val = getattr(cfg, attr, "")
+            if val:
+                setattr(cfg, attr, self._resolve_stored_path(val))
+        if cfg.recent_db_paths:
+            resolved_recent: List[str] = []
+            seen: set[str] = set()
+            for item in cfg.recent_db_paths:
+                rp = self._resolve_stored_path(item)
+                norm = os.path.normcase(rp)
+                if rp and norm not in seen:
+                    seen.add(norm)
+                    resolved_recent.append(rp)
+            cfg.recent_db_paths = resolved_recent[: cfg.max_recent_dbs]
+        return cfg
 
     def _apply_default_paths(self, cfg: AppConfig) -> AppConfig:
         if not cfg.current_db_path:
@@ -288,9 +391,8 @@ class ConfigManager:
         try:
             raw_text = self.config_path.read_text(encoding="utf-8")
             parsed = json.loads(raw_text)
-            cfg = self._apply_default_paths(AppConfig.from_dict(parsed))
-        except (OSError, json.JSONDecodeError, ValueError, TypeError):
-            # Preserve corrupt file for troubleshooting and fall back to defaults.
+        except json.JSONDecodeError:
+            # Quarantine syntactically corrupt JSON for troubleshooting and fall back to defaults.
             corrupt_path = self.config_path.with_suffix(".corrupt.json")
             try:
                 if self.config_path.exists():
@@ -298,20 +400,60 @@ class ConfigManager:
             except OSError:
                 pass
             cfg = self._apply_default_paths(AppConfig())
+            self.config = cfg
+            return cfg
+        except OSError:
+            # Transient read/permission error: do not destroy config file on disk.
+            cfg = self._apply_default_paths(AppConfig())
+            self.config = cfg
+            return cfg
 
+        cfg = AppConfig.from_dict(parsed)
+        cfg = self._resolve_config_paths(cfg)
+        cfg = self._apply_default_paths(cfg)
         self.config = cfg
         return cfg
 
     def save(self, config: Optional[AppConfig] = None) -> Path:
-        """Atomically persist the configuration to disk."""
+        """Atomically persist the configuration to disk using a unique temp file + fsync."""
         if config is not None:
             self.config = config
         self._apply_default_paths(self.config)
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.config_path.with_suffix(".json.tmp")
-        payload = json.dumps(self.config.to_dict(), ensure_ascii=False, indent=2)
-        tmp_path.write_text(payload, encoding="utf-8")
-        os.replace(tmp_path, self.config_path)
+
+        data = self.config.to_dict()
+        if self.is_portable():
+            for attr in _PORTABLE_PATH_FIELDS:
+                if data.get(attr):
+                    data[attr] = self._to_portable_path(str(data[attr]))
+            if isinstance(data.get("recent_db_paths"), list):
+                data["recent_db_paths"] = [
+                    self._to_portable_path(str(p)) for p in data["recent_db_paths"]
+                ]
+
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+        tmp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(self.config_path.parent),
+                prefix=f".{self.config_path.stem}_",
+                suffix=".tmp",
+                delete=False,
+            ) as tmp_file:
+                tmp_path = Path(tmp_file.name)
+                tmp_file.write(payload)
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())
+            os.replace(tmp_path, self.config_path)
+        except Exception:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
         return self.config_path
 
     def add_recent_db(self, db_path: str | Path, set_current: bool = True) -> List[str]:
