@@ -12,11 +12,15 @@ import pytest
 from src.core.parser import CodeParser
 from src.core.scanner import (
     detect_input_format,
+    normalize_cell_text,
     read_text_auto_encoding,
+    scan_document_file,
+    scan_excel_file,
     scan_file,
     scan_files,
     scan_folder,
     scan_text,
+    scan_word_file,
 )
 
 
@@ -202,3 +206,235 @@ def test_scan_folder_and_file_error_handling(tmp_path: Path) -> None:
         scan_file(tmp_path / "missing.txt")
     with pytest.raises(NotADirectoryError):
         scan_folder(tmp_path / "missing_dir")
+
+
+# ---------------------------------------------------------------------------
+# v1.1.0 Word (.docx), Excel (.xlsx), TSV & unified scan_document_file tests
+# ---------------------------------------------------------------------------
+def test_normalize_cell_text_float_int_and_decimals() -> None:
+    assert normalize_cell_text(None) == ""
+    assert normalize_cell_text(True) == "TRUE"
+    assert normalize_cell_text(1234567) == "1234567"
+    assert normalize_cell_text(1234567.0) == "1234567"
+    assert normalize_cell_text("1234567.0") == "1234567"
+    assert normalize_cell_text(3.14) == "3.14"
+    assert normalize_cell_text("  ABC-001  ") == "ABC-001"
+
+
+def test_scan_excel_file_multi_sheet_multiline_merged_and_float_ids(tmp_path: Path) -> None:
+    import openpyxl
+
+    xlsx_path = tmp_path / "清单数据.xlsx"
+    wb = openpyxl.Workbook()
+
+    ws1 = wb.active
+    ws1.title = "清单A"
+    ws1.append(["序号", "项目编码", "说明", "更新日期", "金额"])
+    ws1.append([1.0, "ＡＢＣ－００１", "示例条目 4K", "2026-11-26", "¥128.00"])
+    ws1.append([2.0, "PRJ-0042中字", "常规记录", "2025/01/15", "USD 99.00"])
+    ws1.append([1234567.0, "DEF-101.mp4\nGHI-202.mkv", "多行单元格", "14:30:22", "138-1234-5678"])
+    ws1.append(["", "MERG-009", None, None, None])
+    ws1.merge_cells("B5:D5")
+    ws1.append(["", "2026-11-26", "纯日期价格行", "20240512", "¥256.00"])
+
+    ws2 = wb.create_sheet("清单B")
+    ws2.append(["FC2-PPV#7654321"])
+    ws2.append(["300AAA-123.mp4\n300BBB-456.mkv"])
+
+    wb.save(xlsx_path)
+    wb.close()
+
+    items_all = scan_excel_file(xlsx_path)
+    assert any("1234567" in it.raw_text and "1234567.0" not in it.raw_text for it in items_all)
+    assert any("[清单A 行2]" in it.source_name for it in items_all)
+    assert any("[清单B 行1]" in it.source_name for it in items_all)
+
+    results = CodeParser().parse_items(items_all, ignore_companions=True)
+    recognized_codes = [r.canonical_code for r in results if r.recognized]
+    assert "ABC-001" in recognized_codes
+    assert "PRJ-0042" in recognized_codes
+    assert "DEF-101" in recognized_codes
+    assert "GHI-202" in recognized_codes
+    assert recognized_codes.count("MERG-009") == 1  # Merged cell not duplicated
+    assert "FC2-PPV-7654321" in recognized_codes
+    assert "300AAA-123" in recognized_codes
+    assert "300BBB-456" in recognized_codes
+    # Ensure pure date/price/phone row produced no false positive code.
+    assert not any(c.startswith(("2026", "2025", "2024", "USD", "138")) for c in recognized_codes)
+
+    # Sheet filter test
+    items_b = scan_excel_file(xlsx_path, sheet_names=["清单B"])
+    codes_b = [r.canonical_code for r in CodeParser().parse_items(items_b) if r.recognized]
+    assert codes_b == ["FC2-PPV-7654321", "300AAA-123", "300BBB-456"]
+
+
+def test_scan_excel_single_cell_multiline_paths_preserve_parent_fallback(tmp_path: Path) -> None:
+    import openpyxl
+
+    xlsx_path = tmp_path / "paths.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "路径表"
+    ws.append([r"D:\Archive\CAT-001\1.mp4" + "\n" + r"D:\Archive\CAT-002\1.mp4"])
+    wb.save(xlsx_path)
+    wb.close()
+
+    items = scan_excel_file(xlsx_path)
+    assert len(items) == 2
+    results = CodeParser().parse_items(items, ignore_companions=True)
+    assert [r.canonical_code for r in results] == ["CAT-001", "CAT-002"]
+    assert all(r.from_parent for r in results)
+
+
+def test_scan_word_file_paragraphs_tables_merged_and_headers(tmp_path: Path) -> None:
+    import docx
+
+    docx_path = tmp_path / "归档报告.docx"
+    doc = docx.Document()
+    doc.sections[0].header.paragraphs[0].text = "页眉编号 TOP-001"
+    doc.add_paragraph("ＡＢＣ－００１.mp4")
+    doc.add_paragraph("测试前缀XYZ-0098中字.mkv")
+    doc.add_paragraph("2026-11-26 ¥299.00 138-1234-5678")
+
+    tbl = doc.add_table(rows=3, cols=2)
+    tbl.cell(0, 0).text = "编码"
+    tbl.cell(0, 1).text = "备注"
+    merged_cell = tbl.cell(1, 0).merge(tbl.cell(1, 1))
+    merged_cell.text = "MERG-777 合并单元格"
+    tbl.cell(2, 0).text = "TAB-002\nTAB-003"
+    tbl.cell(2, 1).text = "FC2 PPV #1234567"
+
+    doc.save(docx_path)
+
+    items = scan_word_file(docx_path)
+    assert any("归档报告.docx" in it.source_name for it in items)
+    assert any("表格1" in it.source_name for it in items)
+
+    results = CodeParser().parse_items(items, ignore_companions=True)
+    recognized_codes = [r.canonical_code for r in results if r.recognized]
+    assert "TOP-001" in recognized_codes
+    assert "ABC-001" in recognized_codes
+    assert "XYZ-0098" in recognized_codes
+    assert recognized_codes.count("MERG-777") == 1  # Merged cell not duplicated
+    assert "TAB-002" in recognized_codes
+    assert "TAB-003" in recognized_codes
+    assert "FC2-PPV-1234567" in recognized_codes
+
+
+def test_scan_document_file_unified_dispatcher_and_scan_files(tmp_path: Path) -> None:
+    import docx
+    import openpyxl
+
+    p_txt = tmp_path / "list.txt"
+    p_txt.write_text("TXT-001.mp4\n", encoding="utf-8")
+
+    p_log = tmp_path / "scan.log"
+    p_log.write_text("LOG-002.mkv\n", encoding="utf-8")
+
+    p_csv = tmp_path / "items.csv"
+    p_csv.write_text("文件名,大小\nCSV-003.mp4,1024\n", encoding="utf-8-sig")
+
+    p_tsv = tmp_path / "items.tsv"
+    p_tsv.write_text("序号\t编码\t备注\n1\tTSV-004\t说明\n", encoding="utf-8")
+
+    p_docx = tmp_path / "doc.docx"
+    d = docx.Document()
+    d.add_paragraph("DOCX-005.mp4")
+    d.save(p_docx)
+
+    p_xlsx = tmp_path / "book.xlsx"
+    wb = openpyxl.Workbook()
+    wb.active.append(["XLSX-006"])
+    wb.save(p_xlsx)
+    wb.close()
+
+    # Test single unified dispatcher for each format
+    for fp, expected in [
+        (p_txt, "TXT-001"),
+        (p_log, "LOG-002"),
+        (p_csv, "CSV-003"),
+        (p_tsv, "TSV-004"),
+        (p_docx, "DOCX-005"),
+        (p_xlsx, "XLSX-006"),
+    ]:
+        scanned = scan_document_file(fp)
+        codes = [r.canonical_code for r in CodeParser().parse_items(scanned) if r.recognized]
+        assert expected in codes, f"Expected {expected} from {fp.name}, got {codes}"
+
+    # Test scan_files with mixed document formats
+    all_items = scan_files([p_txt, p_log, p_csv, p_tsv, p_docx, p_xlsx])
+    all_codes = {r.canonical_code for r in CodeParser().parse_items(all_items) if r.recognized}
+    assert {"TXT-001", "LOG-002", "CSV-003", "TSV-004", "DOCX-005", "XLSX-006"}.issubset(all_codes)
+
+
+def test_scan_document_file_legacy_and_missing_errors(tmp_path: Path) -> None:
+    legacy_doc = tmp_path / "old.doc"
+    legacy_doc.write_bytes(b"legacy")
+    with pytest.raises(ValueError, match=r"\.docx"):
+        scan_document_file(legacy_doc)
+
+    legacy_xls = tmp_path / "old.xls"
+    legacy_xls.write_bytes(b"legacy")
+    with pytest.raises(ValueError, match=r"\.xlsx"):
+        scan_document_file(legacy_xls)
+
+    with pytest.raises(FileNotFoundError):
+        scan_word_file(tmp_path / "missing.docx")
+    with pytest.raises(FileNotFoundError):
+        scan_excel_file(tmp_path / "missing.xlsx")
+    with pytest.raises(FileNotFoundError):
+        scan_document_file(tmp_path / "missing.xlsx")
+
+
+def test_word_and_excel_no_false_parent_fallback_from_host_folder_or_sheet(tmp_path: Path) -> None:
+    """Host folder names (e.g. PRJ-2026_folder / dedup_qa_v110) and sheet names must never
+    cause unrecognized header/date/price rows in Word/Excel files to inherit false codes.
+    """
+    import docx
+    import openpyxl
+
+    coded_dir = tmp_path / "dedup_qa_v110_PRJ-2026"
+    coded_dir.mkdir()
+
+    # 1. Excel inside coded folder with coded sheet name
+    xlsx_path = coded_dir / "2026Q3_资产清单.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "PRJ-2026"
+    ws.append(["记录编号", "原始文件名", "归档分类", "更新日期", "金额"])
+    ws.append(["", "纯中文无编码说明", "办公文档", "2026-11-26", "¥128.00"])
+    ws.append(["1", "ABC-001.mp4", "归档", "2026-11-26", "¥0.00"])
+    ws.append([r"D:\Archive\CAT-009\1.mp4"])  # Genuine in-cell path SHOULD still fall back
+    wb.save(xlsx_path)
+    wb.close()
+
+    excel_items = scan_excel_file(xlsx_path)
+    excel_results = CodeParser().parse_items(excel_items, ignore_companions=True)
+    excel_recognized = [r.canonical_code for r in excel_results if r.recognized]
+    excel_unrec = [r for r in excel_results if not r.recognized]
+
+    assert excel_recognized == ["ABC-001", "CAT-009"]
+    assert len(excel_unrec) == 2  # Header row + pure Chinese/date/price row stay unrecognized
+    assert not any("PRJ-2026" in c or "V110" in c for c in excel_recognized)
+
+    # 2. Word inside coded folder
+    docx_path = coded_dir / "归档汇总说明.docx"
+    doc = docx.Document()
+    doc.add_paragraph("2026年第三季度归档汇总说明")
+    doc.add_paragraph("2026-11-26 ¥299.00 138-1234-5678")
+    doc.add_paragraph("DEF-002.mkv")
+    tbl = doc.add_table(rows=2, cols=2)
+    tbl.cell(0, 0).text = "编码"
+    tbl.cell(0, 1).text = "备注"
+    tbl.cell(1, 0).text = "GHI-003"
+    tbl.cell(1, 1).text = "正式归档"
+    doc.save(docx_path)
+
+    word_items = scan_word_file(docx_path)
+    word_results = CodeParser().parse_items(word_items, ignore_companions=True)
+    word_recognized = [r.canonical_code for r in word_results if r.recognized]
+    word_unrec = [r for r in word_results if not r.recognized]
+
+    assert word_recognized == ["DEF-002", "GHI-003"]
+    assert len(word_unrec) == 3  # Title paragraph + date/price paragraph + table header row
+    assert not any("PRJ-2026" in c or "V110" in c for c in word_recognized)
