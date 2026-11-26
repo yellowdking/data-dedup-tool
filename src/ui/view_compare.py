@@ -3,100 +3,95 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QApplication,
     QCheckBox,
     QFileDialog,
     QFrame,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
-    QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSplitter,
-    QTableView,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from src.core.dedup import compare_two_sources, compare_with_db
-from src.core.exporter import (
-    ExportError,
-    export_codes_txt,
-    export_compare_result_csv,
-    export_compare_result_excel,
-)
+from src.core.config import normalize_extension
+from src.core.dedup import compare_with_db
 from src.core.models import CompareResult, DataRecord, ImportBatch, ScannedItem
-from src.core.scanner import (
-    SUPPORTED_DOCUMENT_EXTENSIONS,
-    read_text_auto_encoding,
-    scan_document_file,
-)
+from src.core.scanner import scan_document_file
 from src.ui.app_context import AppContext
 from src.ui.table_models import CompareTableModel
-from src.ui.widgets import DropZoneWidget, ScrollableDetailDialog
+from src.ui.view_compare_ab import (
+    _COMPARE_FILE_FILTER,
+    CompareABMixin,
+    _ABIntersectionTableModel,
+    _DroppablePlainTextEdit,
+    _stop_worker_safely,
+)
+from src.ui.widgets import ScrollableDetailDialog, WorkerThread
 
 _OFFICE_EXTENSIONS: frozenset[str] = frozenset({".docx", ".xlsx", ".xlsm"})
-_COMPARE_FILE_FILTER: str = (
-    "支持的文档与清单 (*.txt *.docx *.xlsx *.xlsm *.csv *.tsv *.efu *.log);;"
-    "Word 文档 (*.docx);;Excel 表格 (*.xlsx *.xlsm);;"
-    "文本与 CSV (*.txt *.csv *.tsv *.efu *.log);;所有文件 (*.*)"
-)
+_MAX_PREVIEW_LINES: int = 300
+_MAX_PREVIEW_CHARS: int = 120_000
 
 
-class _DroppablePlainTextEdit(QPlainTextEdit):
-    """QPlainTextEdit that also accepts dropped TXT/Word/Excel/CSV files and emits the path."""
-
-    file_dropped = Signal(str)
-
-    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.mimeData().hasUrls():
-            for url in event.mimeData().urls():
-                if url.isLocalFile() and Path(url.toLocalFile()).is_file():
-                    event.acceptProposedAction()
-                    return
-        super().dragEnterEvent(event)
-
-    def dropEvent(self, event: QDropEvent) -> None:
-        if event.mimeData().hasUrls():
-            for url in event.mimeData().urls():
-                if url.isLocalFile() and Path(url.toLocalFile()).is_file():
-                    event.acceptProposedAction()
-                    self.file_dropped.emit(url.toLocalFile())
-                    return
-        super().dropEvent(event)
-
-
-class CompareView(QWidget):
+class CompareView(CompareABMixin, QWidget):
     """Quick comparison view supporting (a) DB non-mutating check and (b) A-vs-B cross-check."""
 
     def __init__(self, ctx: AppContext, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.ctx = ctx
 
+        theme = self.ctx.config.theme
+
         # Mode A state
         self._db_compare_result: Optional[CompareResult] = None
+        self._db_result_db_path: str = ""
+        self._db_result_stale: bool = False
         self._db_loaded_file: str = ""
-        self._model_db_matched = CompareTableModel(with_matches=True, parent=self)
-        self._model_db_new = CompareTableModel(with_matches=False, parent=self)
-        self._model_db_unrec = CompareTableModel(with_matches=False, parent=self)
+        self._self_importing: bool = False
+        self._db_worker: Optional[WorkerThread] = None
+        self._import_worker: Optional[WorkerThread] = None
+        self._db_gen: int = 0
+        self._db_cancel_handled_gen: int = -1
+
+        self._model_db_matched = self._create_cmp_model(True, theme)
+        self._model_db_new = self._create_cmp_model(False, theme)
+        self._model_db_unrec = self._create_cmp_model(False, theme)
 
         # Mode B state
         self._ab_result: Optional[CompareResult] = None
         self._file_a_path: str = ""
         self._file_b_path: str = ""
-        self._model_ab_inter = CompareTableModel(with_matches=False, parent=self)
-        self._model_ab_only_a = CompareTableModel(with_matches=False, parent=self)
-        self._model_ab_only_b = CompareTableModel(with_matches=False, parent=self)
-        self._model_ab_unrec = CompareTableModel(with_matches=False, parent=self)
+        self._ab_worker: Optional[WorkerThread] = None
+        self._ab_gen: int = 0
+        self._ab_cancel_handled_gen: int = -1
+
+        self._model_ab_inter = _ABIntersectionTableModel(parent=self, theme=theme)
+        self._model_ab_only_a = self._create_cmp_model(False, theme)
+        self._model_ab_only_b = self._create_cmp_model(False, theme)
+        self._model_ab_unrec = self._create_cmp_model(False, theme)
+
+        # Shared export worker
+        self._export_worker: Optional[WorkerThread] = None
 
         self._setup_ui()
+        self.ctx.db_switched.connect(self._on_db_switched)
+        self.ctx.data_changed.connect(self._on_data_changed)
+        self.ctx.settings_changed.connect(self._sync_settings)
+        self.ctx.theme_changed.connect(self.apply_theme)
+
+    def _create_cmp_model(self, with_matches: bool, theme: str) -> CompareTableModel:
+        try:
+            return CompareTableModel(with_matches=with_matches, parent=self, theme=theme)
+        except TypeError:
+            return CompareTableModel(with_matches=with_matches, parent=self)
 
     def _setup_ui(self) -> None:
         root = QVBoxLayout(self)
@@ -107,6 +102,93 @@ class CompareView(QWidget):
         self._mode_tabs.addTab(self._build_db_compare_tab(), "与当前库比对（不入库）")
         self._mode_tabs.addTab(self._build_ab_compare_tab(), "双文件交叉比对（A vs B）")
         root.addWidget(self._mode_tabs, 1)
+
+    # ------------------------------------------------------------------
+    # Lifecycle, theme & context hooks
+    # ------------------------------------------------------------------
+
+    def shutdown(self) -> None:
+        self._db_gen += 1
+        self._ab_gen += 1
+        _stop_worker_safely(self._db_worker)
+        self._db_worker = None
+        _stop_worker_safely(self._ab_worker)
+        self._ab_worker = None
+        _stop_worker_safely(self._import_worker)
+        self._import_worker = None
+        _stop_worker_safely(self._export_worker)
+        self._export_worker = None
+
+    def apply_theme(self, theme: str) -> None:
+        for model in (
+            self._model_db_matched,
+            self._model_db_new,
+            self._model_db_unrec,
+            self._model_ab_inter,
+            self._model_ab_only_a,
+            self._model_ab_only_b,
+            self._model_ab_unrec,
+        ):
+            if hasattr(model, "set_theme"):
+                model.set_theme(theme)
+
+    def _sync_settings(self) -> None:
+        checked = self.ctx.config.ignore_companion_files
+        self._chk_db_ignore_comp.blockSignals(True)
+        self._chk_db_ignore_comp.setChecked(checked)
+        self._chk_db_ignore_comp.blockSignals(False)
+
+        self._chk_ab_ignore_comp.blockSignals(True)
+        self._chk_ab_ignore_comp.setChecked(checked)
+        self._chk_ab_ignore_comp.blockSignals(False)
+
+    def _get_companion_exts(self, enabled: bool) -> set[str]:
+        if not enabled:
+            return set()
+        try:
+            return self.ctx.get_companion_extensions(respect_global_toggle=False)
+        except TypeError:
+            return {
+                normalize_extension(ext)
+                for ext in self.ctx.config.companion_extensions
+                if normalize_extension(ext)
+            }
+
+    def _is_worker_running(self, worker: Optional[WorkerThread]) -> bool:
+        if worker is None:
+            return False
+        try:
+            return worker.isRunning()
+        except RuntimeError:
+            return False
+
+    def _on_db_switched(self, _db_path: str) -> None:
+        if self._is_worker_running(self._db_worker):
+            self._cancel_db_worker()
+        self._db_compare_result = None
+        self._db_result_db_path = ""
+        self._db_result_stale = True
+        self._model_db_matched.set_rows([])
+        self._model_db_new.set_rows([])
+        self._model_db_unrec.set_rows([])
+        self._db_result_tabs.setTabText(0, "已存在 (0)")
+        self._db_result_tabs.setTabText(1, "未找到 · 新数据 (0)")
+        self._db_result_tabs.setTabText(2, "未识别 (0)")
+        self._btn_import_new.setEnabled(False)
+        self._btn_copy_new.setEnabled(False)
+        self._btn_export_db_cmp.setEnabled(False)
+        self._db_summary.setText("数据库已切换，比对结果已清空 — 请重新点击「开始快速查重」")
+
+    def _on_data_changed(self) -> None:
+        if self._self_importing:
+            return
+        if self._db_compare_result is not None:
+            self._db_result_stale = True
+            self._btn_import_new.setEnabled(False)
+            self._db_summary.setText(
+                f"当前数据库已发生变更（原比对结果：已存在 {len(self._db_compare_result.matched_in_db):,} · "
+                f"新数据 {len(self._db_compare_result.not_in_db):,}）— 入库前请重新查重"
+            )
 
     # ------------------------------------------------------------------
     # Mode A: Compare against current database without mutating
@@ -138,20 +220,20 @@ class CompareView(QWidget):
         self._chk_db_ignore_comp.setChecked(self.ctx.config.ignore_companion_files)
         header_row.addWidget(self._chk_db_ignore_comp)
 
-        btn_load_txt = QPushButton("载入文件 (Word/Excel/TXT)")
-        btn_load_txt.setToolTip("支持载入 .txt / .docx / .xlsx / .xlsm / .csv / .tsv / .log 文件")
-        btn_load_txt.clicked.connect(self._load_file_to_db_input)
-        header_row.addWidget(btn_load_txt)
+        self._btn_load_txt = QPushButton("载入文件 (Word/Excel/TXT)")
+        self._btn_load_txt.setToolTip("支持载入 .txt / .docx / .xlsx / .xlsm / .csv / .tsv / .log 文件")
+        self._btn_load_txt.clicked.connect(self._load_file_to_db_input)
+        header_row.addWidget(self._btn_load_txt)
 
-        btn_clear_input = QPushButton("清空")
-        btn_clear_input.setProperty("variant", "ghost")
-        btn_clear_input.clicked.connect(self._clear_db_input)
-        header_row.addWidget(btn_clear_input)
+        self._btn_clear_input = QPushButton("清空")
+        self._btn_clear_input.setProperty("variant", "ghost")
+        self._btn_clear_input.clicked.connect(self._clear_db_input)
+        header_row.addWidget(self._btn_clear_input)
 
-        btn_run = QPushButton("开始快速查重")
-        btn_run.setProperty("variant", "primary")
-        btn_run.clicked.connect(lambda: self.run_db_compare())
-        header_row.addWidget(btn_run)
+        self._btn_run_db = QPushButton("开始快速查重")
+        self._btn_run_db.setProperty("variant", "primary")
+        self._btn_run_db.clicked.connect(lambda: self.run_db_compare())
+        header_row.addWidget(self._btn_run_db)
         top_layout.addLayout(header_row)
 
         self._db_file_badge = QLabel("")
@@ -186,6 +268,16 @@ class CompareView(QWidget):
         action_row.addWidget(self._db_summary)
         action_row.addStretch()
 
+        self._db_progress = QProgressBar()
+        self._db_progress.setFixedWidth(160)
+        self._db_progress.setVisible(False)
+        action_row.addWidget(self._db_progress)
+
+        self._btn_cancel_db = QPushButton("取消")
+        self._btn_cancel_db.setVisible(False)
+        self._btn_cancel_db.clicked.connect(self._cancel_db_worker)
+        action_row.addWidget(self._btn_cancel_db)
+
         self._btn_copy_new = QPushButton("复制新数据编码")
         self._btn_copy_new.setEnabled(False)
         self._btn_copy_new.clicked.connect(self._copy_not_in_db_codes)
@@ -204,6 +296,7 @@ class CompareView(QWidget):
         bottom_layout.addLayout(action_row)
 
         self._db_result_tabs = QTabWidget()
+        self._db_result_tabs.setProperty("subtabs", True)
         self._db_result_tabs.addTab(self._make_table(self._model_db_matched), "已存在 (0)")
         self._db_result_tabs.addTab(self._make_table(self._model_db_new), "未找到 · 新数据 (0)")
         self._db_result_tabs.addTab(self._make_table(self._model_db_unrec), "未识别 (0)")
@@ -213,6 +306,19 @@ class CompareView(QWidget):
         splitter.setSizes([180, 420])
         layout.addWidget(splitter, 1)
         return widget
+
+    def _set_db_busy(self, busy: bool, cancellable: bool = False) -> None:
+        self._db_progress.setVisible(busy)
+        if busy:
+            self._db_progress.setRange(0, 0)
+        self._btn_cancel_db.setVisible(busy and cancellable)
+        self._btn_cancel_db.setEnabled(busy and cancellable)
+        self._btn_run_db.setEnabled(not busy)
+        self._btn_load_txt.setEnabled(not busy)
+        self._btn_clear_input.setEnabled(not busy)
+        if busy:
+            self._btn_import_new.setEnabled(False)
+            self._btn_export_db_cmp.setEnabled(False)
 
     def _clear_db_input(self) -> None:
         self._db_loaded_file = ""
@@ -227,50 +333,132 @@ class CompareView(QWidget):
             self._db_file_badge.setVisible(False)
 
     def _load_file_to_db_input(self) -> None:
+        start_dir = self.ctx.config.default_import_dir or str(Path.home())
         path, _ = QFileDialog.getOpenFileName(
-            self, "选择待比对文件", "", _COMPARE_FILE_FILTER
+            self, "选择待比对文件", start_dir, _COMPARE_FILE_FILTER
         )
         if not path:
             return
+        try:
+            self.ctx.config.default_import_dir = str(Path(path).parent)
+            self.ctx.config_manager.save()
+        except OSError:
+            pass
         self._load_specific_file_to_db_input(path)
 
+    @staticmethod
+    def _build_preview_text(scanned: list[ScannedItem], is_office: bool) -> str:
+        lines: list[str] = []
+        total_chars = 0
+        truncated = False
+        for idx, item in enumerate(scanned):
+            if idx >= _MAX_PREVIEW_LINES:
+                truncated = True
+                break
+            line = (
+                f"[{item.source_name}] {item.raw_text}"
+                if (is_office and item.source_name)
+                else item.raw_text
+            )
+            if total_chars + len(line) > _MAX_PREVIEW_CHARS:
+                truncated = True
+                break
+            lines.append(line)
+            total_chars += len(line) + 1
+        if truncated or len(scanned) > _MAX_PREVIEW_LINES:
+            lines.append(
+                f"... 共提取 {len(scanned):,} 条内容（仅预览前 {len(lines)} 条，比对时将解析完整文件）"
+            )
+        return "\n".join(lines)
+
     def _load_specific_file_to_db_input(self, path: str) -> None:
+        if self._is_worker_running(self._db_worker) or self._is_worker_running(self._import_worker):
+            self.ctx.notify("正在执行查重/入库任务，请稍候或先取消", "warning")
+            return
+
         p = Path(path)
         ignore_comp = self._chk_db_ignore_comp.isChecked()
-        comp_exts = self.ctx.get_companion_extensions() if ignore_comp else set()
+        comp_exts = self._get_companion_exts(ignore_comp)
+        expected_db_path = str(self.ctx.db.db_path)
+        is_office = p.suffix.lower() in _OFFICE_EXTENSIONS
 
-        try:
-            ext = p.suffix.lower()
-            if ext in _OFFICE_EXTENSIONS:
-                scanned = scan_document_file(p, companion_extensions=comp_exts)
-                preview_lines = [
-                    f"[{item.source_name}] {item.raw_text}" if item.source_name else item.raw_text
-                    for item in scanned[:300]
-                ]
-                if len(scanned) > 300:
-                    preview_lines.append(f"... 共提取 {len(scanned):,} 条内容（仅预览前 300 条）")
-                self._db_input.blockSignals(True)
-                self._db_input.setPlainText("\n".join(preview_lines))
-                self._db_input.blockSignals(False)
-                self._db_loaded_file = str(p)
-                self._db_file_badge.setText(f"📄 已载入文档：{p.name}（提取 {len(scanned):,} 条）")
-                self._db_file_badge.setVisible(True)
-                self._run_db_compare_from_scanned(scanned, source_name=p.name)
-            else:
-                content, _ = read_text_auto_encoding(p)
-                self._db_input.blockSignals(True)
-                self._db_input.setPlainText(content)
-                self._db_input.blockSignals(False)
-                self._db_loaded_file = str(p)
-                self._db_file_badge.setText(f"📄 已载入文件：{p.name}")
-                self._db_file_badge.setVisible(True)
-                scanned = scan_document_file(p, companion_extensions=comp_exts)
-                self._run_db_compare_from_scanned(scanned, source_name=p.name)
-        except Exception as exc:
-            ScrollableDetailDialog("载入文件失败", f"无法读取 {p.name}：{exc}", parent=self).exec()
+        self._db_gen += 1
+        gen = self._db_gen
+        self._set_db_busy(True, cancellable=True)
+        self._db_summary.setText(f"正在后台读取并比对 {p.name}...")
 
-    def _apply_db_compare_result(self, result: CompareResult) -> None:
+        worker_box: list[Optional[WorkerThread]] = [None]
+
+        def _is_cancelled() -> bool:
+            w = worker_box[0]
+            return bool(w is not None and w.is_cancelled)
+
+        def _task() -> Optional[dict[str, Any]]:
+            # Single read for ALL file types (zero double-read!)
+            scanned = scan_document_file(p, companion_extensions=comp_exts)
+            if _is_cancelled():
+                return None
+            preview_text = self._build_preview_text(scanned, is_office=is_office)
+            parsed = self.ctx.parser.parse_items(
+                scanned,
+                ignore_companions=ignore_comp,
+                companion_extensions=comp_exts,
+                cancel_check=_is_cancelled,
+            )
+            if _is_cancelled():
+                return None
+            result = compare_with_db(parsed, self.ctx.db, source_name=p.name)
+            return {
+                "file_path": str(p),
+                "file_name": p.name,
+                "scanned_count": len(scanned),
+                "preview_text": preview_text,
+                "result": result,
+            }
+
+        worker = WorkerThread(_task, parent=self)
+        worker_box[0] = worker
+        self._db_worker = worker
+        worker.succeeded.connect(
+            lambda payload, g=gen, dbp=expected_db_path: self._on_db_file_compare_succeeded(
+                g, payload, dbp
+            )
+        )
+        worker.failed.connect(lambda detail, g=gen: self._on_db_compare_failed(g, detail))
+        if hasattr(worker, "cancelled"):
+            worker.cancelled.connect(lambda g=gen: self._on_db_compare_cancelled(g))
+        worker.finished.connect(lambda w=worker, g=gen: self._on_db_worker_finished(w, g))
+        if not hasattr(worker, "safe_stop"):
+            worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_db_file_compare_succeeded(
+        self, gen: int, payload: Optional[dict[str, Any]], expected_db_path: str
+    ) -> None:
+        if gen != self._db_gen:
+            return
+        self._set_db_busy(False)
+        if payload is None:
+            self._on_db_compare_cancelled(gen)
+            return
+        if str(self.ctx.db.db_path) != expected_db_path:
+            self._on_db_switched(str(self.ctx.db.db_path))
+            return
+
+        self._db_input.blockSignals(True)
+        self._db_input.setPlainText(payload["preview_text"])
+        self._db_input.blockSignals(False)
+        self._db_loaded_file = payload["file_path"]
+        self._db_file_badge.setText(
+            f"📄 已载入文件：{payload['file_name']}（共提取 {payload['scanned_count']:,} 条）"
+        )
+        self._db_file_badge.setVisible(True)
+        self._apply_db_compare_result(payload["result"], db_path=expected_db_path)
+
+    def _apply_db_compare_result(self, result: CompareResult, db_path: str = "") -> None:
         self._db_compare_result = result
+        self._db_result_db_path = db_path or str(self.ctx.db.db_path)
+        self._db_result_stale = False
 
         self._model_db_matched.set_rows(result.matched_in_db)
         self._model_db_new.set_rows(result.not_in_db)
@@ -292,44 +480,126 @@ class CompareView(QWidget):
             self._db_result_tabs.setCurrentIndex(1)
         self.ctx.notify("快速查重完成（未修改当前数据库）", "success")
 
-    def _run_db_compare_from_scanned(self, scanned: list[ScannedItem], source_name: str) -> None:
-        ignore_comp = self._chk_db_ignore_comp.isChecked()
-        comp_exts = self.ctx.get_companion_extensions() if ignore_comp else set()
-        parsed = self.ctx.parser.parse_items(
-            scanned,
-            ignore_companions=ignore_comp,
-            companion_extensions=comp_exts,
-        )
-        result = compare_with_db(parsed, self.ctx.db, source_name=source_name)
-        self._apply_db_compare_result(result)
-
     def run_db_compare(self, source_name: str = "快速粘贴") -> None:
-        ignore_comp = self._chk_db_ignore_comp.isChecked()
-        comp_exts = self.ctx.get_companion_extensions() if ignore_comp else set()
-
-        if self._db_loaded_file and Path(self._db_loaded_file).is_file():
-            try:
-                p = Path(self._db_loaded_file)
-                scanned = scan_document_file(p, companion_extensions=comp_exts)
-                self._run_db_compare_from_scanned(scanned, source_name=p.name)
-                return
-            except Exception as exc:
-                ScrollableDetailDialog("解析文档失败", str(exc), parent=self).exec()
-                return
-
-        text = self._db_input.toPlainText().strip()
-        if not text:
-            self.ctx.notify("请先粘贴或载入待比对内容", "warning")
+        if self._is_worker_running(self._db_worker) or self._is_worker_running(self._import_worker):
+            self.ctx.notify("正在执行查重/入库任务，请稍候或先取消", "warning")
             return
 
-        parsed = self.ctx.parser.parse_text(
-            text,
-            source_name=source_name,
-            ignore_companions=ignore_comp,
-            companion_extensions=comp_exts,
+        ignore_comp = self._chk_db_ignore_comp.isChecked()
+        comp_exts = self._get_companion_exts(ignore_comp)
+        loaded_file = self._db_loaded_file
+        expected_db_path = str(self.ctx.db.db_path)
+
+        text = ""
+        if not (loaded_file and Path(loaded_file).is_file()):
+            loaded_file = ""
+            text = self._db_input.toPlainText().strip()
+            if not text:
+                self.ctx.notify("请先粘贴或载入待比对内容", "warning")
+                return
+
+        self._db_gen += 1
+        gen = self._db_gen
+        self._set_db_busy(True, cancellable=True)
+        self._db_summary.setText("正在后台执行快速查重...")
+
+        worker_box: list[Optional[WorkerThread]] = [None]
+
+        def _is_cancelled() -> bool:
+            w = worker_box[0]
+            return bool(w is not None and w.is_cancelled)
+
+        def _task() -> Optional[CompareResult]:
+            if loaded_file:
+                p = Path(loaded_file)
+                scanned = scan_document_file(p, companion_extensions=comp_exts)
+                if _is_cancelled():
+                    return None
+                parsed = self.ctx.parser.parse_items(
+                    scanned,
+                    ignore_companions=ignore_comp,
+                    companion_extensions=comp_exts,
+                    cancel_check=_is_cancelled,
+                )
+                if _is_cancelled():
+                    return None
+                return compare_with_db(parsed, self.ctx.db, source_name=p.name)
+
+            parsed = self.ctx.parser.parse_text(
+                text,
+                source_name=source_name,
+                ignore_companions=ignore_comp,
+                companion_extensions=comp_exts,
+            )
+            if _is_cancelled():
+                return None
+            return compare_with_db(parsed, self.ctx.db, source_name=source_name)
+
+        worker = WorkerThread(_task, parent=self)
+        worker_box[0] = worker
+        self._db_worker = worker
+        worker.succeeded.connect(
+            lambda res, g=gen, dbp=expected_db_path: self._on_db_text_compare_succeeded(g, res, dbp)
         )
-        result = compare_with_db(parsed, self.ctx.db, source_name=source_name)
-        self._apply_db_compare_result(result)
+        worker.failed.connect(lambda detail, g=gen: self._on_db_compare_failed(g, detail))
+        if hasattr(worker, "cancelled"):
+            worker.cancelled.connect(lambda g=gen: self._on_db_compare_cancelled(g))
+        worker.finished.connect(lambda w=worker, g=gen: self._on_db_worker_finished(w, g))
+        if not hasattr(worker, "safe_stop"):
+            worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def _on_db_text_compare_succeeded(
+        self, gen: int, result: Optional[CompareResult], expected_db_path: str
+    ) -> None:
+        if gen != self._db_gen:
+            return
+        self._set_db_busy(False)
+        if result is None:
+            self._on_db_compare_cancelled(gen)
+            return
+        if str(self.ctx.db.db_path) != expected_db_path:
+            self._on_db_switched(str(self.ctx.db.db_path))
+            return
+        self._apply_db_compare_result(result, db_path=expected_db_path)
+
+    def _on_db_compare_cancelled(self, gen: int) -> None:
+        if gen != self._db_gen or self._db_cancel_handled_gen == gen:
+            return
+        self._db_cancel_handled_gen = gen
+        self._set_db_busy(False)
+        self._db_summary.setText("已取消快速查重")
+        if self._db_compare_result is not None:
+            self._btn_export_db_cmp.setEnabled(True)
+            self._btn_import_new.setEnabled(
+                (not self._db_result_stale) and len(self._db_compare_result.not_in_db) > 0
+            )
+        self.ctx.notify("已取消快速查重", "info")
+
+    def _on_db_compare_failed(self, gen: int, detail: str) -> None:
+        if gen != self._db_gen:
+            return
+        self._set_db_busy(False)
+        self._db_summary.setText("查重失败，请查看详情")
+        ScrollableDetailDialog("快速查重失败", "执行查重时发生错误：", detail, parent=self).exec()
+
+    def _on_db_worker_finished(self, worker: WorkerThread, gen: int) -> None:
+        was_cancelled = False
+        try:
+            was_cancelled = worker.is_cancelled
+        except RuntimeError:
+            pass
+        if self._db_worker is worker:
+            self._db_worker = None
+        if was_cancelled and gen == self._db_gen and self._db_cancel_handled_gen != gen:
+            self._on_db_compare_cancelled(gen)
+
+    def _cancel_db_worker(self) -> None:
+        if self._is_worker_running(self._db_worker):
+            assert self._db_worker is not None
+            self._db_worker.cancel()
+            self._btn_cancel_db.setEnabled(False)
+            self._db_summary.setText("正在取消快速查重...")
 
     def _copy_not_in_db_codes(self) -> None:
         if not self._db_compare_result:
@@ -341,11 +611,21 @@ class CompareView(QWidget):
     def _import_not_in_db(self) -> None:
         if not self._db_compare_result or not self._db_compare_result.not_in_db:
             return
-        items = self._db_compare_result.not_in_db
-        records = [DataRecord.from_parse_result(item) for item in items]
+        if self._is_worker_running(self._db_worker) or self._is_worker_running(self._import_worker):
+            self.ctx.notify("后台任务执行中，请稍候...", "warning")
+            return
+        if self._db_result_stale or self._db_result_db_path != str(self.ctx.db.db_path):
+            self.ctx.notify("数据库已切换或发生变更，请先重新执行快速查重后再入库", "warning")
+            self._btn_import_new.setEnabled(False)
+            return
+
+        items = list(self._db_compare_result.not_in_db)
+        source_a_name = self._db_compare_result.source_a_name or "快速查重入库"
+        loaded_file = self._db_loaded_file
+
         source_type = "paste"
-        if self._db_loaded_file:
-            ext = Path(self._db_loaded_file).suffix.lower()
+        if loaded_file:
+            ext = Path(loaded_file).suffix.lower()
             if ext == ".docx":
                 source_type = "word"
             elif ext in {".xlsx", ".xlsm"}:
@@ -354,187 +634,48 @@ class CompareView(QWidget):
                 source_type = "csv"
             else:
                 source_type = "txt"
-        batch = ImportBatch(
-            source_name=self._db_compare_result.source_a_name or "快速查重入库",
-            source_type=source_type,
-            total_count=len(items),
-            added_count=len(records),
+
+        self._set_db_busy(True, cancellable=False)
+        self._db_summary.setText(f"正在后台将 {len(items):,} 条新数据写入当前库...")
+
+        def _task() -> int:
+            records = [DataRecord.from_parse_result(item) for item in items]
+            batch = ImportBatch(
+                source_name=source_a_name,
+                source_type=source_type,
+                total_count=len(items),
+                added_count=len(records),
+            )
+            saved, _ = self.ctx.db.add_records(records, batch=batch)
+            return len(saved)
+
+        worker = WorkerThread(_task, parent=self)
+        self._import_worker = worker
+        worker.succeeded.connect(
+            lambda cnt, sname=source_a_name: self._on_import_new_succeeded(cnt, sname)
         )
-        saved, _ = self.ctx.db.add_records(records, batch=batch)
-        self.ctx.notify(f"已将 {len(saved)} 条新数据写入当前库", "success")
-        self.ctx.data_changed.emit()
-        self.run_db_compare(source_name=self._db_compare_result.source_a_name or "快速粘贴")
+        worker.failed.connect(self._on_import_new_failed)
+        worker.finished.connect(lambda w=worker: self._on_import_worker_finished(w))
+        if not hasattr(worker, "safe_stop"):
+            worker.finished.connect(worker.deleteLater)
+        worker.start()
 
-    # ------------------------------------------------------------------
-    # Mode B: A-vs-B Cross Comparison
-    # ------------------------------------------------------------------
-
-    def _build_ab_compare_tab(self) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
-
-        top_row = QHBoxLayout()
-        top_row.setSpacing(12)
-
-        self._drop_a = DropZoneWidget(
-            title="文件 A（拖拽或选择 TXT / Word / Excel / CSV）",
-            subtitle="尚未选择文件 A",
-            allow_dirs=False,
-            allowed_exts=set(SUPPORTED_DOCUMENT_EXTENSIONS),
-        )
-        self._drop_a.paths_dropped.connect(lambda ps: self._set_ab_file("A", ps[0]))
-        btn_a = QPushButton("选择文件 A")
-        btn_a.clicked.connect(lambda: self._pick_ab_file("A"))
-        self._drop_a.add_action_button(btn_a)
-        top_row.addWidget(self._drop_a, 1)
-
-        self._drop_b = DropZoneWidget(
-            title="文件 B（拖拽或选择 TXT / Word / Excel / CSV）",
-            subtitle="尚未选择文件 B",
-            allow_dirs=False,
-            allowed_exts=set(SUPPORTED_DOCUMENT_EXTENSIONS),
-        )
-        self._drop_b.paths_dropped.connect(lambda ps: self._set_ab_file("B", ps[0]))
-        btn_b = QPushButton("选择文件 B")
-        btn_b.clicked.connect(lambda: self._pick_ab_file("B"))
-        self._drop_b.add_action_button(btn_b)
-        top_row.addWidget(self._drop_b, 1)
-
-        layout.addLayout(top_row)
-
-        ctrl_row = QHBoxLayout()
-        self._ab_summary = QLabel("请选择或拖入文件 A 与文件 B，点击「执行交叉比对」")
-        self._ab_summary.setProperty("role", "subtitle")
-        ctrl_row.addWidget(self._ab_summary)
-        ctrl_row.addStretch()
-
-        self._btn_run_ab = QPushButton("执行交叉比对")
-        self._btn_run_ab.setProperty("variant", "primary")
-        self._btn_run_ab.setEnabled(False)
-        self._btn_run_ab.clicked.connect(self.run_ab_compare)
-        ctrl_row.addWidget(self._btn_run_ab)
-
-        self._btn_export_ab = QPushButton("导出比对报告 (.xlsx)")
-        self._btn_export_ab.setEnabled(False)
-        self._btn_export_ab.clicked.connect(lambda: self._export_compare(self._ab_result))
-        ctrl_row.addWidget(self._btn_export_ab)
-
-        layout.addLayout(ctrl_row)
-
-        self._ab_result_tabs = QTabWidget()
-        self._ab_result_tabs.addTab(self._make_table(self._model_ab_inter), "交集 · 重复 (0)")
-        self._ab_result_tabs.addTab(self._make_table(self._model_ab_only_a), "仅 A 有 (0)")
-        self._ab_result_tabs.addTab(self._make_table(self._model_ab_only_b), "仅 B 有 (0)")
-        self._ab_result_tabs.addTab(self._make_table(self._model_ab_unrec), "未识别 (0)")
-        layout.addWidget(self._ab_result_tabs, 1)
-
-        return widget
-
-    def _pick_ab_file(self, side: str) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, f"选择文件 {side}", "", _COMPARE_FILE_FILTER
-        )
-        if path:
-            self._set_ab_file(side, path)
-
-    def _set_ab_file(self, side: str, path: str) -> None:
-        p = Path(path)
-        if side == "A":
-            self._file_a_path = str(p)
-            self._drop_a._sub_label.setText(f"已选：{p.name}")
-        else:
-            self._file_b_path = str(p)
-            self._drop_b._sub_label.setText(f"已选：{p.name}")
-        self._btn_run_ab.setEnabled(bool(self._file_a_path and self._file_b_path))
-
-    def run_ab_compare(self) -> None:
-        if not self._file_a_path or not self._file_b_path:
-            return
-        comp_exts = self.ctx.get_companion_extensions()
-        ignore_comp = self.ctx.config.ignore_companion_files
-
+    def _on_import_new_succeeded(self, saved_count: int, source_name: str) -> None:
+        self._set_db_busy(False)
+        self.ctx.notify(f"已将 {saved_count:,} 条新数据写入当前库", "success")
+        self._self_importing = True
         try:
-            scanned_a = scan_document_file(self._file_a_path, companion_extensions=comp_exts)
-            scanned_b = scan_document_file(self._file_b_path, companion_extensions=comp_exts)
-        except Exception as exc:
-            ScrollableDetailDialog("读取比对文件失败", str(exc), parent=self).exec()
-            return
+            self.ctx.data_changed.emit()
+        finally:
+            self._self_importing = False
+        self.run_db_compare(source_name=source_name or "快速粘贴")
 
-        parsed_a = self.ctx.parser.parse_items(scanned_a, ignore_companions=ignore_comp, companion_extensions=comp_exts)
-        parsed_b = self.ctx.parser.parse_items(scanned_b, ignore_companions=ignore_comp, companion_extensions=comp_exts)
+    def _on_import_new_failed(self, detail: str) -> None:
+        self._set_db_busy(False)
+        self._db_summary.setText("新数据入库失败，请查看详情")
+        ScrollableDetailDialog("写入数据库失败", "将新数据入库时发生错误：", detail, parent=self).exec()
 
-        result = compare_two_sources(
-            parsed_a,
-            parsed_b,
-            source_a_name=Path(self._file_a_path).name,
-            source_b_name=Path(self._file_b_path).name,
-        )
-        self._ab_result = result
-
-        self._model_ab_inter.set_rows(result.intersection_a)
-        self._model_ab_only_a.set_rows(result.only_in_a)
-        self._model_ab_only_b.set_rows(result.only_in_b)
-        self._model_ab_unrec.set_rows(result.unrecognized_a + result.unrecognized_b)
-
-        self._ab_result_tabs.setTabText(0, f"交集 · 重复 ({len(result.intersection_codes)} 编码)")
-        self._ab_result_tabs.setTabText(1, f"仅 A 有 ({len(result.only_in_a)})")
-        self._ab_result_tabs.setTabText(2, f"仅 B 有 ({len(result.only_in_b)})")
-        self._ab_result_tabs.setTabText(
-            3, f"未识别 ({len(result.unrecognized_a) + len(result.unrecognized_b)})"
-        )
-        self._ab_summary.setText(
-            f"交叉比对完成：交集 {len(result.intersection_codes)} 个编码 · "
-            f"仅 A 有 {len(result.only_in_a)} 条 · 仅 B 有 {len(result.only_in_b)} 条"
-        )
-        self._btn_export_ab.setEnabled(True)
-        self.ctx.notify("双文件交叉比对完成", "success")
-
-    # ------------------------------------------------------------------
-    # Shared helpers
-    # ------------------------------------------------------------------
-
-    def _make_table(self, model: CompareTableModel) -> QTableView:
-        tv = QTableView()
-        tv.setModel(model)
-        tv.setAlternatingRowColors(True)
-        tv.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        tv.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        tv.verticalHeader().setDefaultSectionSize(30)
-        tv.verticalHeader().setVisible(False)
-        tv.horizontalHeader().setStretchLastSection(True)
-        tv.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        if model._with_matches:
-            widths = [118, 215, 240, 90, 62]
-        else:
-            widths = [118, 62, 72, 54, 245, 220]
-        for idx, w in enumerate(widths):
-            if idx < model.columnCount():
-                tv.setColumnWidth(idx, w)
-        return tv
-
-    def _export_compare(self, result: Optional[CompareResult]) -> None:
-        if result is None:
-            return
-        default_name = "交叉比对报告.xlsx" if result.mode == "ab" else "快速查重结果.xlsx"
-        save_path, selected_filter = QFileDialog.getSaveFileName(
-            self,
-            "导出比对结果",
-            str(Path(self.ctx.config.default_export_dir or Path.home()) / default_name),
-            "Excel 工作簿 (*.xlsx);;CSV 表格 (*.csv);;新数据编码清单 (*.txt)",
-        )
-        if not save_path:
-            return
-        try:
-            low = save_path.lower()
-            if low.endswith(".csv") or "CSV" in selected_filter:
-                export_compare_result_csv(result, save_path)
-            elif low.endswith(".txt") or "TXT" in selected_filter.upper():
-                target_items = result.not_in_db if result.mode == "db" else result.intersection_a
-                export_codes_txt(target_items, save_path, unique=True, sort_codes=True)
-            else:
-                export_compare_result_excel(result, save_path)
-            self.ctx.notify(f"导出成功：{Path(save_path).name}", "success")
-        except ExportError as exc:
-            ScrollableDetailDialog("导出失败", str(exc), parent=self).exec()
+    def _on_import_worker_finished(self, worker: WorkerThread) -> None:
+        if self._import_worker is worker:
+            self._import_worker = None
+        self._set_db_busy(False)
