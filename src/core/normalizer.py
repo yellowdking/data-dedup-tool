@@ -9,55 +9,7 @@ import re
 import unicodedata
 from typing import Collection, Optional
 
-
-# Extensions typically representing sidecar/companion files rather than primary items.
-DEFAULT_COMPANION_EXTENSIONS: frozenset[str] = frozenset(
-    {
-        ".jpg",
-        ".jpeg",
-        ".png",
-        ".gif",
-        ".bmp",
-        ".webp",
-        ".tiff",
-        ".tif",
-        ".ico",
-        ".svg",
-        ".nfo",
-        ".srt",
-        ".ass",
-        ".ssa",
-        ".sub",
-        ".idx",
-        ".vtt",
-        ".sup",
-        ".lrc",
-        ".txt",
-        ".log",
-        ".url",
-        ".lnk",
-        ".torrent",
-        ".ini",
-        ".cfg",
-        ".db",
-        ".sqlite",
-        ".bak",
-        ".json",
-        ".xml",
-        ".md",
-        ".html",
-        ".htm",
-        ".sfv",
-        ".md5",
-        ".sha1",
-        ".sha256",
-        ".ds_store",
-        ".thumbs",
-        ".m3u",
-        ".m3u8",
-        ".cue",
-    }
-)
+from .io_utils import DEFAULT_COMPANION_EXTENSIONS, normalize_companion_extensions
 
 # Extensions representing primary media or archive files (stripped before parsing).
 PRIMARY_FILE_EXTENSIONS: frozenset[str] = frozenset(
@@ -93,6 +45,9 @@ PRIMARY_FILE_EXTENSIONS: frozenset[str] = frozenset(
 )
 
 ALL_KNOWN_EXTENSIONS: frozenset[str] = DEFAULT_COMPANION_EXTENSIONS | PRIMARY_FILE_EXTENSIONS
+
+# Known dotfiles that are themselves sidecar/OS metadata items.
+_KNOWN_COMPANION_DOTFILES: frozenset[str] = frozenset({".ds_store", ".thumbs"})
 
 # Exact technical tokens that must never be recognized as catalog codes.
 FALSE_POSITIVE_CODES: frozenset[str] = frozenset(
@@ -244,7 +199,7 @@ FALSE_POSITIVE_CODES: frozenset[str] = frozenset(
     }
 )
 
-# Prefixes that represent technical identifiers, timestamps, camera names, or split markers.
+# Prefixes that represent technical identifiers, standards, media containers, currencies, or split markers.
 FALSE_POSITIVE_PREFIXES: frozenset[str] = frozenset(
     {
         "H",
@@ -256,6 +211,22 @@ FALSE_POSITIVE_PREFIXES: frozenset[str] = frozenset(
         "X265",
         "MPEG",
         "MP",
+        "MP3",
+        "MP4",
+        "MKV",
+        "AVI",
+        "WMV",
+        "FLV",
+        "M4V",
+        "WEBM",
+        "ISO",
+        "RFC",
+        "IEEE",
+        "HD",
+        "FHD",
+        "UHD",
+        "QHD",
+        "SD",
         "UTF",
         "GB",
         "SHA",
@@ -383,19 +354,45 @@ _TLD_PATTERN = (
     r"site|online|live|link|fun|icu|cn|jp|tw|hk|uk|us|de|fr|nl|to|gg|ws|bz|su|in|work"
 )
 
+# Generic TLDs that are rarely used as plain language/tier filename suffixes after a compact code.
+_STRICT_GENERIC_TLDS: frozenset[str] = frozenset({"com", "net", "org"})
+
+# Bounded domain/URL regexes (no unbounded subdomain repetition -> O(N) linear time, zero ReDoS).
 _RE_URL_HOST = re.compile(r"https?://[^\s/]+(?:/|$)", re.IGNORECASE)
 _RE_DOMAIN_AT = re.compile(
     rf"(?:^|[\s\[\(【（])[a-z0-9](?:[a-z0-9-]{{0,40}}[a-z0-9])?"
-    rf"(?:\.[a-z0-9-]+)*\.(?:{_TLD_PATTERN})@",
+    rf"(?:\.[a-z0-9-]{{1,40}}){{0,4}}\.(?:{_TLD_PATTERN})@",
     re.IGNORECASE,
 )
 _RE_EMAIL = re.compile(
-    rf"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.(?:{_TLD_PATTERN})(?![A-Za-z0-9])",
+    rf"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]{{1,40}}){{0,4}}\.(?:{_TLD_PATTERN})(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 _RE_DOMAIN_PREFIX = re.compile(
-    rf"(?<![a-z0-9])(?:www\.)?[a-z0-9](?:[a-z0-9-]{{0,40}}[a-z0-9])?"
-    rf"(?:\.[a-z0-9-]+)*\.(?:{_TLD_PATTERN})(?![a-z0-9])[-_.\s@]*",
+    rf"(?<![a-z0-9.])(?P<host>(?:www\.)?[a-z0-9](?:[a-z0-9-]{{0,40}}[a-z0-9])?"
+    rf"(?:\.[a-z0-9-]{{1,40}}){{0,4}})\.(?P<tld>{_TLD_PATTERN})(?![a-z0-9])(?P<trail>[-_.\s@]*)",
+    re.IGNORECASE,
+)
+
+# Structural check to prevent domain stripping from erasing `<CATALOG-CODE>.<lang/tier>` stems
+# such as `ABC-123.cn.mp4`, `ABC-123.jp.mkv`, `PRJ-0042.vip.mp4`, `S2M-001.tv.mp4`.
+_RE_HYPHEN_CODE_HOST = re.compile(
+    r"^(?:"
+    r"FC2(?:-PPV)?-\d{5,7}|"
+    r"[A-Za-z]{2,7}-\d{2,6}|"
+    r"\d{2,4}[A-Za-z]{2,6}-\d{2,5}|"
+    r"[A-Za-z][A-Za-z0-9]{1,11}-\d{2,5}|"
+    r"[A-Za-z]{2,4}-[A-Za-z]{1,2}-\d{2,5}|"
+    r"[A-Za-z]\d{4}-[A-Za-z]{2,4}\d{3,6}|"
+    r"[A-Za-z]{2,5}-[A-Za-z]\d{2,4}|"
+    r"\d{6}-\d{2,3}"
+    r")$",
+    re.IGNORECASE,
+)
+_RE_COMPACT_CODE_HOST = re.compile(r"^[A-Za-z]{2,6}\d{3,5}$")
+
+_RE_UUID = re.compile(
+    r"(?<![A-Za-z0-9])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 _RE_FILE_SIZE = re.compile(
@@ -403,9 +400,12 @@ _RE_FILE_SIZE = re.compile(
     re.IGNORECASE,
 )
 _RE_ISO_DATE = re.compile(
-    r"(?<![A-Za-z0-9])(?:19|20)\d{2}[-/.](?:0?[1-9]|1[0-2])[-/.](?:0?[1-9]|[12]\d|3[01])"
+    r"(?<![A-Za-z0-9])(?:19|20)\d{2}([-/._])(?:0?[1-9]|1[0-2])\1(?:0?[1-9]|[12]\d|3[01])"
     r"(?:[T\s]\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?Z?)?(?![A-Za-z0-9])",
     re.IGNORECASE,
+)
+_RE_YEAR_MMDD = re.compile(
+    r"(?<![A-Za-z0-9])(?:19|20)\d{2}[-_](?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])(?![A-Za-z0-9])"
 )
 _RE_CN_DATE = re.compile(
     r"(?:19|20)\d{2}\s*年\s*(?:0?[1-9]|1[0-2])\s*月(?:\s*(?:0?[1-9]|[12]\d|3[01])\s*[日号])?"
@@ -446,7 +446,12 @@ _RE_TECH_NOISE = re.compile(
     re.IGNORECASE,
 )
 _RE_STANDALONE_QUALITY = re.compile(
-    r"(?:^|[\s\[\(【（\-_]|(?<=[^\x00-\x7F]))(?:8K|4K|2K|HD|SD)(?=$|[\s\]\)】）\-_]|[^\x00-\x7F])",
+    r"(?:^|[\s\[\(【（\-_.]|(?<=[^\x00-\x7F]))(?:8K|4K|2K|HD|SD)(?=$|[\s\]\)】）\-_.]|[^\x00-\x7F])",
+    re.IGNORECASE,
+)
+_RE_DIR_LINE_PREFIX = re.compile(
+    r"^\s*(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})\s+"
+    r"(?:(?:上午|下午)\s*)?\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AP]M)?\s+(?:<DIR>|[\d,]+)\s+",
     re.IGNORECASE,
 )
 _RE_DASH_VARIANTS = re.compile(r"[‐‑‒–—―−－]")
@@ -471,9 +476,18 @@ _RE_TAG_SPECIAL_TOKEN = re.compile(
     r"(?:^|[-_.\s\[\(【（])(?:UC|UNC[A-Z]*|LEAK|SPECIAL|RAW-?ORIG)(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
-_RE_SUFFIX_UC = re.compile(r"^[-_.\s]*(?:UC)(?![A-Za-z0-9])", re.IGNORECASE)
-_RE_SUFFIX_C = re.compile(r"^[-_.\s]*(?:CH|CHS|CHT|C)(?![A-Za-z0-9])", re.IGNORECASE)
-_RE_SUFFIX_U = re.compile(r"^[-_.\s]*(?:U|UNC[A-Z]*|LEAK)(?![A-Za-z0-9])", re.IGNORECASE)
+_RE_SUFFIX_UC = re.compile(r"^[-_.\s]*(?:UC)(?![A-Za-z0-9+#])", re.IGNORECASE)
+_RE_SUFFIX_C = re.compile(
+    r"^(?:[-_.\s]*(?:CH|CHS|CHT)|[-_.]*C)(?![A-Za-z0-9+#])",
+    re.IGNORECASE,
+)
+_RE_SUFFIX_U = re.compile(
+    r"^(?:[-_.\s]*(?:UNC[A-Z]*|LEAK)|[-_.]*U)(?![A-Za-z0-9+#])",
+    re.IGNORECASE,
+)
+_RE_TRAIL_SUFFIX_UC = re.compile(r"[-_.](?:UC)(?![A-Za-z0-9+#])", re.IGNORECASE)
+_RE_TRAIL_SUFFIX_C = re.compile(r"[-_.](?:CH|CHS|CHT|C)(?![A-Za-z0-9+#])", re.IGNORECASE)
+_RE_TRAIL_SUFFIX_U = re.compile(r"[-_.](?:U)(?![A-Za-z0-9+#])", re.IGNORECASE)
 
 # Multi-part extraction patterns.
 _RE_PART_CD = re.compile(r"(?<![A-Za-z0-9])CD[-_\s]?0?([1-9]\d?)(?![A-Za-z0-9])", re.IGNORECASE)
@@ -487,16 +501,45 @@ _RE_PART_CN_NUM = re.compile(r"第\s*0?([1-9]\d?)\s*[集部段卷话]")
 _RE_PART_CN_UPPER = re.compile(r"(?:上集|上部|上卷|（上）|\(上\)|\[上\]|【上】)")
 _RE_PART_CN_MIDDLE = re.compile(r"(?:中集|中部|中卷|（中）|\(中\)|\[中\]|【中】)")
 _RE_PART_CN_LOWER = re.compile(r"(?:下集|下部|下卷|（下）|\(下\)|\[下\]|【下】)")
+# Letter parts (`-A`, `_B`, `A`) must be attached via `[-_.]` or directly glued to the code,
+# never matched loosely after whitespace (`Plan B`, `A Good Day`, `E-book`).
 _RE_SUFFIX_LETTER_PART = re.compile(
-    r"^(?:[-_.\s]+([ABDEF])|([ABDEF]))(?![A-Za-z0-9])", re.IGNORECASE
-)
-_RE_SUFFIX_NUM_PART = re.compile(
-    r"^(?:[-_]([1-9])(?![A-Za-z0-9]))"
-)
-_RE_SUFFIX_COMBINED_PART = re.compile(
-    r"(?:^|[-_.\s])(?:(?:CD|PART|PT|DISC|DISK)[-_\s]?0?([1-9]\d?)|([ABDEF]))(?![A-Za-z0-9])",
+    r"^(?:[-_.]([ABDEF])|([ABDEF]))(?=$|[\s\]\)】）\-_.]|[^\x00-\x7F])",
     re.IGNORECASE,
 )
+_RE_HYPHENATED_WORD_CONT = re.compile(r"^-[A-Za-z]{3,}")
+_RE_KNOWN_TAG_OR_PART_HEAD = re.compile(
+    r"^-(?:CD|PT|PART|DISC|DISK|SUB|SUBS|CHS|CHT|UNC|LEAK|FHD|UHD|RAW|FULL)(?![A-Za-z])",
+    re.IGNORECASE,
+)
+_RE_SUFFIX_NUM_PART = re.compile(r"^(?:[-_]([1-9])(?![A-Za-z0-9]))")
+
+
+def _strip_domain_match(m: re.Match) -> str:
+    """Replace site/domain watermarks while preserving `<CODE>.<lang/tier>` stems like `ABC-123.cn`."""
+    host = m.group("host")
+    tld = m.group("tld").lower()
+    trail = m.group("trail") or ""
+
+    # Explicit `www.` or trailing `@` is always a site watermark.
+    if host.lower().startswith("www.") or "@" in trail:
+        return " "
+
+    # Single-label host matching a hyphenated catalog code (e.g. `ABC-123.cn`, `PRJ-0042.vip`):
+    # keep the catalog code intact and only drop `.tld`.
+    if "." not in host:
+        if _RE_HYPHEN_CODE_HOST.match(host):
+            return f"{host}{trail or ' '}"
+        if (
+            tld not in _STRICT_GENERIC_TLDS
+            and _RE_COMPACT_CODE_HOST.match(host)
+            and (not trail or trail[0].isspace())
+        ):
+            m_parts = re.match(r"^([A-Za-z]+)(\d+)$", host)
+            if m_parts and not is_false_positive(m_parts.group(1), m_parts.group(2), host):
+                return f"{host}{trail or ' '}"
+
+    return " "
 
 
 def normalize_width(text: str) -> str:
@@ -525,7 +568,7 @@ def normalize_width(text: str) -> str:
 
 
 def split_known_extension(text: str) -> tuple[str, str]:
-    """Split off a trailing known file extension if present.
+    """Split off a trailing known file extension (or known companion dotfile) if present.
 
     Avoids mangling non-extension dots such as version numbers or dotted dates.
     Returns `(stem, lowercase_ext_with_dot)`.
@@ -534,7 +577,12 @@ def split_known_extension(text: str) -> tuple[str, str]:
     if not stripped or "." not in stripped:
         return stripped, ""
     dot_idx = stripped.rfind(".")
-    if dot_idx <= 0:
+    if dot_idx == 0:
+        low = stripped.lower()
+        if low in _KNOWN_COMPANION_DOTFILES or low in DEFAULT_COMPANION_EXTENSIONS:
+            return "", low
+        return stripped, ""
+    if dot_idx < 0:
         return stripped, ""
     ext = stripped[dot_idx:].lower()
     if ext in ALL_KNOWN_EXTENSIONS:
@@ -552,10 +600,7 @@ def is_companion_extension(
     norm = ext.lower() if ext.startswith(".") else f".{ext.lower()}"
     if companion_exts is None:
         return norm in DEFAULT_COMPANION_EXTENSIONS
-    normalized_set = {
-        e.lower() if e.startswith(".") else f".{e.lower()}" for e in companion_exts
-    }
-    return norm in normalized_set
+    return norm in normalize_companion_extensions(companion_exts)
 
 
 def is_false_positive(prefix: str, number: str, raw_token: str = "") -> bool:
@@ -627,7 +672,9 @@ def extract_tags(text: str, suffix: str = "", prefix: str = "") -> list[str]:
     elif _RE_TAG_HD.search(norm_text) and not prefix_up.endswith("HD"):
         _add("HD")
 
-    if _RE_TAG_VR.search(norm_text) or (len(prefix_up) >= 4 and prefix_up.endswith("VR")):
+    if _RE_TAG_VR.search(norm_text) or (
+        len(prefix_up) >= 3 and (prefix_up.endswith("VR") or prefix_up.startswith("VR"))
+    ):
         _add("VR")
 
     # Subtitle & special-edition markers from full text and immediate suffix.
@@ -636,11 +683,11 @@ def extract_tags(text: str, suffix: str = "", prefix: str = "") -> list[str]:
 
     if _RE_TAG_SPECIAL_TOKEN.search(norm_text):
         _add("特殊版")
-        if re.search(r"(?:^|[-_.\s\[\(【（])UC(?![A-Za-z0-9])", norm_text, re.IGNORECASE):
+        if re.search(r"(?:^|[-_.\s\[\(【（])UC(?![A-Za-z0-9+#])", norm_text, re.IGNORECASE):
             _add("字幕")
 
     if norm_suffix:
-        # Check combined suffix patterns such as -UC, -C, -CH, -U, -C-CD1, _CD1_C.
+        # Check combined suffix patterns such as -UC, -C, -CH, -U, -C-CD1, _CD1_C, -CD1-C-U.
         if _RE_SUFFIX_UC.search(norm_suffix):
             _add("特殊版")
             _add("字幕")
@@ -649,13 +696,13 @@ def extract_tags(text: str, suffix: str = "", prefix: str = "") -> list[str]:
                 _add("字幕")
             if _RE_SUFFIX_U.search(norm_suffix):
                 _add("特殊版")
-        # Also catch trailing -C / -UC after part token (e.g. ABC-123_CD1-C).
-        if re.search(r"[-_.](?:UC)(?![A-Za-z0-9])", norm_suffix, re.IGNORECASE):
+        # Independent checks after part tokens so `-CD1-C-U` keeps BOTH `字幕` and `特殊版`.
+        if _RE_TRAIL_SUFFIX_UC.search(norm_suffix):
             _add("特殊版")
             _add("字幕")
-        elif re.search(r"[-_.](?:CH|CHS|CHT|C)(?![A-Za-z0-9])", norm_suffix, re.IGNORECASE):
+        if _RE_TRAIL_SUFFIX_C.search(norm_suffix):
             _add("字幕")
-        elif re.search(r"[-_.](?:U)(?![A-Za-z0-9])", norm_suffix, re.IGNORECASE):
+        if _RE_TRAIL_SUFFIX_U.search(norm_suffix):
             _add("特殊版")
 
     return tags
@@ -680,14 +727,14 @@ def extract_part(text: str, suffix: str = "") -> str:
         if m:
             return f"Disc{int(m.group(1))}"
 
-    # Check Chinese part indicators.
+    # Check Chinese part indicators (distinct mapping for 上/中/下 so 3-part sets never collide).
     m = _RE_PART_CN_NUM.search(norm_text)
     if m:
         return f"Part{int(m.group(1))}"
     if _RE_PART_CN_UPPER.search(norm_text):
         return "Part1"
     if _RE_PART_CN_MIDDLE.search(norm_text):
-        return "Part2"
+        return "PartMid"
     if _RE_PART_CN_LOWER.search(norm_text):
         return "Part2"
 
@@ -695,24 +742,24 @@ def extract_part(text: str, suffix: str = "") -> str:
     if norm_suffix:
         trimmed = norm_suffix
         trimmed = re.sub(
-            r"^[-_.\s]*(?:UC|CH|CHS|CHT|C|U)(?=[-_.\s]|$)",
+            r"^[-_.]*(?:UC|CH|CHS|CHT|C|U)(?=[-_.\s]|$)",
             "",
             trimmed,
             flags=re.IGNORECASE,
         )
         m = _RE_SUFFIX_LETTER_PART.search(trimmed)
         if m:
-            letter = (m.group(1) or m.group(2)).upper()
-            return letter
+            after = trimmed[m.end() :]
+            # Guard against hyphenated English words like `-E-book` unless followed by a known tag/part.
+            if not (
+                _RE_HYPHENATED_WORD_CONT.match(after)
+                and not _RE_KNOWN_TAG_OR_PART_HEAD.match(after)
+            ):
+                letter = (m.group(1) or m.group(2)).upper()
+                return letter
         m = _RE_SUFFIX_NUM_PART.search(trimmed)
         if m:
             return f"Part{int(m.group(1))}"
-        m = _RE_SUFFIX_COMBINED_PART.search(trimmed)
-        if m:
-            if m.group(1):
-                return f"Part{int(m.group(1))}"
-            if m.group(2):
-                return m.group(2).upper()
 
     return ""
 
@@ -723,7 +770,7 @@ def clean_text(text: str) -> str:
     Steps:
     1. Normalize full-width characters, brackets, and Unicode dash variants
     2. Strip known file extension
-    3. Strip URLs, domain/site `@` prefixes, email addresses, and site domain watermarks
+    3. Strip Windows dir listing prefix, UUIDs, URLs, domain/site `@` prefixes, emails, and domain watermarks
     4. Strip file size tokens, calendar dates, timestamps, phone numbers, and currency prices
     5. Strip codec/resolution/technical noise tokens
     6. Convert wrapper brackets to spaces and collapse whitespace
@@ -734,22 +781,21 @@ def clean_text(text: str) -> str:
     cleaned, _ = split_known_extension(normalized)
 
     # Strip Windows dir timestamp+size prefix if still attached.
-    cleaned = re.sub(
-        r"^\s*\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}(?::\d{2})?\s+(?:<DIR>|[\d,]+)\s+",
-        "",
-        cleaned,
-        flags=re.IGNORECASE,
-    )
+    cleaned = _RE_DIR_LINE_PREFIX.sub("", cleaned)
+
+    # Strip standard UUIDs before domain/code scanning.
+    cleaned = _RE_UUID.sub(" ", cleaned)
 
     # Strip scheme+host URLs, domain@ prefixes, email addresses, and domain watermarks.
     cleaned = _RE_URL_HOST.sub(" ", cleaned)
     cleaned = _RE_DOMAIN_AT.sub(" ", cleaned)
     cleaned = _RE_EMAIL.sub(" ", cleaned)
-    cleaned = _RE_DOMAIN_PREFIX.sub(" ", cleaned)
+    cleaned = _RE_DOMAIN_PREFIX.sub(_strip_domain_match, cleaned)
 
     # Strip file size markers, calendar dates/timestamps, phone numbers, and prices.
     cleaned = _RE_FILE_SIZE.sub(" ", cleaned)
     cleaned = _RE_ISO_DATE.sub(" ", cleaned)
+    cleaned = _RE_YEAR_MMDD.sub(" ", cleaned)
     cleaned = _RE_CN_DATE.sub(" ", cleaned)
     cleaned = _RE_COMPACT_DATE_8.sub(" ", cleaned)
     cleaned = _RE_TIME_STR.sub(" ", cleaned)
