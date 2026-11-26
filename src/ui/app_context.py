@@ -7,7 +7,7 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
 
-from src.core.config import ConfigManager
+from src.core.config import ConfigManager, normalize_extension
 from src.core.database import DatabaseRepository
 from src.core.parser import CodeParser
 from src.core.rules import RuleRegistry
@@ -32,6 +32,7 @@ class AppContext(QObject):
         super().__init__(parent)
         self.config_manager = config_manager or ConfigManager()
         cfg = self.config_manager.config
+        self._closed = False
 
         # Ensure current DB is recorded in recent list
         db_path = Path(cfg.current_db_path)
@@ -83,10 +84,30 @@ class AppContext(QObject):
             self.config_manager.save()
         self.theme_changed.emit(normalized)
 
-    def get_companion_extensions(self) -> set[str]:
-        return self.config_manager.get_companion_extension_set()
+    def get_companion_extensions(self, respect_global_toggle: bool = True) -> set[str]:
+        """Return configured companion extensions as a normalized lowercase set.
+
+        When ``respect_global_toggle`` is True (default), returns an empty set if
+        ``config.ignore_companion_files`` is False. Pass ``respect_global_toggle=False``
+        when a view's local companion-filter checkbox is explicitly enabled.
+        """
+        if respect_global_toggle:
+            return self.config_manager.get_companion_extension_set()
+        return {
+            normalize_extension(ext)
+            for ext in self.config.companion_extensions
+            if normalize_extension(ext)
+        }
+
+    def sync_db_backup_settings(self) -> None:
+        """Apply current config backup preferences to the active DatabaseRepository."""
+        self.db.auto_backup = bool(self.config.auto_backup)
+        self.db.backup_keep_count = max(1, int(self.config.backup_keep_count))
 
     def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         try:
             self.config_manager.save()
         finally:
