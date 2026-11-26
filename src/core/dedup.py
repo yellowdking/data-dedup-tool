@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from .database import DatabaseRepository, normalize_part_key
 from .models import (
+    ChecklistEntry,
     CompareResult,
     DataRecord,
     DedupPreview,
@@ -259,44 +260,262 @@ def compare_with_db(
 
 
 # ----------------------------------------------------------------------
-# 3. Two-source A-vs-B cross-comparison
+# 3. Two-source A-vs-B dual-list coverage & missing-item comparison
 # ----------------------------------------------------------------------
 
 
-def compare_two_sources(
-    items_a: Sequence[ParseResult],
-    items_b: Sequence[ParseResult],
+def data_record_to_parse_result(record: DataRecord) -> ParseResult:
+    """Fast conversion of a persisted ``DataRecord`` into a ``ParseResult`` without re-parsing."""
+    code = record.canonical_code.strip().upper()
+    return ParseResult(
+        canonical_code=code,
+        prefix=record.prefix,
+        number=record.number,
+        raw_code=record.raw_code or code,
+        raw_text=record.raw_text or record.file_name or code,
+        file_name=record.file_name or record.raw_text or code,
+        parent_dir="",
+        full_path=record.full_path,
+        source_name=record.source_name,
+        source_type=record.source_type or "db",
+        line_number=0,
+        file_size=record.file_size,
+        file_ext=record.file_ext,
+        tags=list(record.tags),
+        part=record.part,
+        matched_rule=record.matched_rule or "database",
+        cleaned_text="",
+        confidence=record.confidence,
+        from_parent=False,
+        recognized=bool(code),
+        note=record.note,
+    )
+
+
+def database_records_to_parse_results(db_repo: DatabaseRepository) -> List[ParseResult]:
+    """Load all records from ``DatabaseRepository`` as ``ParseResult``s without regex parsing."""
+    records = db_repo.query_records(sort_by="id", sort_desc=False)
+    return [data_record_to_parse_result(rec) for rec in records]
+
+
+def _collect_unique_names(items: Sequence[ParseResult]) -> List[str]:
+    """Collect distinct display filenames/texts from matched Base List A items in order."""
+    names: List[str] = []
+    seen: set[str] = set()
+    for item in items:
+        label = (item.file_name or item.raw_text or item.canonical_code).strip()
+        if label and label not in seen:
+            seen.add(label)
+            names.append(label)
+    return names
+
+
+def _collect_combined_tags(items: Sequence[ParseResult]) -> str:
+    """Collect distinct version/feature tags across matched Base List A items in order."""
+    tags: List[str] = []
+    seen: set[str] = set()
+    for item in items:
+        for tag in item.tags:
+            t = str(tag).strip()
+            if t and t not in seen:
+                seen.add(t)
+                tags.append(t)
+    return ",".join(tags)
+
+
+def _normalize_exact_line_item(
+    raw_item: ParseResult | str,
     *,
-    source_a_name: str = "来源A",
-    source_b_name: str = "来源B",
+    source_name: str,
+    line_number: int,
+    strip_whitespace: bool,
+    ignore_case: bool,
+) -> Tuple[str, str, ParseResult]:
+    """Normalize a string or ``ParseResult`` for ``exact_line`` comparison without mutating inputs."""
+    if isinstance(raw_item, str):
+        raw_text = raw_item
+        val = raw_text.strip() if strip_whitespace else raw_text
+        if not val:
+            return (
+                "",
+                "",
+                ParseResult(
+                    raw_text=raw_text,
+                    file_name=raw_text,
+                    source_name=source_name,
+                    source_type="paste",
+                    line_number=line_number,
+                    recognized=False,
+                    note="空文本行",
+                ),
+            )
+        cmp_key = val.casefold() if ignore_case else val
+        pr = ParseResult(
+            canonical_code=val,
+            raw_code=val,
+            raw_text=raw_text,
+            file_name=raw_text,
+            source_name=source_name,
+            source_type="paste",
+            line_number=line_number,
+            matched_rule="exact_line",
+            cleaned_text=val,
+            confidence=1.0,
+            recognized=True,
+        )
+        return cmp_key, val, pr
+
+    raw_text = raw_item.raw_text or raw_item.file_name or raw_item.canonical_code
+    val = raw_text.strip() if strip_whitespace else raw_text
+    if not val:
+        return "", "", raw_item
+    cmp_key = val.casefold() if ignore_case else val
+    pr = ParseResult(
+        canonical_code=val,
+        prefix=raw_item.prefix,
+        number=raw_item.number,
+        raw_code=val,
+        raw_text=raw_text,
+        file_name=raw_item.file_name or raw_text,
+        parent_dir=raw_item.parent_dir,
+        full_path=raw_item.full_path,
+        source_name=raw_item.source_name or source_name,
+        source_type=raw_item.source_type,
+        line_number=raw_item.line_number or line_number,
+        file_size=raw_item.file_size,
+        file_ext=raw_item.file_ext,
+        tags=list(raw_item.tags),
+        part=raw_item.part,
+        matched_rule="exact_line",
+        cleaned_text=val,
+        confidence=1.0,
+        from_parent=raw_item.from_parent,
+        recognized=True,
+        note=raw_item.note,
+    )
+    return cmp_key, val, pr
+
+
+def compare_two_sources(
+    items_a: Sequence[ParseResult | str],
+    items_b: Sequence[ParseResult | str],
+    source_a_name: str = "基准清单A",
+    source_b_name: str = "目标清单B",
+    *,
+    match_mode: str = "smart_code",
+    ignore_case: bool = True,
+    strip_whitespace: bool = True,
+    include_unrecognized_in_checklist: bool = False,
 ) -> CompareResult:
-    """Cross-compare two parsed item lists by canonical code.
+    """Cross-compare Base List A against Target List B for coverage & missing-item verification.
 
-    Returns intersection codes & matching items from both sides, items only in A,
-    items only in B, and unrecognized items from each source.
+    Modes:
+    - ``"smart_code"``: compares canonical codes of A vs B, builds an ordered ``target_checklist``
+      preserving Target List B's first-appearance order, and attaches matching A filenames & tags.
+    - ``"exact_line"``: compares raw strings or ``ParseResult.raw_text`` lines directly (with
+      configurable case folding and whitespace stripping) for general office/plain-text lists.
     """
-    codes_a: set[str] = set()
-    codes_b: set[str] = set()
-    unrecognized_a: List[ParseResult] = []
-    unrecognized_b: List[ParseResult] = []
-    recognized_a: List[ParseResult] = []
-    recognized_b: List[ParseResult] = []
+    mode_norm = (match_mode or "smart_code").strip().lower()
+    if mode_norm not in {"smart_code", "exact_line"}:
+        raise ValueError(f"不支持的比对模式：{match_mode}")
 
-    for item in items_a:
+    if mode_norm == "exact_line":
+        return _compare_two_sources_exact_line(
+            items_a,
+            items_b,
+            source_a_name=source_a_name,
+            source_b_name=source_b_name,
+            ignore_case=ignore_case,
+            strip_whitespace=strip_whitespace,
+            include_unrecognized_in_checklist=include_unrecognized_in_checklist,
+        )
+
+    # Smart canonical code mode.
+    lazy_parser = None
+
+    def _ensure_parse_result(item: ParseResult | str, src: str, idx: int) -> ParseResult:
+        nonlocal lazy_parser
+        if isinstance(item, ParseResult):
+            return item
+        if lazy_parser is None:
+            from .parser import CodeParser
+
+            lazy_parser = CodeParser()
+        return lazy_parser.parse_single(item, source_name=src, line_number=idx)
+
+    a_by_code: Dict[str, List[ParseResult]] = {}
+    recognized_a: List[ParseResult] = []
+    unrecognized_a: List[ParseResult] = []
+
+    for idx, raw_item in enumerate(items_a, start=1):
+        item = _ensure_parse_result(raw_item, source_a_name, idx)
         code = item.canonical_code.strip().upper()
         if item.recognized and code:
-            codes_a.add(code)
+            a_by_code.setdefault(code, []).append(item)
             recognized_a.append(item)
         else:
             unrecognized_a.append(item)
 
-    for item in items_b:
+    codes_a = set(a_by_code.keys())
+    codes_b: set[str] = set()
+    recognized_b: List[ParseResult] = []
+    unrecognized_b: List[ParseResult] = []
+    target_checklist: List[ChecklistEntry] = []
+    matched_b_codes: List[str] = []
+    missing_b_codes: List[str] = []
+    seen_b_codes: set[str] = set()
+    order_index = 0
+
+    for idx, raw_item in enumerate(items_b, start=1):
+        item = _ensure_parse_result(raw_item, source_b_name, idx)
         code = item.canonical_code.strip().upper()
         if item.recognized and code:
             codes_b.add(code)
             recognized_b.append(item)
+            if code not in seen_b_codes:
+                seen_b_codes.add(code)
+                order_index += 1
+                target_text = item.raw_text or item.file_name or code
+                matched_a_list = a_by_code.get(code)
+                if matched_a_list:
+                    matched_b_codes.append(code)
+                    target_checklist.append(
+                        ChecklistEntry(
+                            order_index=order_index,
+                            canonical_code=code,
+                            status="matched",
+                            target_text=target_text,
+                            target_item=item,
+                            matched_a_count=len(matched_a_list),
+                            matched_a_names=_collect_unique_names(matched_a_list),
+                            matched_a_tags=_collect_combined_tags(matched_a_list),
+                            matched_a_items=list(matched_a_list),
+                        )
+                    )
+                else:
+                    missing_b_codes.append(code)
+                    target_checklist.append(
+                        ChecklistEntry(
+                            order_index=order_index,
+                            canonical_code=code,
+                            status="missing",
+                            target_text=target_text,
+                            target_item=item,
+                        )
+                    )
         else:
             unrecognized_b.append(item)
+            if include_unrecognized_in_checklist:
+                order_index += 1
+                target_checklist.append(
+                    ChecklistEntry(
+                        order_index=order_index,
+                        canonical_code="",
+                        status="unrecognized",
+                        target_text=item.raw_text or item.file_name,
+                        target_item=item,
+                    )
+                )
 
     intersection_set = codes_a & codes_b
     intersection_codes = sorted(intersection_set)
@@ -325,6 +544,135 @@ def compare_two_sources(
         intersection_b=intersection_b,
         only_in_a=only_in_a,
         only_in_b=only_in_b,
+        match_mode="smart_code",
+        target_checklist=target_checklist,
+        unique_a_count=len(codes_a),
+        unique_b_count=len(codes_b),
+        hit_b_count=len(matched_b_codes),
+        missing_b_count=len(missing_b_codes),
+        missing_b_codes=missing_b_codes,
+        matched_b_codes=matched_b_codes,
+    )
+
+
+def _compare_two_sources_exact_line(
+    items_a: Sequence[ParseResult | str],
+    items_b: Sequence[ParseResult | str],
+    *,
+    source_a_name: str,
+    source_b_name: str,
+    ignore_case: bool,
+    strip_whitespace: bool,
+    include_unrecognized_in_checklist: bool,
+) -> CompareResult:
+    """Compare two lists by normalized text line for general-purpose plain-text auditing."""
+    a_by_key: Dict[str, List[ParseResult]] = {}
+    recognized_a_pairs: List[Tuple[str, ParseResult]] = []
+    unrecognized_a: List[ParseResult] = []
+
+    for idx, raw_item in enumerate(items_a, start=1):
+        cmp_key, _, pr = _normalize_exact_line_item(
+            raw_item,
+            source_name=source_a_name,
+            line_number=idx,
+            strip_whitespace=strip_whitespace,
+            ignore_case=ignore_case,
+        )
+        if cmp_key:
+            a_by_key.setdefault(cmp_key, []).append(pr)
+            recognized_a_pairs.append((cmp_key, pr))
+        else:
+            unrecognized_a.append(pr)
+
+    b_display_by_key: Dict[str, str] = {}
+    recognized_b_pairs: List[Tuple[str, ParseResult]] = []
+    unrecognized_b: List[ParseResult] = []
+    target_checklist: List[ChecklistEntry] = []
+    matched_b_codes: List[str] = []
+    missing_b_codes: List[str] = []
+    order_index = 0
+
+    for idx, raw_item in enumerate(items_b, start=1):
+        cmp_key, display_val, pr = _normalize_exact_line_item(
+            raw_item,
+            source_name=source_b_name,
+            line_number=idx,
+            strip_whitespace=strip_whitespace,
+            ignore_case=ignore_case,
+        )
+        if cmp_key:
+            recognized_b_pairs.append((cmp_key, pr))
+            if cmp_key not in b_display_by_key:
+                b_display_by_key[cmp_key] = display_val
+                order_index += 1
+                matched_a_list = a_by_key.get(cmp_key)
+                if matched_a_list:
+                    matched_b_codes.append(display_val)
+                    target_checklist.append(
+                        ChecklistEntry(
+                            order_index=order_index,
+                            canonical_code=display_val,
+                            status="matched",
+                            target_text=pr.raw_text,
+                            target_item=pr,
+                            matched_a_count=len(matched_a_list),
+                            matched_a_names=_collect_unique_names(matched_a_list),
+                            matched_a_tags=_collect_combined_tags(matched_a_list),
+                            matched_a_items=list(matched_a_list),
+                        )
+                    )
+                else:
+                    missing_b_codes.append(display_val)
+                    target_checklist.append(
+                        ChecklistEntry(
+                            order_index=order_index,
+                            canonical_code=display_val,
+                            status="missing",
+                            target_text=pr.raw_text,
+                            target_item=pr,
+                        )
+                    )
+        else:
+            unrecognized_b.append(pr)
+            if include_unrecognized_in_checklist:
+                order_index += 1
+                target_checklist.append(
+                    ChecklistEntry(
+                        order_index=order_index,
+                        canonical_code="",
+                        status="unrecognized",
+                        target_text=pr.raw_text,
+                        target_item=pr,
+                    )
+                )
+
+    intersection_keys = set(a_by_key.keys()) & set(b_display_by_key.keys())
+    intersection_codes = sorted(b_display_by_key[k] for k in intersection_keys)
+
+    intersection_a = [pr for k, pr in recognized_a_pairs if k in intersection_keys]
+    intersection_b = [pr for k, pr in recognized_b_pairs if k in intersection_keys]
+    only_in_a = [pr for k, pr in recognized_a_pairs if k not in intersection_keys]
+    only_in_b = [pr for k, pr in recognized_b_pairs if k not in intersection_keys]
+
+    return CompareResult(
+        mode="ab",
+        source_a_name=source_a_name,
+        source_b_name=source_b_name,
+        unrecognized_a=unrecognized_a,
+        unrecognized_b=unrecognized_b,
+        intersection_codes=intersection_codes,
+        intersection_a=intersection_a,
+        intersection_b=intersection_b,
+        only_in_a=only_in_a,
+        only_in_b=only_in_b,
+        match_mode="exact_line",
+        target_checklist=target_checklist,
+        unique_a_count=len(a_by_key),
+        unique_b_count=len(b_display_by_key),
+        hit_b_count=len(matched_b_codes),
+        missing_b_count=len(missing_b_codes),
+        missing_b_codes=missing_b_codes,
+        matched_b_codes=matched_b_codes,
     )
 
 
