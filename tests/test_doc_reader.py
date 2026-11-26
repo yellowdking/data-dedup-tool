@@ -5,6 +5,7 @@ All fixtures and test strings are 100% neutral and general-purpose.
 
 from __future__ import annotations
 
+import zipfile
 from datetime import date, datetime, time
 from pathlib import Path
 
@@ -12,11 +13,13 @@ import docx
 import openpyxl
 import pytest
 
+from src.core import doc_reader
 from src.core.database import DatabaseRepository
 from src.core.doc_reader import (
     extract_excel_text_items,
     extract_word_text_items,
     list_excel_sheets,
+    list_word_tables_info,
     load_tables_from_file,
     read_csv_table,
     read_database_as_table,
@@ -520,3 +523,135 @@ def test_tree_txt_and_empty_csv_edge_cases(tmp_path: Path):
     assert empty_tbl.headers == []
     assert empty_tbl.rows == []
 
+
+def test_excel_header_row_and_uncached_formula_detection(tmp_path: Path):
+    xlsx_path = tmp_path / "banner_formula.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "汇总"
+    ws.append(["2026年度归档汇总表", None, None])
+    ws.merge_cells("A1:C1")
+    ws.append(["前缀", "序号", "合成编码"])
+    ws.append(["ABC", "001", '=A3&"-"&B3'])
+    ws.append(["DEF", "002", "DEF-002"])
+    wb.save(xlsx_path)
+
+    tables = read_excel_tables(xlsx_path, header_row=1)
+    assert len(tables) == 1
+    tbl = tables[0]
+    assert tbl.headers == ["前缀", "序号", "合成编码"]
+    assert tbl.row_count == 2
+    assert tbl.metadata["header_row"] == 1
+    assert tbl.metadata["uncached_formula_count"] == 1
+
+    # Formula-free workbook reports 0
+    clean_path = tmp_path / "no_formula.xlsx"
+    wb2 = openpyxl.Workbook()
+    wb2.active.append(["编码", "值"])
+    wb2.active.append(["ABC-001", "OK"])
+    wb2.save(clean_path)
+    clean_tbls = read_excel_tables(clean_path)
+    assert clean_tbls[0].metadata["uncached_formula_count"] == 0
+
+
+def test_corrupt_xml_encrypted_ole2_and_zip_bomb_guards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    # 1. Corrupt XML inside valid .xlsx ZIP
+    bad_xml_xlsx = tmp_path / "bad_xml.xlsx"
+    with zipfile.ZipFile(bad_xml_xlsx, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<broken><xml")
+    with pytest.raises(ValueError, match="无法读取 Excel 文件"):
+        read_excel_tables(bad_xml_xlsx)
+
+    # 2. Corrupt XML inside valid .docx ZIP
+    bad_xml_docx = tmp_path / "bad_xml.docx"
+    with zipfile.ZipFile(bad_xml_docx, "w") as zf:
+        zf.writestr("[Content_Types].xml", "<broken><xml")
+        zf.writestr("word/document.xml", "<w:document><unclosed")
+    with pytest.raises(ValueError, match="无法读取 Word 文件"):
+        read_word_tables(bad_xml_docx)
+
+    # 3. Encrypted OLE2 .xlsx and .docx
+    enc_xlsx = tmp_path / "encrypted.xlsx"
+    enc_xlsx.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64)
+    with pytest.raises(ValueError, match="加密|密码"):
+        read_excel_tables(enc_xlsx)
+
+    enc_docx = tmp_path / "encrypted.docx"
+    enc_docx.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 64)
+    with pytest.raises(ValueError, match="加密|密码"):
+        read_word_tables(enc_docx)
+
+    # 4. Zip-bomb uncompressed size limit
+    normal_xlsx = tmp_path / "bomb.xlsx"
+    wb = openpyxl.Workbook()
+    wb.active.append(["A", "B"])
+    wb.active.append(["X" * 2000, "Y" * 2000])
+    wb.save(normal_xlsx)
+    monkeypatch.setattr(doc_reader, "MAX_OFFICE_UNCOMPRESSED_BYTES", 512)
+    with pytest.raises(ValueError, match="压缩炸弹|解压后体积"):
+        read_excel_tables(normal_xlsx)
+
+
+def test_word_nested_tables_header_row_and_info(tmp_path: Path):
+    docx_path = tmp_path / "nested.docx"
+    doc = docx.Document()
+    outer = doc.add_table(rows=3, cols=2)
+    outer.cell(0, 0).text = "报表标题"
+    outer.cell(1, 0).text = "编号"
+    outer.cell(1, 1).text = "详情"
+    outer.cell(2, 0).text = "OUT-001"
+    outer.cell(2, 1).text = "外层内容"
+
+    # Nested table inside cell (2, 1)
+    inner = outer.cell(2, 1).add_table(rows=2, cols=2)
+    inner.cell(0, 0).text = "子项"
+    inner.cell(0, 1).text = "编码"
+    inner.cell(1, 0).text = "附件1"
+    inner.cell(1, 1).text = "INN-009"
+    doc.save(docx_path)
+
+    # Default excludes nested tables
+    default_tbls = read_word_tables(docx_path)
+    assert len(default_tbls) == 1
+
+    # include_nested_tables=True extracts both outer and nested table
+    with_nested = load_tables_from_file(docx_path, include_nested_tables=True)
+    assert len(with_nested) == 2
+    assert with_nested[1].sheet_name == "表格1.1"
+    assert with_nested[1].headers == ["子项", "编码"]
+    assert with_nested[1].rows == [["附件1", "INN-009"]]
+
+    # header_row=1 on outer table
+    hdr1 = read_word_tables(docx_path, header_row=1)
+    assert hdr1[0].headers == ["编号", "详情"]
+    assert hdr1[0].rows[0][0] == "OUT-001"
+
+    info = list_word_tables_info(docx_path, include_nested_tables=True)
+    assert [item["label"] for item in info] == ["表格1", "表格1.1"]
+
+
+def test_csv_large_field_utf32_bom_corrupt_bom_and_header_row(tmp_path: Path):
+    # > 128 KB single cell must not raise _csv.Error
+    big_csv = tmp_path / "big_cell.csv"
+    big_val = "A" * 200_000
+    big_csv.write_text(f"标题行\n编码,内容\nABC-001,{big_val}\n", encoding="utf-8")
+    tbl = read_csv_table(big_csv, header_row=1)
+    assert tbl.headers == ["编码", "内容"]
+    assert tbl.rows[0][0] == "ABC-001"
+    assert len(tbl.rows[0][1]) == 200_000
+
+    # UTF-32LE BOM decodes cleanly without \x00 garbling
+    u32_csv = tmp_path / "u32.csv"
+    u32_csv.write_bytes("col1,col2\nABC-001,测试\n".encode("utf-32"))
+    tbl32 = read_csv_table(u32_csv)
+    assert tbl32.headers == ["col1", "col2"]
+    assert tbl32.rows == [["ABC-001", "测试"]]
+
+    # Corrupt bytes after UTF-8-SIG BOM do not raise UnicodeDecodeError
+    bad_bom = tmp_path / "corrupt_bom.csv"
+    bad_bom.write_bytes(b"\xef\xbb\xbfcol1,col2\n\xff\xfe,ok\n")
+    tbl_bad = read_csv_table(bad_bom)
+    assert tbl_bad.headers == ["col1", "col2"]
+    assert tbl_bad.row_count == 1
