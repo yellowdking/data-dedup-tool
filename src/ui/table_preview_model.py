@@ -1,12 +1,14 @@
 """High-performance virtualized table model for dynamic-column DataTable views.
 
 Supports arbitrary headers/rows, instant substring search filtering,
-numeric-aware column sorting, and semantic row tinting adapted for both
-Light and Dark themes.
+finite numeric-aware column sorting with persistent selection preservation,
+and theme-cached semantic row tinting adapted for both Light and Dark themes.
 """
 
 from __future__ import annotations
 
+import math
+import re
 from typing import TYPE_CHECKING, Any, Optional
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
@@ -24,7 +26,6 @@ _LIGHT_ROW_TINTS: dict[str, str] = {
     "intersection": "#DCFCE7",
     "dropped": "#FEE2E2",
     "info": "#DBEAFE",
-    "group_alt": "#F8FAFC",
 }
 
 _DARK_ROW_TINTS: dict[str, str] = {
@@ -34,7 +35,6 @@ _DARK_ROW_TINTS: dict[str, str] = {
     "intersection": "#0B3B2C",
     "dropped": "#3F1219",
     "info": "#172E54",
-    "group_alt": "#1A2538",
 }
 
 _LIGHT_KEY_FG: dict[str, str] = {
@@ -57,23 +57,44 @@ _DARK_KEY_FG: dict[str, str] = {
     "default": "#60A5FA",
 }
 
+# Fast numeric validators rejecting NaN, Inf, malformed commas (e.g. ",123"), and plain text
+_RE_PLAIN_NUM = re.compile(r"^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$")
+_RE_COMMA_NUM = re.compile(r"^[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?$")
+
 
 def _try_float(text: str) -> Optional[float]:
-    """Attempt fast numeric parse for natural column sorting."""
+    """Attempt fast, finite numeric parse for natural column sorting.
+
+    Rejects NaN/Inf, malformed thousand-separators, and leading-zero IDs like "00123".
+    """
     s = text.strip()
     if not s:
         return None
-    # Reject strings with leading zeros like "00123" so IDs sort lexicographically
-    if len(s) > 1 and s[0] == "0" and s[1].isdigit():
+    first = s[0]
+    if first not in "0123456789+-.":
         return None
+    # Reject strings with leading zeros like "00123" so IDs sort lexicographically
+    if len(s) > 1 and first == "0" and s[1].isdigit():
+        return None
+    if "," in s:
+        if not _RE_COMMA_NUM.match(s):
+            return None
+        num_str = s.replace(",", "")
+    else:
+        if not _RE_PLAIN_NUM.match(s):
+            return None
+        num_str = s
     try:
-        return float(s.replace(",", ""))
+        val = float(num_str)
     except ValueError:
         return None
+    if not math.isfinite(val):
+        return None
+    return val
 
 
 def _sort_key_for_cell(val: str) -> tuple[int, Any]:
-    """Produce a comparable tuple sorting numbers before text and blanks last."""
+    """Produce a comparable tuple sorting finite numbers before text and blanks last."""
     s = val.strip()
     if not s or s == "-":
         return (2, "")
@@ -108,6 +129,20 @@ class DynamicTableModel(QAbstractTableModel):
         self._mono_font = QFont("Consolas", 10)
         self._mono_font.setBold(True)
 
+        self._bg_brushes: dict[str, QBrush] = {}
+        self._fg_brushes: dict[str, QBrush] = {}
+        self._rebuild_theme_brushes()
+
+    # ------------------------------------------------------------------
+    # Theme brush cache
+    # ------------------------------------------------------------------
+
+    def _rebuild_theme_brushes(self) -> None:
+        bg_palette = _DARK_ROW_TINTS if self._theme == "dark" else _LIGHT_ROW_TINTS
+        fg_palette = _DARK_KEY_FG if self._theme == "dark" else _LIGHT_KEY_FG
+        self._bg_brushes = {k: QBrush(QColor(v)) for k, v in bg_palette.items()}
+        self._fg_brushes = {k: QBrush(QColor(v)) for k, v in fg_palette.items()}
+
     # ------------------------------------------------------------------
     # Data population & configuration
     # ------------------------------------------------------------------
@@ -118,6 +153,7 @@ class DynamicTableModel(QAbstractTableModel):
         if normalized == self._theme:
             return
         self._theme = normalized
+        self._rebuild_theme_brushes()
         if self._visible_indices and self._headers:
             top_left = self.index(0, 0)
             bottom_right = self.index(len(self._visible_indices) - 1, len(self._headers) - 1)
@@ -134,6 +170,8 @@ class DynamicTableModel(QAbstractTableModel):
         highlight_columns: Optional[set[int]] = None,
         mono_columns: Optional[set[int]] = None,
         center_columns: Optional[set[int]] = None,
+        *,
+        reset_filter: bool = True,
     ) -> None:
         """Bind a DataTable object (or None to clear)."""
         if table is None:
@@ -146,6 +184,7 @@ class DynamicTableModel(QAbstractTableModel):
             highlight_columns=highlight_columns,
             mono_columns=mono_columns,
             center_columns=center_columns,
+            reset_filter=reset_filter,
         )
 
     def set_data(
@@ -156,19 +195,25 @@ class DynamicTableModel(QAbstractTableModel):
         highlight_columns: Optional[set[int]] = None,
         mono_columns: Optional[set[int]] = None,
         center_columns: Optional[set[int]] = None,
+        *,
+        reset_filter: bool = True,
     ) -> None:
         """Populate model with arbitrary headers and rows."""
         self.beginResetModel()
         col_count = len(headers)
-        self._headers = [str(h) for h in headers]
+        self._headers = [h if isinstance(h, str) else str(h) for h in headers]
         normalized_rows: list[list[str]] = []
         search_cache: list[str] = []
 
         for raw_row in rows:
-            cells = ["" if v is None else str(v) for v in raw_row]
-            if len(cells) < col_count:
-                cells.extend([""] * (col_count - len(cells)))
-            elif len(cells) > col_count and col_count > 0:
+            cells = [
+                "" if v is None else (v if isinstance(v, str) else str(v))
+                for v in raw_row
+            ]
+            n_cells = len(cells)
+            if n_cells < col_count:
+                cells.extend([""] * (col_count - n_cells))
+            elif n_cells > col_count and col_count > 0:
                 cells = cells[:col_count]
             normalized_rows.append(cells)
             search_cache.append("\x1f".join(cells).lower())
@@ -180,21 +225,26 @@ class DynamicTableModel(QAbstractTableModel):
         self._mono_columns = set(mono_columns) if mono_columns else set()
         self._center_columns = set(center_columns) if center_columns else set()
         self._sort_col = -1
+        self._sort_order = Qt.SortOrder.AscendingOrder
+        if reset_filter:
+            self._filter_query = ""
         self._rebuild_visible_indices()
         self.endResetModel()
 
     def clear(self) -> None:
-        """Reset model to empty state."""
+        """Reset model to empty state, including active filter and sort state."""
         self.beginResetModel()
         self._headers = []
         self._rows = []
         self._search_cache = []
         self._visible_indices = []
+        self._filter_query = ""
         self._row_tints = {}
         self._highlight_columns = set()
         self._mono_columns = set()
         self._center_columns = set()
         self._sort_col = -1
+        self._sort_order = Qt.SortOrder.AscendingOrder
         self.endResetModel()
 
     def set_highlighted_rows(self, row_tints: dict[int, str]) -> None:
@@ -217,9 +267,12 @@ class DynamicTableModel(QAbstractTableModel):
         self._filter_query = cleaned
         self.beginResetModel()
         self._rebuild_visible_indices()
-        if self._sort_col >= 0 and self._sort_col < len(self._headers):
+        if 0 <= self._sort_col < len(self._headers):
             self._apply_sort_in_place(self._sort_col, self._sort_order)
         self.endResetModel()
+
+    def filter_query(self) -> str:
+        return self._filter_query
 
     def _rebuild_visible_indices(self) -> None:
         if not self._filter_query:
@@ -258,6 +311,13 @@ class DynamicTableModel(QAbstractTableModel):
         if 0 <= view_row < len(self._visible_indices):
             return self._visible_indices[view_row]
         return -1
+
+    def find_view_row_for_original(self, orig_row: int) -> int:
+        """Locate the current visible row index for a 0-based original row index."""
+        try:
+            return self._visible_indices.index(orig_row)
+        except ValueError:
+            return -1
 
     def row_values(self, view_row: int) -> list[str]:
         orig = self.original_row_index(view_row)
@@ -333,18 +393,13 @@ class DynamicTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.BackgroundRole:
             tone = self._row_tints.get(orig_row)
             if tone:
-                palette = _DARK_ROW_TINTS if self._theme == "dark" else _LIGHT_ROW_TINTS
-                hex_color = palette.get(tone)
-                if hex_color:
-                    return QBrush(QColor(hex_color))
+                return self._bg_brushes.get(tone)
             return None
 
         if role == Qt.ItemDataRole.ForegroundRole:
             if col in self._highlight_columns and value and value != "-":
                 tone = self._row_tints.get(orig_row, "default")
-                fg_palette = _DARK_KEY_FG if self._theme == "dark" else _LIGHT_KEY_FG
-                hex_fg = fg_palette.get(tone, fg_palette["default"])
-                return QBrush(QColor(hex_fg))
+                return self._fg_brushes.get(tone, self._fg_brushes.get("default"))
             return None
 
         if role == Qt.ItemDataRole.ToolTipRole:
@@ -359,13 +414,60 @@ class DynamicTableModel(QAbstractTableModel):
         column: int,
         order: Qt.SortOrder = Qt.SortOrder.AscendingOrder,
     ) -> None:
-        if not (0 <= column < len(self._headers)) or not self._visible_indices:
+        if not self._visible_indices:
+            self._sort_col = -1
             return
+        if column < 0:
+            self._sort_col = -1
+            self._sort_order = Qt.SortOrder.AscendingOrder
+            old_persistent = self.persistentIndexList()
+            old_origs = [
+                (self._visible_indices[idx.row()], idx.column())
+                if 0 <= idx.row() < len(self._visible_indices)
+                else (-1, -1)
+                for idx in old_persistent
+            ]
+            self.layoutAboutToBeChanged.emit()
+            self._rebuild_visible_indices()
+            self._remake_persistent_indices(old_persistent, old_origs)
+            self.layoutChanged.emit()
+            return
+
+        if column >= len(self._headers):
+            return
+
         self._sort_col = column
         self._sort_order = order
+
+        old_persistent = self.persistentIndexList()
+        old_origs = [
+            (self._visible_indices[idx.row()], idx.column())
+            if 0 <= idx.row() < len(self._visible_indices)
+            else (-1, -1)
+            for idx in old_persistent
+        ]
+
         self.layoutAboutToBeChanged.emit()
         self._apply_sort_in_place(column, order)
+        self._remake_persistent_indices(old_persistent, old_origs)
         self.layoutChanged.emit()
+
+    def _remake_persistent_indices(
+        self,
+        old_persistent: list[QModelIndex],
+        old_origs: list[tuple[int, int]],
+    ) -> None:
+        if not old_persistent:
+            return
+        orig_to_new = {orig: new_pos for new_pos, orig in enumerate(self._visible_indices)}
+        new_persistent: list[QModelIndex] = []
+        for orig_row, col in old_origs:
+            new_row = orig_to_new.get(orig_row, -1)
+            if new_row >= 0 and 0 <= col < len(self._headers):
+                new_persistent.append(self.index(new_row, col))
+            else:
+                new_persistent.append(QModelIndex())
+        self.changePersistentIndexList(old_persistent, new_persistent)
 
     def _apply_sort_in_place(self, column: int, order: Qt.SortOrder) -> None:
         reverse = order == Qt.SortOrder.DescendingOrder
