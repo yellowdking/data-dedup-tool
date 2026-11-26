@@ -9,93 +9,112 @@ from __future__ import annotations
 
 import csv
 import io
-import math
+import xml.etree.ElementTree as ET
 import zipfile
-from datetime import date, datetime, time
-from decimal import Decimal
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
+from .io_utils import (
+    decode_bytes_auto as _decode_bytes_auto,
+    format_cell_value as _format_cell_value,
+)
 from .table_data import DataTable, generate_table_id
 
-# Encodings attempted when reading CSV/TSV/TXT files without explicit BOM.
-_CANDIDATE_ENCODINGS: tuple[str, ...] = (
-    "utf-8-sig",
-    "utf-8",
-    "gb18030",
-    "big5",
-    "cp932",
-    "utf-16",
+try:
+    from lxml.etree import XMLSyntaxError as _LxmlSyntaxError
+except Exception:  # pragma: no cover - optional when lxml is absent
+    _LxmlSyntaxError = None  # type: ignore[assignment]
+
+_XML_PARSE_ERRORS: tuple[type[BaseException], ...] = (
+    (ET.ParseError, _LxmlSyntaxError) if _LxmlSyntaxError is not None else (ET.ParseError,)
 )
 
 SUPPORTED_TABLE_EXTENSIONS: frozenset[str] = frozenset(
     {".xlsx", ".xlsm", ".docx", ".csv", ".tsv", ".efu", ".txt", ".log"}
 )
 
-
-def _decode_bytes_auto(raw_bytes: bytes) -> tuple[str, str]:
-    """Decode raw bytes by checking BOM first and trying common Windows/CJK encodings."""
-    if not raw_bytes:
-        return "", "utf-8"
-
-    if raw_bytes.startswith(b"\xff\xfe") or raw_bytes.startswith(b"\xfe\xff"):
-        return raw_bytes.decode("utf-16"), "utf-16"
-    if raw_bytes.startswith(b"\xef\xbb\xbf"):
-        return raw_bytes.decode("utf-8-sig"), "utf-8-sig"
-
-    for enc in _CANDIDATE_ENCODINGS:
-        if enc in ("utf-8-sig", "utf-16"):
-            continue
-        try:
-            return raw_bytes.decode(enc), enc
-        except UnicodeDecodeError:
-            continue
-
-    return raw_bytes.decode("utf-8", errors="replace"), "utf-8-replace"
+# Safety limits against abnormally huge files or OOXML zip-bomb archives.
+MAX_OFFICE_FILE_BYTES: int = 150 * 1024 * 1024
+MAX_OFFICE_UNCOMPRESSED_BYTES: int = 500 * 1024 * 1024
+MAX_TEXT_TABLE_FILE_BYTES: int = 200 * 1024 * 1024
+_CSV_SAFE_FIELD_LIMIT: int = 10 * 1024 * 1024
+_OLE2_MAGIC: bytes = b"\xd0\xcf\x11\xe0"
 
 
-def _format_cell_value(value: Any) -> str:
-    """Convert an openpyxl/Python cell value into a clean display string.
+def _ensure_csv_field_size_limit() -> None:
+    """Safely raise Python's csv field size limit above the 128 KB default."""
+    try:
+        if csv.field_size_limit() < _CSV_SAFE_FIELD_LIMIT:
+            csv.field_size_limit(_CSV_SAFE_FIELD_LIMIT)
+    except (OverflowError, ValueError):  # pragma: no cover - 32-bit safeguard
+        pass
 
-    - Converts whole-number floats such as ``12345.0`` to ``"12345"`` without
-      altering real decimals like ``3.14``.
-    - Formats date/datetime/time objects consistently.
-    - Normalizes line endings and trims outer whitespace.
+
+def _check_office_zip_safety(path: Path, label: str) -> bool:
+    """Validate file size, encrypted OLE2 header, and decompressed zip-bomb limits.
+
+    Returns ``True`` if the archive contains worksheet XML formula tags (``<f``),
+    allowing Excel readers to skip uncached-formula scanning on formula-free files.
     """
-    if value is None:
-        return ""
-    if isinstance(value, bool):
-        return "TRUE" if value else "FALSE"
-    if isinstance(value, int):
-        return str(value)
-    if isinstance(value, float):
-        if math.isnan(value) or math.isinf(value):
-            return ""
-        if value.is_integer():
-            return str(int(value))
-        return str(value)
-    if isinstance(value, Decimal):
-        if value.is_nan() or value.is_infinite():
-            return ""
-        if value == value.to_integral_value():
-            return str(int(value))
-        return format(value.normalize(), "f")
-    if isinstance(value, datetime):
-        if (
-            value.hour == 0
-            and value.minute == 0
-            and value.second == 0
-            and value.microsecond == 0
-        ):
-            return value.strftime("%Y-%m-%d")
-        return value.strftime("%Y-%m-%d %H:%M:%S")
-    if isinstance(value, date):
-        return value.strftime("%Y-%m-%d")
-    if isinstance(value, time):
-        return value.strftime("%H:%M:%S")
+    try:
+        file_size = path.stat().st_size
+    except OSError as exc:
+        raise ValueError(f"无法读取 {label} 文件「{path.name}」：{exc}") from exc
 
-    text = str(value).replace("\r\n", "\n").replace("\r", "\n")
-    return text.strip()
+    if file_size > MAX_OFFICE_FILE_BYTES:
+        limit_mb = MAX_OFFICE_FILE_BYTES // (1024 * 1024)
+        raise ValueError(
+            f"{label} 文件「{path.name}」体积过大（超过 {limit_mb} MB 安全上限），已中止读取。"
+        )
+
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(8)
+    except OSError as exc:
+        raise ValueError(f"无法读取 {label} 文件「{path.name}」：{exc}") from exc
+
+    if head.startswith(_OLE2_MAGIC):
+        raise ValueError(
+            f"{label} 文件「{path.name}」已启用密码加密保护或为旧版二进制格式，"
+            "请先解除密码并另存为标准未加密格式后重试。"
+        )
+
+    has_formula_tag = False
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            total_uncompressed = 0
+            for info in zf.infolist():
+                total_uncompressed += max(0, int(info.file_size))
+                if total_uncompressed > MAX_OFFICE_UNCOMPRESSED_BYTES:
+                    limit_mb = MAX_OFFICE_UNCOMPRESSED_BYTES // (1024 * 1024)
+                    raise ValueError(
+                        f"{label} 文件「{path.name}」解压后体积超过安全上限（{limit_mb} MB），"
+                        "疑似异常膨胀或压缩炸弹，已拒绝读取。"
+                    )
+            if label == "Excel":
+                for info in zf.infolist():
+                    lower_name = info.filename.lower()
+                    if lower_name.startswith("xl/worksheets/") and lower_name.endswith(".xml"):
+                        # Stream-check in chunks for <f> / <f ...> formula tags.
+                        with zf.open(info, "r") as sheet_fh:
+                            prev = b""
+                            while True:
+                                chunk = sheet_fh.read(65536)
+                                if not chunk:
+                                    break
+                                window = prev + chunk
+                                if b"<f>" in window or b"<f " in window:
+                                    has_formula_tag = True
+                                    break
+                                prev = chunk[-4:]
+                        if has_formula_tag:
+                            break
+    except ValueError:
+        raise
+    except (zipfile.BadZipFile, OSError, EOFError, KeyError) as exc:
+        raise ValueError(f"无法读取 {label} 文件「{path.name}」：{exc}") from exc
+
+    return has_formula_tag
 
 
 def _make_unique_headers(raw_headers: Sequence[str], col_count: int) -> list[str]:
@@ -169,19 +188,29 @@ def _matrix_to_headers_and_rows(
     matrix: list[list[str]],
     *,
     has_header: bool = True,
+    header_row: int = 0,
     single_row_as_data: bool = False,
 ) -> tuple[list[str], list[list[str]]]:
-    """Split a trimmed 2D string matrix into normalized `(headers, data_rows)`."""
+    """Split a trimmed 2D string matrix into normalized `(headers, data_rows)`.
+
+    ``header_row`` is a 0-based index into ``matrix`` (default ``0``, i.e. the
+    first non-empty row). Rows preceding ``header_row`` (such as merged title
+    banners) are skipped cleanly.
+    """
     if not matrix:
         return [], []
 
-    col_count = max(len(r) for r in matrix)
-    if not has_header or (single_row_as_data and len(matrix) == 1):
-        headers = _make_unique_headers([], col_count)
-        return headers, matrix
+    hdr_idx = max(0, int(header_row))
+    if hdr_idx >= len(matrix):
+        return [], []
 
-    headers = _make_unique_headers(matrix[0], col_count)
-    return headers, matrix[1:]
+    col_count = max(len(r) for r in matrix)
+    if not has_header or (single_row_as_data and hdr_idx == 0 and len(matrix) == 1):
+        headers = _make_unique_headers([], col_count)
+        return headers, matrix[hdr_idx:]
+
+    headers = _make_unique_headers(matrix[hdr_idx], col_count)
+    return headers, matrix[hdr_idx + 1 :]
 
 
 # ---------------------------------------------------------------------------
@@ -201,18 +230,55 @@ def _validate_excel_path(path: Path) -> None:
         raise ValueError(f"不支持的 Excel 扩展名「{ext}」，请提供 .xlsx 或 .xlsm 文件。")
 
 
-def _load_openpyxl_workbook(path: Path, *, read_only: bool = False):
+def _load_openpyxl_workbook(
+    path: Path,
+    *,
+    read_only: bool = False,
+    data_only: bool = True,
+    check_safety: bool = True,
+):
     import openpyxl
     from openpyxl.utils.exceptions import InvalidFileException
+
+    if check_safety:
+        _check_office_zip_safety(path, "Excel")
 
     try:
         return openpyxl.load_workbook(
             filename=str(path),
             read_only=read_only,
-            data_only=True,
+            data_only=data_only,
         )
-    except (InvalidFileException, zipfile.BadZipFile, OSError, ValueError) as exc:
+    except (
+        InvalidFileException,
+        zipfile.BadZipFile,
+        KeyError,
+        OSError,
+        ValueError,
+        EOFError,
+        *_XML_PARSE_ERRORS,
+    ) as exc:
         raise ValueError(f"无法读取 Excel 文件「{path.name}」：{exc}") from exc
+
+
+def _is_formula_cell_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.startswith("=")
+    cls_name = type(value).__name__
+    return cls_name in ("ArrayFormula", "DataTableFormula")
+
+
+def _count_uncached_formulas(ws_values: Any, ws_formulas: Any) -> int:
+    """Count cells where a formula exists in ``ws_formulas`` but cached value is None."""
+    count = 0
+    for val_row, form_row in zip(
+        ws_values.iter_rows(values_only=True),
+        ws_formulas.iter_rows(values_only=True),
+    ):
+        for v_cell, f_cell in zip(val_row, form_row):
+            if v_cell is None and _is_formula_cell_value(f_cell):
+                count += 1
+    return count
 
 
 def list_excel_sheets(path: Union[str, Path]) -> list[str]:
@@ -226,7 +292,7 @@ def list_excel_sheets(path: Union[str, Path]) -> list[str]:
         wb.close()
 
 
-def _extract_sheet_matrix(ws) -> list[list[str]]:
+def _extract_sheet_matrix(ws: Any) -> list[list[str]]:
     """Read an openpyxl worksheet into a 2D list of formatted strings.
 
     Propagates values for single-column vertical merges in data rows so
@@ -259,12 +325,23 @@ def read_excel_tables(
     path: Union[str, Path],
     sheet_names: Optional[Sequence[str]] = None,
     has_header: bool = True,
+    header_row: int = 0,
 ) -> list[DataTable]:
     """Load one or more worksheets from an `.xlsx`/`.xlsm` workbook into `DataTable`s."""
     file_path = Path(path)
     _validate_excel_path(file_path)
+    has_formulas = _check_office_zip_safety(file_path, "Excel")
 
-    wb = _load_openpyxl_workbook(file_path, read_only=False)
+    wb = _load_openpyxl_workbook(
+        file_path, read_only=False, data_only=True, check_safety=False
+    )
+    wb_formulas = (
+        _load_openpyxl_workbook(
+            file_path, read_only=True, data_only=False, check_safety=False
+        )
+        if has_formulas
+        else None
+    )
     tables: list[DataTable] = []
     try:
         available = list(wb.sheetnames)
@@ -281,6 +358,10 @@ def read_excel_tables(
 
         for sheet_name in target_sheets:
             ws = wb[sheet_name]
+            uncached_count = 0
+            if wb_formulas is not None and sheet_name in wb_formulas.sheetnames:
+                uncached_count = _count_uncached_formulas(ws, wb_formulas[sheet_name])
+
             raw_matrix = _extract_sheet_matrix(ws)
             trimmed = _trim_matrix(raw_matrix)
             if not trimmed:
@@ -289,8 +370,12 @@ def read_excel_tables(
             headers, rows = _matrix_to_headers_and_rows(
                 trimmed,
                 has_header=has_header,
+                header_row=header_row,
                 single_row_as_data=False,
             )
+            if not headers and not rows:
+                continue
+
             table_name = f"{file_path.stem} - {sheet_name}"
             tables.append(
                 DataTable(
@@ -305,11 +390,19 @@ def read_excel_tables(
                         "file_name": file_path.name,
                         "sheet_name": sheet_name,
                         "has_header": has_header,
+                        "header_row": max(0, int(header_row)),
+                        "uncached_formula_count": uncached_count,
                     },
                 )
             )
+    except ValueError:
+        raise
+    except (zipfile.BadZipFile, KeyError, OSError, EOFError, *_XML_PARSE_ERRORS) as exc:
+        raise ValueError(f"无法读取 Excel 文件「{file_path.name}」：{exc}") from exc
     finally:
         wb.close()
+        if wb_formulas is not None:
+            wb_formulas.close()
 
     return tables
 
@@ -320,15 +413,15 @@ def extract_excel_text_items(
 ) -> list[dict[str, Any]]:
     """Extract non-empty rows/cells from an Excel workbook with `工作表名 行R` locators.
 
-    Designed for document-level code scanning in `scanner.py`. Multi-line cells
-    in single-cell rows are emitted line-by-line to preserve per-line context;
+    Uses ``read_only=True`` streaming mode for low memory footprint on large
+    workbooks. Multi-line cells in single-cell rows are emitted line-by-line;
     multi-column rows are joined cleanly with ``" | "`` while keeping raw cell
     values in ``cells``.
     """
     file_path = Path(path)
     _validate_excel_path(file_path)
 
-    wb = _load_openpyxl_workbook(file_path, read_only=False)
+    wb = _load_openpyxl_workbook(file_path, read_only=True, data_only=True)
     items: list[dict[str, Any]] = []
     try:
         available = list(wb.sheetnames)
@@ -378,6 +471,10 @@ def extract_excel_text_items(
                             "source_type": "excel",
                         }
                     )
+    except ValueError:
+        raise
+    except (zipfile.BadZipFile, KeyError, OSError, EOFError, *_XML_PARSE_ERRORS) as exc:
+        raise ValueError(f"无法读取 Excel 文件「{file_path.name}」：{exc}") from exc
     finally:
         wb.close()
 
@@ -401,13 +498,22 @@ def _validate_word_path(path: Path) -> None:
         raise ValueError(f"不支持的 Word 扩展名「{ext}」，请提供 .docx 文件。")
 
 
-def _load_docx_document(path: Path):
+def _load_docx_document(path: Path) -> Any:
     import docx
     from docx.opc.exceptions import PackageNotFoundError
 
+    _check_office_zip_safety(path, "Word")
     try:
         return docx.Document(str(path))
-    except (PackageNotFoundError, zipfile.BadZipFile, OSError, ValueError) as exc:
+    except (
+        PackageNotFoundError,
+        zipfile.BadZipFile,
+        KeyError,
+        OSError,
+        ValueError,
+        EOFError,
+        *_XML_PARSE_ERRORS,
+    ) as exc:
         raise ValueError(f"无法读取 Word 文件「{path.name}」：{exc}") from exc
 
 
@@ -416,7 +522,7 @@ def _clean_word_text(text: str) -> str:
     return str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
-def _extract_word_table_matrix(table) -> list[list[str]]:
+def _extract_word_table_matrix(table: Any) -> list[list[str]]:
     """Convert a `python-docx` Table into a 2D matrix with merged-cell handling.
 
     Horizontally merged cells within the same row emit their value once in the
@@ -439,73 +545,159 @@ def _extract_word_table_matrix(table) -> list[list[str]]:
     return matrix
 
 
+def _iter_word_tables(
+    word_table: Any,
+    label: str,
+    top_index: int,
+    *,
+    include_nested: bool = False,
+) -> list[tuple[int, str, Any]]:
+    """Collect a Word table and optionally its nested sub-tables in document order."""
+    collected: list[tuple[int, str, Any]] = [(top_index, label, word_table)]
+    if not include_nested:
+        return collected
+    seen_tcs: set[Any] = set()
+    nested_counter = 0
+    for row in word_table.rows:
+        for cell in row.cells:
+            tc = cell._tc
+            if tc in seen_tcs:
+                continue
+            seen_tcs.add(tc)
+            for nested_tbl in cell.tables:
+                nested_counter += 1
+                collected.extend(
+                    _iter_word_tables(
+                        nested_tbl,
+                        f"{label}.{nested_counter}",
+                        top_index,
+                        include_nested=True,
+                    )
+                )
+    return collected
+
+
+def list_word_tables_info(
+    path: Union[str, Path],
+    *,
+    include_nested_tables: bool = False,
+) -> list[dict[str, Any]]:
+    """Return lightweight metadata for embedded tables in a ``.docx`` document."""
+    file_path = Path(path)
+    _validate_word_path(file_path)
+    doc = _load_docx_document(file_path)
+    infos: list[dict[str, Any]] = []
+    for tbl_idx, word_table in enumerate(doc.tables, start=1):
+        for top_idx, label, tbl_obj in _iter_word_tables(
+            word_table, f"表格{tbl_idx}", tbl_idx, include_nested=include_nested_tables
+        ):
+            trimmed = _trim_matrix(_extract_word_table_matrix(tbl_obj))
+            if not trimmed:
+                continue
+            preview = " | ".join(c for c in trimmed[0][:4] if c)[:80]
+            infos.append(
+                {
+                    "index": top_idx,
+                    "label": label,
+                    "rows": len(trimmed),
+                    "cols": max(len(r) for r in trimmed),
+                    "preview": preview,
+                }
+            )
+    return infos
+
+
 def read_word_tables(
     path: Union[str, Path],
     include_paragraphs_as_table: bool = False,
     has_header: bool = True,
+    header_row: int = 0,
+    include_nested_tables: bool = False,
+    table_indices: Optional[Sequence[int]] = None,
 ) -> list[DataTable]:
-    """Extract embedded tables (and optionally body paragraphs) from a `.docx` file."""
+    """Extract embedded tables (and optionally nested tables / body paragraphs) from `.docx`."""
     file_path = Path(path)
     _validate_word_path(file_path)
 
     doc = _load_docx_document(file_path)
     tables: list[DataTable] = []
+    allowed_indices: Optional[set[int]] = (
+        {int(i) for i in table_indices} if table_indices is not None else None
+    )
 
-    for tbl_idx, word_table in enumerate(doc.tables, start=1):
-        raw_matrix = _extract_word_table_matrix(word_table)
-        trimmed = _trim_matrix(raw_matrix)
-        if not trimmed:
-            continue
-
-        headers, rows = _matrix_to_headers_and_rows(
-            trimmed,
-            has_header=has_header,
-            single_row_as_data=True,
-        )
-        sheet_label = f"表格{tbl_idx}"
-        tables.append(
-            DataTable(
-                table_id=generate_table_id(),
-                name=f"{file_path.stem} - {sheet_label}",
-                headers=headers,
-                rows=rows,
-                source_path=str(file_path),
-                sheet_name=sheet_label,
-                source_type="word",
-                metadata={
-                    "file_name": file_path.name,
-                    "table_index": tbl_idx,
-                    "has_header": has_header,
-                },
-            )
-        )
-
-    if include_paragraphs_as_table or not tables:
-        para_rows: list[list[str]] = []
-        for para in doc.paragraphs:
-            cleaned = _clean_word_text(para.text)
-            if not cleaned:
+    try:
+        for tbl_idx, word_table in enumerate(doc.tables, start=1):
+            if allowed_indices is not None and tbl_idx not in allowed_indices:
                 continue
-            for line in cleaned.splitlines():
-                line_s = line.strip()
-                if line_s:
-                    para_rows.append([line_s])
-        if para_rows:
-            tables.append(
-                DataTable(
-                    table_id=generate_table_id(),
-                    name=f"{file_path.stem} - 正文段落",
-                    headers=["段落内容"],
-                    rows=para_rows,
-                    source_path=str(file_path),
-                    sheet_name="正文段落",
-                    source_type="word",
-                    metadata={
-                        "file_name": file_path.name,
-                        "kind": "paragraphs",
-                    },
+            for top_idx, sheet_label, tbl_obj in _iter_word_tables(
+                word_table,
+                f"表格{tbl_idx}",
+                tbl_idx,
+                include_nested=include_nested_tables,
+            ):
+                raw_matrix = _extract_word_table_matrix(tbl_obj)
+                trimmed = _trim_matrix(raw_matrix)
+                if not trimmed:
+                    continue
+
+                headers, rows = _matrix_to_headers_and_rows(
+                    trimmed,
+                    has_header=has_header,
+                    header_row=header_row,
+                    single_row_as_data=True,
                 )
-            )
+                if not headers and not rows:
+                    continue
+                tables.append(
+                    DataTable(
+                        table_id=generate_table_id(),
+                        name=f"{file_path.stem} - {sheet_label}",
+                        headers=headers,
+                        rows=rows,
+                        source_path=str(file_path),
+                        sheet_name=sheet_label,
+                        source_type="word",
+                        metadata={
+                            "file_name": file_path.name,
+                            "table_index": top_idx,
+                            "table_label": sheet_label,
+                            "has_header": has_header,
+                            "header_row": max(0, int(header_row)),
+                            "nested": "." in sheet_label,
+                        },
+                    )
+                )
+
+        if include_paragraphs_as_table or (not tables and allowed_indices is None):
+            para_rows: list[list[str]] = []
+            for para in doc.paragraphs:
+                cleaned = _clean_word_text(para.text)
+                if not cleaned:
+                    continue
+                for line in cleaned.splitlines():
+                    line_s = line.strip()
+                    if line_s:
+                        para_rows.append([line_s])
+            if para_rows:
+                tables.append(
+                    DataTable(
+                        table_id=generate_table_id(),
+                        name=f"{file_path.stem} - 正文段落",
+                        headers=["段落内容"],
+                        rows=para_rows,
+                        source_path=str(file_path),
+                        sheet_name="正文段落",
+                        source_type="word",
+                        metadata={
+                            "file_name": file_path.name,
+                            "kind": "paragraphs",
+                        },
+                    )
+                )
+    except ValueError:
+        raise
+    except (zipfile.BadZipFile, KeyError, OSError, EOFError, *_XML_PARSE_ERRORS) as exc:
+        raise ValueError(f"无法读取 Word 文件「{file_path.name}」：{exc}") from exc
 
     return tables
 
@@ -676,25 +868,41 @@ def read_csv_table(
     path: Union[str, Path],
     has_header: bool = True,
     delimiter: Optional[str] = None,
+    header_row: int = 0,
 ) -> DataTable:
     """Read a CSV/TSV/EFU file with automatic encoding and delimiter detection."""
     file_path = Path(path)
     if not file_path.is_file():
         raise FileNotFoundError(f"找不到 CSV 文件：{file_path}")
 
+    file_size = file_path.stat().st_size
+    if file_size > MAX_TEXT_TABLE_FILE_BYTES:
+        limit_mb = MAX_TEXT_TABLE_FILE_BYTES // (1024 * 1024)
+        raise ValueError(
+            f"CSV 文件「{file_path.name}」体积过大（超过 {limit_mb} MB 安全上限），已中止读取。"
+        )
+
     raw_bytes = file_path.read_bytes()
     text, encoding = _decode_bytes_auto(raw_bytes)
+    if "\x00" in text:
+        text = text.replace("\x00", "")
 
     default_delim = "\t" if file_path.suffix.lower() == ".tsv" else ","
     detected_delim = delimiter or _sniff_delimiter(text, default=default_delim)
 
-    reader = csv.reader(io.StringIO(text), delimiter=detected_delim)
-    raw_matrix = [[_format_cell_value(cell) for cell in row] for row in reader]
+    _ensure_csv_field_size_limit()
+    try:
+        reader = csv.reader(io.StringIO(text), delimiter=detected_delim)
+        raw_matrix = [[_format_cell_value(cell) for cell in row] for row in reader]
+    except csv.Error as exc:
+        raise ValueError(f"无法解析 CSV 文件「{file_path.name}」：{exc}") from exc
+
     trimmed = _trim_matrix(raw_matrix)
 
     headers, rows = _matrix_to_headers_and_rows(
         trimmed,
         has_header=has_header,
+        header_row=header_row,
         single_row_as_data=False,
     )
 
@@ -711,6 +919,7 @@ def read_csv_table(
             "encoding": encoding,
             "delimiter": detected_delim,
             "has_header": has_header,
+            "header_row": max(0, int(header_row)),
         },
     )
 
@@ -733,6 +942,13 @@ def read_txt_as_table(
     file_path = Path(path)
     if not file_path.is_file():
         raise FileNotFoundError(f"找不到文本文件：{file_path}")
+
+    file_size = file_path.stat().st_size
+    if file_size > MAX_TEXT_TABLE_FILE_BYTES:
+        limit_mb = MAX_TEXT_TABLE_FILE_BYTES // (1024 * 1024)
+        raise ValueError(
+            f"文本文件「{file_path.name}」体积过大（超过 {limit_mb} MB 安全上限），已中止读取。"
+        )
 
     if parser_engine is not None:
         from .scanner import scan_file
@@ -857,7 +1073,10 @@ def load_tables_from_file(
     *,
     sheet_names: Optional[Sequence[str]] = None,
     has_header: bool = True,
+    header_row: int = 0,
     include_paragraphs_as_table: bool = False,
+    include_nested_tables: bool = False,
+    table_indices: Optional[Sequence[int]] = None,
     parser_engine: Optional[Any] = None,
 ) -> list[DataTable]:
     """Dispatch a file by extension and return one or more normalized `DataTable`s.
@@ -875,6 +1094,7 @@ def load_tables_from_file(
             file_path,
             sheet_names=sheet_names,
             has_header=has_header,
+            header_row=header_row,
         )
     if ext == ".xls":
         raise ValueError(
@@ -885,13 +1105,22 @@ def load_tables_from_file(
             file_path,
             include_paragraphs_as_table=include_paragraphs_as_table,
             has_header=has_header,
+            header_row=header_row,
+            include_nested_tables=include_nested_tables,
+            table_indices=table_indices,
         )
     if ext == ".doc":
         raise ValueError(
             "暂不支持旧版 Word (.doc) 格式，请使用 Word 或 WPS 将文件另存为 .docx 格式后重试。"
         )
     if ext in {".csv", ".tsv", ".efu"}:
-        return [read_csv_table(file_path, has_header=has_header)]
+        return [
+            read_csv_table(
+                file_path,
+                has_header=has_header,
+                header_row=header_row,
+            )
+        ]
     if ext in {".txt", ".log"}:
         return [read_txt_as_table(file_path, parser_engine=parser_engine)]
 
