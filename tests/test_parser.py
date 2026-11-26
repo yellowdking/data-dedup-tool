@@ -594,3 +594,249 @@ def test_v11_mixed_office_row_keeps_real_code_only(parser: CodeParser) -> None:
     results = parser.parse_line(row_text)
     assert [r.canonical_code for r in results] == ["ABC-123"]
     assert "字幕" in results[0].tags
+
+
+# ---------------------------------------------------------------------------
+# 14. v1.2.0 Hardening: P0/P1 parser, normalizer, custom rules & neutrality
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "raw, expected_code",
+    [
+        ("ABC-123.cn.mp4", "ABC-123"),
+        ("ABC-123.jp.mkv", "ABC-123"),
+        ("ABC-123.tw.mp4", "ABC-123"),
+        ("ABC-123.pro.mp4", "ABC-123"),
+        ("ABC-123.vip.mp4", "ABC-123"),
+        ("ABC-123.tv.mp4", "ABC-123"),
+        ("ABC-123.live.mp4", "ABC-123"),
+        ("ABC-123.cc.mp4", "ABC-123"),
+        ("ABC-123.us.mp4", "ABC-123"),
+        ("ABC-123.info.mp4", "ABC-123"),
+        ("PRJ-0042.cn.mp4", "PRJ-0042"),
+        ("ABC123.cn.mp4", "ABC-123"),
+    ],
+)
+def test_v12_domain_cleaner_preserves_code_with_tld_like_suffix(
+    parser: CodeParser, raw: str, expected_code: str
+) -> None:
+    res = parser.parse_single(raw)
+    assert res.recognized is True
+    assert res.canonical_code == expected_code
+
+
+def test_v12_domain_cleaner_linear_time_no_redos() -> None:
+    import time
+
+    adversarial = "a." * 3000 + "zzz"
+    t0 = time.perf_counter()
+    _ = clean_text(adversarial)
+    elapsed = time.perf_counter() - t0
+    assert elapsed < 0.2, f"clean_text took {elapsed:.3f}s on adversarial input"
+
+
+@pytest.mark.parametrize(
+    "hyphenated, compact, expected",
+    [
+        ("PRJ-0042.mkv", "PRJ0042.mkv", "PRJ-0042"),
+        ("MD-0123.mp4", "MD0123.mp4", "MD-0123"),
+        ("SER-0001.mp4", "SER0001.mp4", "SER-0001"),
+    ],
+)
+def test_v12_four_digit_zero_padded_hyphenated_equals_compact(
+    parser: CodeParser, hyphenated: str, compact: str, expected: str
+) -> None:
+    r1 = parser.parse_single(hyphenated)
+    r2 = parser.parse_single(compact)
+    assert r1.canonical_code == expected
+    assert r2.canonical_code == expected
+
+
+def test_v12_repeated_and_multicode_preserve_tags_and_merge_parts(parser: CodeParser) -> None:
+    # Repeated code with trailing -C and [4K] keeps BOTH tags and emits 1 record.
+    r_rep_tags = parser.parse_line("[ABC-123] ABC-123-C [4K].mp4")
+    assert len(r_rep_tags) == 1
+    assert r_rep_tags[0].canonical_code == "ABC-123"
+    assert "4K" in r_rep_tags[0].tags
+    assert "字幕" in r_rep_tags[0].tags
+
+    # Repeated code with part on second occurrence emits 1 merged record.
+    r_rep_part = parser.parse_line("[ABC-123] ABC-123-CD1.mp4")
+    assert len(r_rep_part) == 1
+    assert r_rep_part[0].canonical_code == "ABC-123"
+    assert r_rep_part[0].part == "CD1"
+
+    # Distinct parts on same line stay separate.
+    r_two_parts = parser.parse_line("ABC-123-CD1 / ABC-123-CD2")
+    assert [(r.canonical_code, r.part) for r in r_two_parts] == [
+        ("ABC-123", "CD1"),
+        ("ABC-123", "CD2"),
+    ]
+
+    # Combined -CD1-C-U keeps BOTH 字幕 and 特殊版.
+    r_cu = parser.parse_single("ABC-123-CD1-C-U.mp4")
+    assert r_cu.canonical_code == "ABC-123"
+    assert r_cu.part == "CD1"
+    assert "字幕" in r_cu.tags
+    assert "特殊版" in r_cu.tags
+
+    # Multi-code line keeps per-code resolution & subtitle tags.
+    r_multi = parser.parse_line("ABC-123-C [4K] / DEF-456 [1080P]")
+    assert len(r_multi) == 2
+    assert r_multi[0].canonical_code == "ABC-123"
+    assert "4K" in r_multi[0].tags and "字幕" in r_multi[0].tags
+    assert r_multi[1].canonical_code == "DEF-456"
+    assert "FHD" in r_multi[1].tags
+
+
+@pytest.mark.parametrize(
+    "noise",
+    [
+        "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        "a1b2c3d4-1234-5678-90ab-cdef12345678",
+        "Backup_2024_05_12.zip",
+        "Report_2024_0512.docx",
+        "Summary 2024.docx",
+        "Office 2021.iso",
+        "May 2024",
+        "item-50kg.txt",
+        "width-120px.css",
+        "latency-100ms.log",
+        "HD.123.mp4",
+        "ISO-9001",
+        "MP4-001",
+        "MP3-320",
+        "app-v100.exe",
+    ],
+)
+def test_v12_uuid_date_year_unit_false_positive_rejection(
+    parser: CodeParser, noise: str
+) -> None:
+    res = parser.parse_single(noise)
+    assert res.recognized is False, f"Unexpected match {res.canonical_code!r} for {noise!r}"
+
+
+def test_v12_false_multipart_cpp_subtitle_and_cn_three_parts(parser: CodeParser) -> None:
+    for line in ("ABC-123 A Good Day.mp4", "ABC-123 Plan B.mp4", "ABC-123 E-book.mp4"):
+        res = parser.parse_single(line)
+        assert res.canonical_code == "ABC-123"
+        assert res.part == "", f"False part {res.part!r} for {line!r}"
+
+    p_up = parser.parse_single("ABC-123 上集.mp4").part
+    p_mid = parser.parse_single("ABC-123 中集.mp4").part
+    p_low = parser.parse_single("ABC-123 下集.mp4").part
+    assert p_up and p_mid and p_low
+    assert len({p_up, p_mid, p_low}) == 3
+
+    r_cpp = parser.parse_single("ABC-123 C++.mp4")
+    assert r_cpp.canonical_code == "ABC-123"
+    assert "字幕" not in r_cpp.tags
+
+
+def test_v12_alpha_sub_prefix_case_insensitive_and_unc_anchor_safe(parser: CodeParser) -> None:
+    assert parser.parse_single("Tokyo-n1287.mp4").canonical_code == "N1287"
+    assert parser.parse_single("tokyo-n1287.mp4").canonical_code == "N1287"
+    assert parser.parse_single("Batch-k1234.mp4").canonical_code == "K1234"
+    assert parser.parse_single("batch-k1234.mp4").canonical_code == "K1234"
+
+    # UNC share host name must NEVER leak into Stage 3 fallback.
+    for unc in ("//NAS-01/media/random.mp4", r"\\NAS-01\media\random.mp4"):
+        item = ScannedItem(raw_text="random.mp4", file_name="random.mp4", full_path=unc)
+        res = parser.parse_item(item)[0]
+        assert res.recognized is False
+
+    # Drive root must not become parent_dir, and parse_single preserves raw_text.
+    r_drive = parser.parse_single(r"D:\1.mp4")
+    assert r_drive.parent_dir == ""
+    r_rel = parser.parse_single("ABC-123/1.mp4")
+    assert r_rel.raw_text == "ABC-123/1.mp4"
+    assert r_rel.canonical_code == "ABC-123"
+
+
+def test_v12_parse_items_allows_narrowing_companion_extensions(parser: CodeParser) -> None:
+    items = [
+        ScannedItem(raw_text="cover.jpg", file_name="cover.jpg", file_ext=".jpg", is_companion=True),
+        ScannedItem(raw_text="ABC-123.txt", file_name="ABC-123.txt", file_ext=".txt", is_companion=True),
+    ]
+    # Narrowing companion_extensions to only `.jpg` must allow `.txt` through.
+    results = parser.parse_items(items, ignore_companions=True, companion_extensions={".jpg"})
+    assert [r.canonical_code for r in results] == ["ABC-123"]
+
+
+def test_v12_custom_rules_recovery_shadowing_redos_zerowidth_and_formatting(tmp_path: Path) -> None:
+    # 1. Corrupt JSON recovery
+    corrupt_path = tmp_path / "corrupt.json"
+    corrupt_path.write_text("{not valid json", encoding="utf-8")
+    reg_corrupt = RuleRegistry(corrupt_path)
+    assert reg_corrupt.get_custom_rules() == []
+    assert reg_corrupt.last_load_error != ""
+
+    # 2. Bad field types & legacy list format
+    bad_types_path = tmp_path / "legacy_list.json"
+    bad_types_path.write_text(
+        '[{"id": "c1", "name": "BadPrio", "pattern": "(ZZZ)-(\\\\d{3})", "priority": "abc"}]',
+        encoding="utf-8",
+    )
+    reg_legacy = RuleRegistry(bad_types_path)
+    assert len(reg_legacy.get_custom_rules()) == 1
+    assert reg_legacy.get_custom_rules()[0].priority == 5
+
+    # 3. Built-in ID shadowing blocked
+    reg = RuleRegistry()
+    with pytest.raises(ValueError, match="内置规则"):
+        reg.add_rule(CustomRule(id="builtin_standard_hyphen", name="Shadow", pattern=r"FOO-\d{3}"))
+
+    # 4. ReDoS nested-quantifier validation
+    ok_redos, err_redos = reg.validate_pattern(r"(a+)+")
+    assert ok_redos is False and "量词" in err_redos
+    ok_good, _ = reg.validate_pattern(r"(?P<prefix>ITEM)-(?P<number>\d{3,5})")
+    assert ok_good is True
+
+    # 5. Zero-width custom rule emits zero bogus matches
+    reg.add_rule(CustomRule(id="zw_rule", name="ZeroWidth", pattern=r"\d*", format_template="ID-{0}", priority=1))
+    p = CodeParser(reg)
+    r_zw = p.parse_single("纯中文无编码.mp4")
+    assert r_zw.recognized is False
+
+    # 6. Single-pass template substitution & multi-segment canonical split
+    import re as _re
+
+    r_tpl = CustomRule(id="tpl1", name="Tpl", pattern=r"(\{\d+\})_([A-Z]+)", format_template="{1}-{2}")
+    m_tpl = _re.search(r_tpl.pattern, "{2}_XYZ")
+    assert m_tpl is not None
+    canon, _, _ = RuleRegistry.format_custom_match(r_tpl, m_tpl)
+    assert canon == "{2}-XYZ"
+
+    r_multi = CustomRule(id="multi1", name="Multi", pattern=r"([A-Z]+-[A-Z]+-\d+)", format_template="{1}")
+    m_multi = _re.search(r_multi.pattern, "ABC-XY-001")
+    assert m_multi is not None
+    c_m, p_m, n_m = RuleRegistry.format_custom_match(r_multi, m_multi)
+    assert (c_m, p_m, n_m) == ("ABC-XY-001", "ABC-XY", "001")
+
+    # 7. update_rule & cache invalidation + save without path error
+    reg.delete_rule("zw_rule")
+    added = reg.add_rule(CustomRule(id="", name="Auto", pattern=r"ZZZ#(\d{3})", format_template="ZZZ-{1}", priority=1))
+    assert p.parse_single("ZZZ#007.mp4").canonical_code == "ZZZ-007"
+    reg.update_rule(CustomRule(id=added.id, name="Auto", pattern=r"YYY#(\d{3})", format_template="YYY-{1}", priority=1))
+    assert p.parse_single("YYY#008.mp4").canonical_code == "YYY-008"
+    with pytest.raises(ValueError):
+        reg.save_custom_rules()
+
+
+def test_v12_builtin_rules_ui_metadata_purely_synthetic_neutral(parser: CodeParser) -> None:
+    from src.core.rules import get_builtin_rules
+
+    forbidden_ui_tokens = ("FC2", "PPV", "H4610", "T28", "S2M", "4k2_")
+    for rule in get_builtin_rules():
+        blob = " ".join(
+            [rule.id, rule.name, rule.pattern, rule.format_template, rule.category, rule.description, rule.example]
+        )
+        for tok in forbidden_ui_tokens:
+            assert tok.lower() not in blob.lower(), f"Found non-synthetic token {tok!r} in rule {rule.id}: {blob}"
+
+    # Underlying engine MUST still recognize all real-world catalog formats.
+    assert parser.parse_single("FC2-PPV-1234567.mp4").canonical_code == "FC2-PPV-1234567"
+    assert parser.parse_single("FC2.PPV.1234567.mp4").canonical_code == "FC2-PPV-1234567"
+    assert parser.parse_single("H4610-KI1234.mp4").canonical_code == "H4610-KI1234"
+    assert parser.parse_single("T28-123.mp4").canonical_code == "T28-123"
+    assert parser.parse_single("S2M-001.mp4").canonical_code == "S2M-001"
+    assert parser.parse_single("4k2_cat00123.mp4").canonical_code == "CAT-123"
