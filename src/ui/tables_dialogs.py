@@ -10,7 +10,7 @@ import inspect
 from pathlib import Path
 from typing import Any, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -34,6 +34,23 @@ from PySide6.QtWidgets import (
 from src.core import doc_reader
 from src.core.doc_reader import list_excel_sheets, load_tables_from_file
 from src.core.table_data import DataTable
+from src.ui.delegates import apply_slim_scrollbars, enhance_table_view
+from src.ui.icons import get_icon
+from src.ui.proxy_style import AppProxyStyle
+
+
+def _detect_theme(widget: Optional[QWidget] = None) -> str:
+    cur = widget
+    while cur is not None:
+        t = getattr(getattr(getattr(cur, "ctx", None), "config", None), "theme", None)
+        if t in ("light", "dark"):
+            return str(t)
+        cur = cur.parentWidget()
+    app = QApplication.instance()
+    proxy = getattr(app, "_app_proxy_style", None) if app is not None else None
+    if isinstance(proxy, AppProxyStyle):
+        return proxy.theme()
+    return "light"
 
 
 def _escape_mnemonic(text: str) -> str:
@@ -127,6 +144,7 @@ class _PerTableKeyDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("配置各表关键列（支持有序多列组合键）")
         self.resize(680, 440)
+        self._theme = _detect_theme(parent)
         self._tables = list(tables)
         self._default_column = default_column
         self.was_cleared: bool = False
@@ -140,7 +158,6 @@ class _PerTableKeyDialog(QDialog):
         )
         self._slot_count = max(1, min(existing_max, self._max_slots))
 
-        # Working state: table_id -> list of selected column names per slot ("" means unused)
         self._slot_values: dict[str, list[str]] = {}
         for tbl in self._tables:
             existing = [c for c in current_mapping.get(tbl.table_id, []) if c in tbl.headers]
@@ -167,17 +184,20 @@ class _PerTableKeyDialog(QDialog):
         hint.setProperty("role", "subtitle")
         root.addWidget(hint)
 
-        # Slot toolbar
         slot_bar = QHBoxLayout()
         slot_bar.setSpacing(8)
 
-        self._btn_add_slot = QPushButton("＋ 添加组合键列")
+        self._btn_add_slot = QPushButton("添加组合键列")
         self._btn_add_slot.setProperty("compact", True)
+        self._btn_add_slot.setIcon(get_icon("plus", 14, theme=self._theme))
+        self._btn_add_slot.setIconSize(QSize(14, 14))
         self._btn_add_slot.clicked.connect(self._add_slot)
         slot_bar.addWidget(self._btn_add_slot)
 
-        self._btn_remove_slot = QPushButton("－ 移除末列")
+        self._btn_remove_slot = QPushButton("移除末列")
         self._btn_remove_slot.setProperty("compact", True)
+        self._btn_remove_slot.setIcon(get_icon("minus", 14, theme=self._theme))
+        self._btn_remove_slot.setIconSize(QSize(14, 14))
         self._btn_remove_slot.clicked.connect(self._remove_slot)
         slot_bar.addWidget(self._btn_remove_slot)
 
@@ -185,6 +205,7 @@ class _PerTableKeyDialog(QDialog):
 
         btn_clear = QPushButton("恢复默认 / 清除按表配置")
         btn_clear.setProperty("compact", True)
+        btn_clear.setProperty("variant", "ghost")
         btn_clear.setToolTip("清除按表自定义配置，重新跟随主界面的统一关键列下拉框")
         btn_clear.clicked.connect(self._on_clear_and_accept)
         slot_bar.addWidget(btn_clear)
@@ -200,6 +221,7 @@ class _PerTableKeyDialog(QDialog):
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QFrame.Shape.NoFrame)
+        apply_slim_scrollbars(self._scroll, theme=self._theme)
         root.addWidget(self._scroll, 1)
 
         btn_row = QHBoxLayout()
@@ -261,8 +283,6 @@ class _PerTableKeyDialog(QDialog):
                 found = cb.findData(target) if target else -1
                 if found >= 0:
                     cb.setCurrentIndex(found)
-                elif s_idx == 0 and tbl.headers:
-                    cb.setCurrentIndex(0)
                 else:
                     cb.setCurrentIndex(0)
 
@@ -357,6 +377,7 @@ class _ImportOptionsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("选择导入的工作表、表格与表头行")
         self.resize(660, 480)
+        self._theme = _detect_theme(parent)
         self._file_specs = list(file_specs)
         self._controls_by_path: dict[str, dict[str, Any]] = {}
 
@@ -372,6 +393,7 @@ class _ImportOptionsDialog(QDialog):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        apply_slim_scrollbars(scroll, theme=self._theme)
 
         container = QWidget()
         cont_layout = QVBoxLayout(container)
@@ -486,7 +508,6 @@ class _ImportOptionsDialog(QDialog):
             else:
                 c_layout.addLayout(top)
 
-            # Header row selector
             hdr_row = QHBoxLayout()
             hdr_row.setSpacing(8)
             hdr_lbl = QLabel("表头设置：")
@@ -558,6 +579,7 @@ class _ColumnManagerDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(f"列管理 — {table.name}")
         self.resize(780, 480)
+        self._theme = _detect_theme(parent)
         self._table = table
         self._col_infos = table.get_column_info(max_samples=4)
         self._keep_checks: list[QCheckBox] = []
@@ -569,7 +591,7 @@ class _ColumnManagerDialog(QDialog):
 
         hint = QLabel(
             f"当前表「{table.name}」共 {table.row_count:,} 行 × {table.col_count} 列。"
-            "可重命名列名以对齐多表合并字段（如「联系电话」→「手机号」），或取消勾选不需要的列。"
+            "可重命名列名以对齐多表合并字段，或取消勾选不需要的列。"
         )
         hint.setWordWrap(True)
         hint.setProperty("role", "subtitle")
@@ -601,10 +623,12 @@ class _ColumnManagerDialog(QDialog):
         self._grid_tbl.setHorizontalHeaderLabels(
             ["保留", "原列名", "目标列名（可编辑）", "非空 / 填充率", "唯一值", "样本预览"]
         )
+        self._grid_tbl.setShowGrid(False)
         self._grid_tbl.verticalHeader().setVisible(False)
-        self._grid_tbl.verticalHeader().setDefaultSectionSize(34)
+        self._grid_tbl.verticalHeader().setDefaultSectionSize(36)
         self._grid_tbl.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self._grid_tbl.setAlternatingRowColors(True)
+        apply_slim_scrollbars(self._grid_tbl, theme=self._theme)
 
         total_rows = max(1, table.row_count)
         for idx, info in enumerate(self._col_infos):
@@ -630,12 +654,12 @@ class _ColumnManagerDialog(QDialog):
             pct = (info.non_empty_count / total_rows * 100.0) if table.row_count else 0.0
             fill_item = QTableWidgetItem(f"{info.non_empty_count:,} / {table.row_count:,} ({pct:.0f}%)")
             fill_item.setFlags(fill_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            fill_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            fill_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self._grid_tbl.setItem(idx, 3, fill_item)
 
             uniq_item = QTableWidgetItem(f"{info.unique_count:,}")
             uniq_item.setFlags(uniq_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-            uniq_item.setTextAlignment(int(Qt.AlignmentFlag.AlignCenter))
+            uniq_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self._grid_tbl.setItem(idx, 4, uniq_item)
 
             sample_txt = " | ".join(s.replace("\n", " ")[:24] for s in info.sample_values) or "-"
@@ -712,6 +736,7 @@ class _RowDetailDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(640, 440)
+        self._theme = _detect_theme(parent)
         self.jump_requested: bool = False
         self._headers = list(headers)
         self._values = list(values)
@@ -729,11 +754,10 @@ class _RowDetailDialog(QDialog):
         row_n = max(len(self._headers), len(self._values))
         tbl = QTableWidget(row_n, 2)
         tbl.setHorizontalHeaderLabels(["字段名", "完整内容"])
-        tbl.verticalHeader().setVisible(False)
         tbl.setWordWrap(True)
         tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        tbl.setAlternatingRowColors(True)
+        enhance_table_view(tbl, theme=self._theme, row_height=34, header_height=34)
 
         for i in range(row_n):
             h = self._headers[i] if i < len(self._headers) else f"列{i + 1}"
@@ -748,6 +772,8 @@ class _RowDetailDialog(QDialog):
 
         btn_row = QHBoxLayout()
         btn_copy = QPushButton("复制全部字段")
+        btn_copy.setIcon(get_icon("copy", 14, theme=self._theme))
+        btn_copy.setIconSize(QSize(14, 14))
         btn_copy.clicked.connect(self._copy_all)
         btn_row.addWidget(btn_copy)
 
