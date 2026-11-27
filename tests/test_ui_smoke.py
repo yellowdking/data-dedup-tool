@@ -25,20 +25,20 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6.QtCore import QModelIndex, Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QTableView, QToolButton
 
 from src.core.config import ConfigManager
 from src.core.models import DataRecord, ParseResult
 from src.core.table_data import DataTable
 from src.ui.app_context import AppContext
 from src.ui.main_window import APP_VERSION, MainWindow
-from src.ui.table_models import PreviewTableModel, RecordTableModel
+from src.ui.table_models import DuplicateTableModel, PreviewTableModel, RecordTableModel
 from src.ui.table_preview_model import DynamicTableModel
 from src.ui.view_compare import CompareView
 from src.ui.view_import import ImportView
 from src.ui.view_settings import RuleEditorDialog, SettingsView, _validate_custom_regex_safe
 from src.ui.view_tables import TablesView
-from src.ui.widgets import WorkerThread
+from src.ui.widgets import WorkerThread, WorkspaceSwitcher
 
 
 @pytest.fixture(scope="session")
@@ -124,16 +124,83 @@ def test_app_context_lifecycle_and_settings(isolated_ctx: AppContext, tmp_path: 
 
 
 def test_main_window_init_theme_switch_and_safe_shutdown(isolated_ctx: AppContext) -> None:
-    assert APP_VERSION.startswith("v1.3.")
+    assert APP_VERSION.startswith("v2.0.")
+
+    # Seed duplicate records so DuplicatesView QTableView & copy button can be exercised
+    isolated_ctx.db.add_records(
+        [
+            DataRecord(
+                canonical_code="DUP-001",
+                prefix="DUP",
+                number="001",
+                raw_text="DUP-001_a.mp4",
+                file_name="DUP-001_a.mp4",
+                source_type="txt",
+                source_name="seed.txt",
+            ),
+            DataRecord(
+                canonical_code="DUP-001",
+                prefix="DUP",
+                number="001",
+                raw_text="DUP-001_b.mp4",
+                file_name="DUP-001_b.mp4",
+                source_type="txt",
+                source_name="seed.txt",
+            ),
+        ]
+    )
 
     win = MainWindow(isolated_ctx)
     try:
-        assert "v1.3." in win.windowTitle()
+        assert "v2.0." in win.windowTitle()
+
+        # v2.0.0 WorkspaceSwitcher & zero-emoji vector sidebar navigation
+        assert isinstance(win.workspace_switcher, WorkspaceSwitcher)
+        assert not win.workspace_switcher.display_name.endswith(".db")
+        ws_menu = win.workspace_switcher.build_menu()
+        ws_texts = [a.text() for a in ws_menu.actions() if a.text()]
+        assert any("新建数据库" in t for t in ws_texts)
+        assert any("打开本地数据库" in t for t in ws_texts)
+
+        forbidden_glyphs = "📚📥📊🔍🧩⚙️🌙☀️📂📋📄📦❌✅✨▶▾"
+        assert len(win._nav_buttons) == 6
+        for btn in win._nav_buttons:
+            assert not any(ch in btn.text() for ch in forbidden_glyphs)
+            assert not btn.icon().isNull()
 
         # Navigate across all 6 views
         for idx in range(6):
             win.switch_view(idx)
             QApplication.processEvents()
+
+        # v2.0.0 DuplicatesView uses virtualized QTableView + DuplicateTableModel + copy split button
+        dup_view = win.duplicates_view
+        assert isinstance(dup_view._table, QTableView)
+        assert isinstance(dup_view._model, DuplicateTableModel)
+        assert isinstance(dup_view._copy_btn, QToolButton)
+        assert dup_view._model.rowCount() == 2
+        dup_view._copy_btn.click()
+        assert QApplication.clipboard().text() == "DUP-001"
+
+        # v2.0.0 show_advanced_fields toggle propagates cleanly across SettingsView & LibraryView
+        filter_texts_default = [
+            win.library_view._filter_combo.itemText(i)
+            for i in range(win.library_view._filter_combo.count())
+        ]
+        assert "疑似分集" not in filter_texts_default
+
+        win.settings_view._chk_show_advanced.setChecked(True)
+        QApplication.processEvents()
+        assert isolated_ctx.config.show_advanced_fields is True
+        filter_texts_adv = [
+            win.library_view._filter_combo.itemText(i)
+            for i in range(win.library_view._filter_combo.count())
+        ]
+        assert "疑似分集" in filter_texts_adv
+
+        win.settings_view._chk_show_advanced.setChecked(False)
+        QApplication.processEvents()
+        assert isolated_ctx.config.show_advanced_fields is False
 
         # Switch themes light -> dark -> light
         isolated_ctx.set_theme("dark")
@@ -802,11 +869,13 @@ def test_settings_view_and_rule_editor_validator(isolated_ctx: AppContext) -> No
         dlg._example.setText("[Archive] PRJ_0042_4K.mkv")
         dlg._live_validate()
         assert "PRJ-0042" in dlg._validation_label.text()
+        assert "✅" not in dlg._validation_label.text()
 
-        # ReDoS pattern displays error marker
+        # ReDoS pattern displays emoji-free validation failure message
         dlg._pattern.setText(r"(a+)+")
         dlg._live_validate()
-        assert "❌" in dlg._validation_label.text()
+        assert "匹配失败" in dlg._validation_label.text()
+        assert "❌" not in dlg._validation_label.text()
     finally:
         dlg.close()
         dlg.deleteLater()
