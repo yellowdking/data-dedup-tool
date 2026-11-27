@@ -1,9 +1,10 @@
-"""Multi-Table Studio view (多表工作台) for 数据查重程序 v1.2.0.
+"""Multi-Table Studio view (多表工作台) for 数据查重程序 v2.0.0.
 
 Provides unified multi-format table management (Excel/Word/CSV/TXT/Database),
 interactive multi-sheet / Word-table / header-row import picking, column profiling
 and renaming, virtualized preview & search, cross-table/intra-table deduplication,
-union/dedup/coalesce/join merging, and fully asynchronous background exports.
+union/dedup/coalesce/join merging, qBittorrent-style customizable table headers,
+and fully asynchronous background exports.
 """
 
 from __future__ import annotations
@@ -12,10 +13,11 @@ import inspect
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
+    QPushButton,
     QSplitter,
     QTabWidget,
     QVBoxLayout,
@@ -30,6 +32,9 @@ from src.core.table_data import (
     TableRowRef,
 )
 from src.ui.app_context import AppContext
+from src.ui.delegates import sync_widget_craft_theme
+from src.ui.icons import get_icon
+from src.ui.table_header import TableHeaderManager
 from src.ui.table_preview_model import DynamicTableModel
 from src.ui.tables_dedup_tab import TablesDedupTabMixin
 from src.ui.tables_dialogs import (
@@ -47,9 +52,12 @@ from src.ui.tables_widgets import (
     _BadgeIconCache,
     _CompactMetricCard,
     _CompactTableDropZone,
+    _InlineMetricBar,
     _format_row_summary,
+    _set_leading_search_icon,
 )
-from src.ui.widgets import ScrollableDetailDialog, WorkerThread
+from src.ui.theme import get_palette
+from src.ui.widgets import PageHeaderBar, ScrollableDetailDialog, WorkerThread
 
 __all__ = [
     "TablesView",
@@ -58,6 +66,7 @@ __all__ = [
     "_CompactMetricCard",
     "_CompactTableDropZone",
     "_ImportOptionsDialog",
+    "_InlineMetricBar",
     "_PerTableKeyDialog",
     "_RowDetailDialog",
     "_call_load_tables_from_file",
@@ -99,6 +108,7 @@ class TablesView(
         self._dedup_tab_populated: set[int] = set()
         self._dedup_tab_refs: dict[int, list[TableRowRef]] = {}
         self._merge_dropped_refs: list[TableRowRef] = []
+        self._header_managers: list[TableHeaderManager] = []
 
         # Background worker threads & monotonic run generation tokens
         self._inspect_worker: Optional[WorkerThread] = None
@@ -156,7 +166,9 @@ class TablesView(
         self._merge_search_timer.timeout.connect(self._apply_merge_filter)
 
         self._setup_ui()
+        self._refresh_view_icons(theme)
         self.ctx.theme_changed.connect(self.apply_theme)
+        self.ctx.settings_changed.connect(self._on_settings_changed)
         self.ctx.data_changed.connect(self._on_db_mutated)
         self.ctx.db_switched.connect(self._on_db_mutated)
         self._sync_controls_state()
@@ -166,7 +178,6 @@ class TablesView(
     # ------------------------------------------------------------------
 
     def _make_worker(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> WorkerThread:
-        """Create a WorkerThread with safe auto_delete / finished->deleteLater cleanup."""
         sig_params = inspect.signature(WorkerThread.__init__).parameters
         if "auto_delete" in sig_params:
             return WorkerThread(fn, *args, parent=self, auto_delete=True, **kwargs)
@@ -210,7 +221,7 @@ class TablesView(
             pass
 
     def shutdown(self) -> None:
-        """Cleanly cancel and join all background workers before window close / DB close."""
+        """Flush header layouts and cleanly cancel/join all background workers."""
         self._inspect_gen += 1
         self._load_gen += 1
         self._db_load_gen += 1
@@ -225,6 +236,12 @@ class TablesView(
             self._merge_search_timer,
         ):
             timer.stop()
+
+        for mgr in self._header_managers:
+            try:
+                mgr.flush()
+            except RuntimeError:
+                pass
 
         for attr in (
             "_inspect_worker",
@@ -252,6 +269,9 @@ class TablesView(
         """Hook called by MainWindow when switching to Multi-Table Studio."""
         self._update_db_stale_hint()
 
+    def _on_settings_changed(self) -> None:
+        self._refresh_merge_keep_strategies()
+
     def _start_export_worker(
         self,
         task_fn: Callable[[], Any],
@@ -259,7 +279,6 @@ class TablesView(
         success_msg: str,
         error_title: str = "导出失败",
     ) -> None:
-        """Run an export callable asynchronously off the GUI thread."""
         if self._is_worker_running(self._export_worker):
             self.ctx.notify("正在执行导出任务，请稍候...", "warning")
             return
@@ -303,6 +322,10 @@ class TablesView(
             (t.table_id, t.name, t.row_count, t.col_count, tuple(t.headers)) for t in tables
         )
 
+    def _clear_all_fixed_report_models(self) -> None:
+        self._clear_dedup_fixed_models()
+        self._clear_merge_dropped_model()
+
     def _invalidate_stale_results(self, affected_table_ids: Optional[set[str]] = None) -> None:
         """Invalidate dedup/merge reports whose input table snapshot is no longer valid."""
         invalidate_dedup = False
@@ -317,14 +340,7 @@ class TablesView(
         if invalidate_dedup:
             self._last_dedup_report = None
             self._last_dedup_snapshot = None
-            for model in (
-                self._dedup_cross_model,
-                self._dedup_intra_model,
-                self._dedup_inter_model,
-                self._dedup_unique_model,
-                self._dedup_unrec_model,
-            ):
-                model.clear()
+            self._clear_dedup_fixed_models()
             self._reset_dedup_ui()
 
         invalidate_merge = False
@@ -340,7 +356,7 @@ class TablesView(
             self._last_merge_result = None
             self._last_merge_snapshot = None
             self._merge_result_model.clear()
-            self._merge_dropped_model.clear()
+            self._clear_merge_dropped_model()
             self._reset_merge_ui()
 
     def _jump_to_table_row(
@@ -381,7 +397,6 @@ class TablesView(
             dlg.exec()
 
     def _open_column_manager(self, table: Optional[DataTable] = None) -> None:
-        """Open column profiling / rename / drop dialog for the active or specified table."""
         if self._any_mutation_lock_active():
             self.ctx.notify("后台任务运行中，请稍候再修改表结构", "warning")
             return
@@ -418,7 +433,6 @@ class TablesView(
             for row in tbl.rows
         ]
 
-        # Keep custom key mappings synced with renamed/dropped columns
         for mapping in (self._dedup_custom_keys, self._merge_custom_keys):
             if tbl.table_id in mapping:
                 updated = [rename_map[c] for c in mapping[tbl.table_id] if c in rename_map]
@@ -427,7 +441,6 @@ class TablesView(
                 else:
                     mapping.pop(tbl.table_id, None)
 
-        # Refresh list item dimensions
         self._table_list.blockSignals(True)
         for idx in range(self._table_list.count()):
             item = self._table_list.item(idx)
@@ -450,15 +463,44 @@ class TablesView(
     # Public API (theme sync, loading & programmatic control)
     # ------------------------------------------------------------------
 
+    def _refresh_view_icons(self, theme: str) -> None:
+        p = get_palette(theme)
+        cta = p["cta_text"]
+        std = p["icon_default"]
+
+        self._btn_add_files.setIcon(get_icon("plus", 15, cta, theme=theme))
+        self._update_db_stale_hint()
+        self._btn_prev_cols.setIcon(get_icon("edit", 14, std, theme=theme))
+        self._btn_prev_col_menu.setIcon(get_icon("columns", 15, std, theme=theme))
+        self._btn_prev_export.setIcon(get_icon("download", 14, std, theme=theme))
+
+        self._btn_run_dedup.setIcon(get_icon("play", 14, cta, theme=theme))
+        self._btn_dedup_col_menu.setIcon(get_icon("columns", 15, std, theme=theme))
+        self._btn_dedup_export.setIcon(get_icon("download", 14, std, theme=theme))
+
+        self._btn_run_merge.setIcon(get_icon("play", 14, cta, theme=theme))
+        self._btn_merge_col_menu.setIcon(get_icon("columns", 15, std, theme=theme))
+        self._btn_merge_export.setIcon(get_icon("download", 14, std, theme=theme))
+        self._btn_merge_add_workspace.setIcon(get_icon("plus", 14, std, theme=theme))
+        self._btn_merge_write_db.setIcon(get_icon("database", 14, std, theme=theme))
+
+        _set_leading_search_icon(self._preview_search, theme)
+        _set_leading_search_icon(self._dedup_search, theme)
+        _set_leading_search_icon(self._merge_search, theme)
+
     def apply_theme(self, theme: str) -> None:
-        """Propagate Light/Dark theme changes to all virtualized table models & metric cards."""
+        """Propagate Light/Dark theme changes across models, pills, icons, and delegates."""
         for model in self._all_models:
             model.set_theme(theme)
-        for card in self._dedup_metric_cards:
-            card.apply_theme(theme)
+        self._dedup_metric_bar.apply_theme(theme)
+        self._empty_preview_canvas.apply_theme(theme)
+        self._dedup_empty.apply_theme(theme)
+        self._merge_empty.apply_theme(theme)
+        self._refresh_source_panel_theme(theme)
+        self._refresh_view_icons(theme)
+        sync_widget_craft_theme(self, theme)
 
     def switch_sub_tab(self, index: int) -> None:
-        """Programmatically switch right-panel sub-tab (0=Preview, 1=Dedup, 2=Merge)."""
         if 0 <= index < self._work_tabs.count():
             self._work_tabs.setCurrentIndex(index)
 
@@ -714,16 +756,18 @@ class TablesView(
             self._update_db_stale_hint()
 
     def _update_db_stale_hint(self) -> None:
+        theme = self.ctx.config.theme
         has_db_table = any(t.source_type == "database" for t in self._tables)
         if has_db_table and self._db_snapshot_stale:
-            self._btn_load_db.setText("↻ 重新载入数据总库 (已更新)")
-            self._btn_load_db.setToolTip("当前数据总库已发生变化，点击可载入最新快照")
+            self._btn_load_db.setText("重新载入总库")
+            self._btn_load_db.setIcon(get_icon("refresh-cw", 14, theme=theme))
+            self._btn_load_db.setToolTip("当前数据总库已发生变化，点击载入最新快照")
         else:
-            self._btn_load_db.setText("载入当前数据总库")
+            self._btn_load_db.setText("载入总库")
+            self._btn_load_db.setIcon(get_icon("database", 14, theme=theme))
             self._btn_load_db.setToolTip("将当前 SQLite 数据总库作为一张表载入工作台")
 
     def checked_tables(self) -> list[DataTable]:
-        """Return all currently checked tables in list order."""
         result: list[DataTable] = []
         for idx in range(self._table_list.count()):
             item = self._table_list.item(idx)
@@ -745,8 +789,34 @@ class TablesView(
 
     def _setup_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 12, 16, 12)
+        root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
+
+        # Sleek 48px PageHeaderBar with primary Add Files & secondary Load DB actions
+        self._page_header = PageHeaderBar("多表工作台", "暂无数据源", parent=self)
+
+        self._btn_load_db = QPushButton("载入总库")
+        self._btn_load_db.setProperty("compact", True)
+        self._btn_load_db.setIconSize(QSize(14, 14))
+        self._btn_load_db.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_load_db.clicked.connect(self.load_database_table)
+        self._page_header.add_action(self._btn_load_db)
+
+        self._btn_add_files = QPushButton("添加文件")
+        self._btn_add_files.setProperty("variant", "primary")
+        self._btn_add_files.setProperty("compact", True)
+        self._btn_add_files.setIconSize(QSize(15, 15))
+        self._btn_add_files.setToolTip("添加 Excel (.xlsx/.xlsm)、Word (.docx)、CSV 或 TXT 文件")
+        self._btn_add_files.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_add_files.clicked.connect(lambda: self._pick_files(force_options=False))
+        self._page_header.add_action(self._btn_add_files)
+
+        root.addWidget(self._page_header)
+
+        body = QWidget()
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(16, 12, 16, 12)
+        body_lay.setSpacing(0)
 
         self._main_splitter = QSplitter(Qt.Orientation.Horizontal)
         self._main_splitter.setChildrenCollapsible(False)
@@ -756,9 +826,10 @@ class TablesView(
         self._main_splitter.addWidget(self._build_right_panel())
         self._main_splitter.setStretchFactor(0, 0)
         self._main_splitter.setStretchFactor(1, 1)
-        self._main_splitter.setSizes([256, 800])
+        self._main_splitter.setSizes([244, 820])
 
-        root.addWidget(self._main_splitter, 1)
+        body_lay.addWidget(self._main_splitter, 1)
+        root.addWidget(body, 1)
 
     def _build_right_panel(self) -> QWidget:
         container = QWidget()
@@ -768,9 +839,9 @@ class TablesView(
 
         self._work_tabs = QTabWidget()
         self._work_tabs.setObjectName("TablesWorkTabs")
-        self._work_tabs.addTab(self._build_preview_tab(), "📊 数据预览")
-        self._work_tabs.addTab(self._build_dedup_tab(), "🔍 多表查重")
-        self._work_tabs.addTab(self._build_merge_tab(), "🧩 表格合并与导出")
+        self._work_tabs.addTab(self._build_preview_tab(), "数据预览")
+        self._work_tabs.addTab(self._build_dedup_tab(), "多表查重")
+        self._work_tabs.addTab(self._build_merge_tab(), "合并与导出")
 
         layout.addWidget(self._work_tabs, 1)
         return container
@@ -801,54 +872,38 @@ class TablesView(
         db_import_busy = self._is_worker_running(self._db_import_worker)
         mut_locked = left_busy or dedup_busy or merge_busy
 
-        # Left-panel buttons & mutation guard
+        # Header & Left-panel actions
         self._btn_add_files.setEnabled(not left_busy)
-        self._btn_add_with_opts.setEnabled(not left_busy)
         self._btn_load_db.setEnabled(not left_busy)
         self._btn_sel_all.setEnabled(has_tables and not mut_locked)
-        self._btn_invert.setEnabled(has_tables and not mut_locked)
-        self._btn_rename.setEnabled(has_tables and not mut_locked)
         self._btn_move_up.setEnabled(len(self._tables) > 1 and not mut_locked)
         self._btn_move_down.setEnabled(len(self._tables) > 1 and not mut_locked)
-        self._btn_remove.setEnabled(has_tables and not mut_locked)
-        self._btn_clear.setEnabled(has_tables and not mut_locked)
-        self._btn_pack_xlsx.setEnabled(has_tables and not export_busy)
+        self._act_src_opts.setEnabled(not left_busy)
+        self._act_src_invert.setEnabled(has_tables and not mut_locked)
+        self._act_src_rename.setEnabled(has_tables and not mut_locked)
+        self._act_src_remove.setEnabled(has_tables and not mut_locked)
+        self._act_src_pack.setEnabled(has_tables and not export_busy)
+        self._act_src_clear.setEnabled(has_tables and not mut_locked)
 
         # Preview tab controls
         self._btn_prev_cols.setEnabled(has_active and not mut_locked)
         self._btn_prev_single_dedup.setEnabled(has_active and not dedup_busy)
-        for btn in (
-            self._btn_prev_xlsx,
-            self._btn_prev_docx,
-            self._btn_prev_csv,
-            self._btn_prev_txt,
-        ):
-            btn.setEnabled(has_active and not export_busy)
+        self._btn_prev_col_menu.setEnabled(has_active)
+        self._btn_prev_export.setEnabled(has_active and not export_busy)
 
         # Dedup tab controls
         self._btn_run_dedup.setEnabled(has_checked and not dedup_busy)
         has_dedup_report = self._last_dedup_report is not None
-        self._btn_dedup_export_xlsx.setEnabled(has_dedup_report and not export_busy)
-        self._btn_dedup_export_docx.setEnabled(has_dedup_report and not export_busy)
-        self._btn_dedup_export_csv.setEnabled(has_dedup_report and not export_busy)
+        self._btn_dedup_export.setEnabled(has_dedup_report and not export_busy)
 
         # Merge tab controls
         self._btn_merge_cols.setEnabled(has_active and not mut_locked)
         self._btn_run_merge.setEnabled(has_checked and not merge_busy)
-        has_merge_data = (
-            self._last_merge_result is not None
-            and (
-                self._last_merge_result.merged_table.row_count > 0
-                or self._last_merge_result.merged_table.col_count > 0
-            )
+        has_merge_data = self._last_merge_result is not None and (
+            self._last_merge_result.merged_table.row_count > 0
+            or self._last_merge_result.merged_table.col_count > 0
         )
-        for btn in (
-            self._btn_merge_xlsx,
-            self._btn_merge_docx,
-            self._btn_merge_csv,
-            self._btn_merge_txt,
-        ):
-            btn.setEnabled(has_merge_data and not export_busy)
+        self._btn_merge_export.setEnabled(has_merge_data and not export_busy)
         self._btn_merge_add_workspace.setEnabled(has_merge_data and not mut_locked)
         self._btn_merge_write_db.setEnabled(
             has_merge_data
