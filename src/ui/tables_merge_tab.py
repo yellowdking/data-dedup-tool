@@ -7,7 +7,7 @@ import inspect
 from pathlib import Path
 from typing import Any, Optional
 
-from PySide6.QtCore import QModelIndex, Qt
+from PySide6.QtCore import QModelIndex, QSize, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -16,8 +16,10 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QProgressBar,
     QPushButton,
+    QStackedWidget,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -33,8 +35,23 @@ from src.core.table_engine import (
     import_table_to_database,
     merge_tables,
 )
-from src.ui.tables_widgets import _PerTableKeyDialog, _format_row_summary
-from src.ui.widgets import ScrollableDetailDialog
+from src.ui.table_header import ColumnSpec
+from src.ui.tables_widgets import (
+    _PerTableKeyDialog,
+    _format_row_summary,
+    _set_leading_search_icon,
+)
+from src.ui.widgets import EmptyStateWidget, ScrollableDetailDialog
+
+_MERGE_DROPPED_SPECS: tuple[ColumnSpec, ...] = (
+    ColumnSpec("key", "去重键 / 编码", 148, True, 90, True, True, 0.0, "basic"),
+    ColumnSpec("source_table", "来源表", 148, True, 84, True, False, 0.0, "basic"),
+    ColumnSpec("row_index", "原行号", 70, True, 56, True, False, 0.0, "basic"),
+    ColumnSpec("parsed_code", "提取编码", 136, True, 80, True, False, 0.0, "basic"),
+    ColumnSpec("tags", "版本标签", 110, False, 70, True, False, 0.0, "advanced"),
+    ColumnSpec("part", "分集", 70, False, 54, True, False, 0.0, "advanced"),
+    ColumnSpec("summary", "原行内容摘要", 280, True, 120, True, False, 1.0, "basic"),
+)
 
 
 class TablesMergeTabMixin:
@@ -43,17 +60,18 @@ class TablesMergeTabMixin:
     def _build_merge_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+        theme = self.ctx.config.theme
 
-        # Merge configuration card
+        # Single clean merge configuration card
         cfg_card = QFrame()
         cfg_card.setProperty("card", True)
         cfg_layout = QVBoxLayout(cfg_card)
-        cfg_layout.setContentsMargins(12, 10, 12, 10)
-        cfg_layout.setSpacing(8)
+        cfg_layout.setContentsMargins(12, 9, 12, 9)
+        cfg_layout.setSpacing(7)
 
-        # Row 1: Merge mode + alignment / join controls + cancel + run CTA
+        # Row 1: Merge mode + alignment / join controls + cancel + primary CTA
         r1 = QHBoxLayout()
         r1.setSpacing(7)
 
@@ -65,11 +83,10 @@ class TablesMergeTabMixin:
         self._merge_mode_combo.addItem("纵向合并去重", "union_dedup")
         self._merge_mode_combo.addItem("纵向追加合并", "union_all")
         self._merge_mode_combo.addItem("横向拼接", "join")
-        self._merge_mode_combo.setMinimumWidth(108)
+        self._merge_mode_combo.setMinimumWidth(112)
         self._merge_mode_combo.currentIndexChanged.connect(self._on_merge_mode_changed)
         r1.addWidget(self._merge_mode_combo)
 
-        # Alignment controls (for union modes)
         self._merge_align_lbl = QLabel("对齐：")
         self._merge_align_lbl.setProperty("role", "subtitle")
         r1.addWidget(self._merge_align_lbl)
@@ -80,7 +97,6 @@ class TablesMergeTabMixin:
         self._merge_align_combo.setMinimumWidth(118)
         r1.addWidget(self._merge_align_combo)
 
-        # Join controls (for join mode)
         self._merge_join_lbl = QLabel("连接：")
         self._merge_join_lbl.setProperty("role", "subtitle")
         r1.addWidget(self._merge_join_lbl)
@@ -95,7 +111,7 @@ class TablesMergeTabMixin:
         self._merge_join_match_combo = QComboBox()
         self._merge_join_match_combo.addItem("全部匹配", "all")
         self._merge_join_match_combo.addItem("仅首条匹配", "first")
-        self._merge_join_match_combo.setToolTip("当右表存在重复键时，选择保留全部笛卡尔匹配或仅取首条匹配")
+        self._merge_join_match_combo.setToolTip("当右表存在重复键时，选择保留全部匹配或仅取首条匹配")
         self._merge_join_match_combo.setMinimumWidth(92)
         r1.addWidget(self._merge_join_match_combo)
 
@@ -118,22 +134,23 @@ class TablesMergeTabMixin:
 
         self._merge_progress = QProgressBar()
         self._merge_progress.setFixedWidth(64)
-        self._merge_progress.setFixedHeight(14)
+        self._merge_progress.setFixedHeight(12)
         self._merge_progress.setTextVisible(False)
         self._merge_progress.setVisible(False)
         r1.addWidget(self._merge_progress)
 
         self._btn_cancel_merge = QPushButton("取消")
         self._btn_cancel_merge.setProperty("compact", True)
-        self._btn_cancel_merge.setProperty("variant", "danger")
+        self._btn_cancel_merge.setProperty("variant", "danger-outline")
         self._btn_cancel_merge.setVisible(False)
         self._btn_cancel_merge.clicked.connect(self._cancel_merge)
         r1.addWidget(self._btn_cancel_merge)
 
-        self._btn_run_merge = QPushButton("▶ 合并预览")
+        self._btn_run_merge = QPushButton("合并预览")
         self._btn_run_merge.setToolTip("执行表格合并并生成预览")
         self._btn_run_merge.setProperty("variant", "primary")
         self._btn_run_merge.setProperty("compact", True)
+        self._btn_run_merge.setIconSize(QSize(14, 14))
         self._btn_run_merge.setCursor(Qt.CursorShape.PointingHandCursor)
         self._btn_run_merge.clicked.connect(self.run_merge)
         r1.addWidget(self._btn_run_merge)
@@ -190,12 +207,8 @@ class TablesMergeTabMixin:
         r2.addWidget(self._merge_keep_lbl)
 
         self._merge_keep_combo = QComboBox()
-        self._merge_keep_combo.addItem("保留首条", "first")
-        self._merge_keep_combo.addItem("保留末条", "last")
-        self._merge_keep_combo.addItem("保留字段最全", "most_complete")
-        self._merge_keep_combo.addItem("保留最高标签质量", "highest_tag_score")
-        self._merge_keep_combo.addItem("字段互补合并 (Coalesce)", "coalesce")
         self._merge_keep_combo.setMinimumWidth(150)
+        self._refresh_merge_keep_strategies()
         r2.addWidget(self._merge_keep_combo)
 
         r2.addStretch()
@@ -203,7 +216,7 @@ class TablesMergeTabMixin:
 
         # Row 3: Additional output column & normalization checkboxes
         r3 = QHBoxLayout()
-        r3.setSpacing(10)
+        r3.setSpacing(12)
 
         self._chk_merge_add_source = QCheckBox("来源表列")
         self._chk_merge_add_source.setToolTip("在合并结果中附加 _来源表 列")
@@ -238,9 +251,10 @@ class TablesMergeTabMixin:
 
         # Preview stats & search bar
         mid_row = QHBoxLayout()
-        mid_row.setSpacing(10)
+        mid_row.setContentsMargins(2, 0, 2, 0)
+        mid_row.setSpacing(8)
 
-        self._merge_summary_lbl = QLabel("请勾选左侧表格后，点击「▶ 合并预览」（支持单表去重或多表合并）")
+        self._merge_summary_lbl = QLabel("勾选左侧表格后点击「合并预览」（支持单表去重或多表合并）")
         self._merge_summary_lbl.setProperty("role", "subtitle")
         mid_row.addWidget(self._merge_summary_lbl, 1)
 
@@ -249,65 +263,82 @@ class TablesMergeTabMixin:
         mid_row.addWidget(self._merge_filter_lbl)
 
         self._merge_search = QLineEdit()
-        self._merge_search.setPlaceholderText("🔍 筛选合并结果或被去重明细...")
+        self._merge_search.setPlaceholderText("筛选合并结果或被去重明细...")
         self._merge_search.setClearButtonEnabled(True)
-        self._merge_search.setMaximumWidth(260)
+        self._merge_search.setMaximumWidth(240)
+        _set_leading_search_icon(self._merge_search, theme)
         self._merge_search.textChanged.connect(lambda _: self._merge_search_timer.start())
         mid_row.addWidget(self._merge_search)
+
+        self._btn_merge_col_menu = QPushButton()
+        self._btn_merge_col_menu.setProperty("iconOnly", True)
+        self._btn_merge_col_menu.setIconSize(QSize(15, 15))
+        self._btn_merge_col_menu.setToolTip("自定义当前结果表显示列或恢复默认顺序")
+        self._btn_merge_col_menu.clicked.connect(self._open_active_merge_col_menu)
+        mid_row.addWidget(self._btn_merge_col_menu)
+
         layout.addLayout(mid_row)
 
-        # Preview Sub-Tabs: Merged Table + Dropped Rows
+        # Stacked EmptyState vs Merge Sub-Tabs
+        self._merge_stack = QStackedWidget()
+        self._merge_empty = EmptyStateWidget(
+            "layers",
+            "准备执行表格合并",
+            "在左侧勾选表格并选择合并方式，点击上方「合并预览」查看合并表与去重明细",
+            theme=theme,
+            parent=self,
+        )
+        self._merge_stack.addWidget(self._merge_empty)
+
         self._merge_preview_tabs = QTabWidget()
         self._merge_preview_tabs.setProperty("subtabs", True)
 
-        self._tv_merge_result = self._make_table_view(self._merge_result_model)
+        self._tv_merge_result, self._merge_result_header_mgr = self._make_table_view(
+            self._merge_result_model, dynamic=True
+        )
         self._tv_merge_result.doubleClicked.connect(self._on_merge_result_double_clicked)
 
-        self._tv_merge_dropped = self._make_table_view(self._merge_dropped_model)
+        self._tv_merge_dropped, self._merge_dropped_header_mgr = self._make_table_view(
+            self._merge_dropped_model,
+            fixed_table_id="tables_merge_dropped",
+            fixed_columns=_MERGE_DROPPED_SPECS,
+        )
         self._tv_merge_dropped.doubleClicked.connect(self._on_merge_dropped_double_clicked)
 
-        self._merge_preview_tabs.addTab(self._tv_merge_result, "合并结果表 (0 行 × 0 列)")
-        self._merge_preview_tabs.addTab(self._tv_merge_dropped, "被去重明细 (0 条)")
+        self._merge_preview_tabs.addTab(self._tv_merge_result, "合并结果表 (0 行)")
+        self._merge_preview_tabs.addTab(self._tv_merge_dropped, "被去重明细 (0)")
         self._merge_preview_tabs.currentChanged.connect(lambda _: self._apply_merge_filter())
-        layout.addWidget(self._merge_preview_tabs, 1)
 
-        # Bottom Export & Write-to-DB bar
+        self._merge_stack.addWidget(self._merge_preview_tabs)
+        self._merge_stack.setCurrentIndex(0)
+        layout.addWidget(self._merge_stack, 1)
+
+        # Streamlined bottom bar: consolidated Export dropdown + Add to Workspace + Write to DB
         export_bar = QHBoxLayout()
-        export_bar.setSpacing(6)
+        export_bar.setContentsMargins(2, 0, 2, 0)
+        export_bar.setSpacing(8)
 
-        lbl_m_exp = QLabel("导出：")
-        lbl_m_exp.setProperty("role", "subtitle")
-        export_bar.addWidget(lbl_m_exp)
-
-        self._btn_merge_xlsx = QPushButton("Excel")
-        self._btn_merge_xlsx.setToolTip("导出合并结果为 Excel 工作簿 (.xlsx)")
-        self._btn_merge_xlsx.setProperty("compact", True)
-        self._btn_merge_xlsx.setEnabled(False)
-        self._btn_merge_xlsx.clicked.connect(lambda: self._export_merged("xlsx"))
-        export_bar.addWidget(self._btn_merge_xlsx)
-
-        self._btn_merge_docx = QPushButton("Word")
-        self._btn_merge_docx.setToolTip("导出合并结果为 Word 文档 (.docx)")
-        self._btn_merge_docx.setProperty("compact", True)
-        self._btn_merge_docx.setEnabled(False)
-        self._btn_merge_docx.clicked.connect(lambda: self._export_merged("docx"))
-        export_bar.addWidget(self._btn_merge_docx)
-
-        self._btn_merge_csv = QPushButton("CSV")
-        self._btn_merge_csv.setProperty("compact", True)
-        self._btn_merge_csv.setEnabled(False)
-        self._btn_merge_csv.clicked.connect(lambda: self._export_merged("csv"))
-        export_bar.addWidget(self._btn_merge_csv)
-
-        self._btn_merge_txt = QPushButton("TXT")
-        self._btn_merge_txt.setProperty("compact", True)
-        self._btn_merge_txt.setEnabled(False)
-        self._btn_merge_txt.clicked.connect(lambda: self._export_merged("txt"))
-        export_bar.addWidget(self._btn_merge_txt)
+        self._btn_merge_export = QPushButton("导出  ")
+        self._btn_merge_export.setToolTip("导出合并结果表为 Excel / Word / CSV / TXT")
+        self._btn_merge_export.setProperty("compact", True)
+        self._btn_merge_export.setIconSize(QSize(14, 14))
+        self._btn_merge_export.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_merge_export.setEnabled(False)
+        merge_exp_menu = QMenu(self._btn_merge_export)
+        for label, fmt in (
+            ("Excel 工作簿 (.xlsx)", "xlsx"),
+            ("Word 文档 (.docx)", "docx"),
+            ("CSV 表格 (.csv)", "csv"),
+            ("纯文本 (.txt)", "txt"),
+        ):
+            merge_exp_menu.addAction(label, lambda _=False, f=fmt: self._export_merged(f))
+        self._btn_merge_export.setMenu(merge_exp_menu)
+        export_bar.addWidget(self._btn_merge_export)
 
         self._btn_merge_add_workspace = QPushButton("加入工作台")
         self._btn_merge_add_workspace.setToolTip("将合并结果作为新表加入左侧数据源列表")
         self._btn_merge_add_workspace.setProperty("compact", True)
+        self._btn_merge_add_workspace.setIconSize(QSize(14, 14))
         self._btn_merge_add_workspace.setEnabled(False)
         self._btn_merge_add_workspace.clicked.connect(self._add_merged_to_workspace)
         export_bar.addWidget(self._btn_merge_add_workspace)
@@ -316,21 +347,51 @@ class TablesMergeTabMixin:
 
         self._db_import_progress = QProgressBar()
         self._db_import_progress.setFixedWidth(56)
-        self._db_import_progress.setFixedHeight(14)
+        self._db_import_progress.setFixedHeight(12)
         self._db_import_progress.setTextVisible(False)
         self._db_import_progress.setVisible(False)
         export_bar.addWidget(self._db_import_progress)
 
         self._btn_merge_write_db = QPushButton("写入数据总库")
         self._btn_merge_write_db.setToolTip("后台解析标准编码并写入当前 SQLite 数据总库")
-        self._btn_merge_write_db.setProperty("variant", "success")
+        self._btn_merge_write_db.setProperty("variant", "outline")
         self._btn_merge_write_db.setProperty("compact", True)
+        self._btn_merge_write_db.setIconSize(QSize(14, 14))
         self._btn_merge_write_db.setEnabled(False)
         self._btn_merge_write_db.clicked.connect(self._write_merged_to_db)
         export_bar.addWidget(self._btn_merge_write_db)
 
         layout.addLayout(export_bar)
         return tab
+
+    def _open_active_merge_col_menu(self) -> None:
+        mgr = (
+            self._merge_result_header_mgr
+            if self._merge_preview_tabs.currentIndex() == 0
+            else self._merge_dropped_header_mgr
+        )
+        self._open_header_menu_below(self._btn_merge_col_menu, mgr)
+
+    def _clear_merge_dropped_model(self) -> None:
+        self._clear_fixed_model(self._merge_dropped_model, _MERGE_DROPPED_SPECS)
+
+    def _refresh_merge_keep_strategies(self) -> None:
+        """Populate keep-strategy selector; hide 最高标签质量 unless show_advanced_fields is True."""
+        prev_val = self._merge_keep_combo.currentData()
+        show_adv = bool(getattr(self.ctx.config, "show_advanced_fields", False))
+
+        self._merge_keep_combo.blockSignals(True)
+        self._merge_keep_combo.clear()
+        self._merge_keep_combo.addItem("保留首条", "first")
+        self._merge_keep_combo.addItem("保留末条", "last")
+        self._merge_keep_combo.addItem("保留字段最全", "most_complete")
+        self._merge_keep_combo.addItem("字段互补合并 (Coalesce)", "coalesce")
+        if show_adv:
+            self._merge_keep_combo.addItem("保留最高标签质量", "highest_tag_score")
+
+        idx = self._merge_keep_combo.findData(prev_val) if prev_val else -1
+        self._merge_keep_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._merge_keep_combo.blockSignals(False)
 
     def _on_merge_mode_changed(self) -> None:
         mode = self._merge_mode_combo.currentData() or "union_dedup"
@@ -361,7 +422,6 @@ class TablesMergeTabMixin:
         self._merge_keep_lbl.setVisible(is_union_dedup)
         self._merge_keep_combo.setVisible(is_union_dedup)
 
-        # Hide column-value normalization options when in union_all or smart_code mode
         self._chk_merge_ignore_case.setVisible(show_col)
         self._chk_merge_strip.setVisible(show_col)
         cfg_fields = {f.name for f in dataclasses.fields(TableMergeConfig)}
@@ -417,7 +477,7 @@ class TablesMergeTabMixin:
 
         detail_lines = [
             f"当前选择的关键列「{selected_col}」在以下表格中不存在：",
-            *[f"• {name}" for name in missing_tables],
+            *[f"- {name}" for name in missing_tables],
             "",
             "若继续执行，缺失该列的表格将默认回退到第 1 列进行匹配。",
             "建议先通过「列管理」重命名列名，或点击「按表指定」为各表分别映射关键列。",
@@ -463,7 +523,6 @@ class TablesMergeTabMixin:
             "ignore_case": self._chk_merge_ignore_case.isChecked(),
             "strip_whitespace": self._chk_merge_strip.isChecked(),
         }
-        # Forward v1.2.0 TableMergeConfig fields when present
         valid_fields = {f.name for f in dataclasses.fields(TableMergeConfig)}
         if "ignore_punctuation" in valid_fields:
             kwargs["ignore_punctuation"] = self._chk_merge_ignore_punct.isChecked()
@@ -566,7 +625,7 @@ class TablesMergeTabMixin:
         result: TableMergeResult,
         snapshot: Optional[Any] = None,
     ) -> None:
-        """Display merged table and dropped rows audit trail."""
+        """Display merged table (dynamic header sync) and dropped rows audit trail."""
         self._last_merge_result = result
         self._last_merge_snapshot = snapshot
         self._merge_dropped_refs = list(result.dropped_rows)
@@ -577,12 +636,14 @@ class TablesMergeTabMixin:
             merged,
             highlight_columns=mono_cols,
             mono_columns=mono_cols,
+            copy_columns=mono_cols,
             reset_filter=True,
         )
+        if self._merge_result_header_mgr is not None:
+            self._merge_result_header_mgr.sync_dynamic_columns(auto_fit=True)
         self._reset_table_view_sort_indicator(self._tv_merge_result)
-        self._auto_size_columns(self._tv_merge_result, self._merge_result_model)
 
-        dropped_headers = ["去重键 / 编码", "来源表", "原行号", "提取编码", "版本标签", "分集", "原行内容摘要"]
+        dropped_headers = [s.label for s in _MERGE_DROPPED_SPECS]
         dropped_rows: list[list[str]] = []
         dropped_tints: dict[int, str] = {}
         for idx, ref in enumerate(result.dropped_rows):
@@ -605,14 +666,15 @@ class TablesMergeTabMixin:
             row_tints=dropped_tints,
             highlight_columns={0},
             mono_columns={0, 3},
+            copy_columns={0, 3},
             center_columns={2, 5},
             reset_filter=True,
         )
-        self._reset_table_view_sort_indicator(self._tv_merge_dropped)
-        self._auto_size_columns(self._tv_merge_dropped, self._merge_dropped_model)
+        if self._merge_dropped_header_mgr is not None:
+            self._merge_dropped_header_mgr.reapply_sort()
 
         self._merge_preview_tabs.setTabText(0, f"合并结果表 ({merged.row_count:,} 行 × {merged.col_count} 列)")
-        self._merge_preview_tabs.setTabText(1, f"被去重明细 ({len(dropped_rows):,} 条)")
+        self._merge_preview_tabs.setTabText(1, f"被去重明细 ({len(dropped_rows):,})")
 
         stats_parts = [
             f"合并结果：{merged.row_count:,} 行 × {merged.col_count} 列",
@@ -624,6 +686,7 @@ class TablesMergeTabMixin:
             stats_parts.insert(0, f"原始输入：{result.stats['input_rows']:,} 行")
         self._merge_summary_lbl.setText(" · ".join(stats_parts))
 
+        self._merge_stack.setCurrentIndex(1)
         self._apply_merge_filter()
         self._sync_controls_state()
 
@@ -667,18 +730,17 @@ class TablesMergeTabMixin:
         self._merge_search.blockSignals(False)
         self._merge_dropped_refs.clear()
 
+        if self._merge_result_header_mgr is not None:
+            self._merge_result_header_mgr.sync_dynamic_columns(auto_fit=False)
         self._reset_table_view_sort_indicator(self._tv_merge_result)
-        self._reset_table_view_sort_indicator(self._tv_merge_dropped)
 
-        self._merge_preview_tabs.setTabText(0, "合并结果表 (0 行 × 0 列)")
-        self._merge_preview_tabs.setTabText(1, "被去重明细 (0 条)")
-        self._merge_summary_lbl.setText("请勾选左侧表格后，点击「▶ 合并预览」（支持单表去重或多表合并）")
+        self._merge_preview_tabs.setTabText(0, "合并结果表 (0 行)")
+        self._merge_preview_tabs.setTabText(1, "被去重明细 (0)")
+        self._merge_summary_lbl.setText("勾选左侧表格后点击「合并预览」（支持单表去重或多表合并）")
         self._merge_filter_lbl.setText("0 行")
+        self._merge_stack.setCurrentIndex(0)
         for btn in (
-            self._btn_merge_xlsx,
-            self._btn_merge_docx,
-            self._btn_merge_csv,
-            self._btn_merge_txt,
+            self._btn_merge_export,
             self._btn_merge_add_workspace,
             self._btn_merge_write_db,
         ):
@@ -690,7 +752,7 @@ class TablesMergeTabMixin:
         cloned = self._last_merge_result.merged_table.clone()
         cloned.source_type = "merged"
         self.add_tables([cloned], select_first=True)
-        self.ctx.notify(f"已将「{cloned.name}」加入左侧工作台列表", "success")
+        self.ctx.notify(f"已将「{cloned.name}」加入左侧数据源列表", "success")
 
     def _write_merged_to_db(self) -> None:
         if not self._last_merge_result:
@@ -709,7 +771,7 @@ class TablesMergeTabMixin:
                 f"即将把合并结果「{merged.name}」（共 {merged.row_count:,} 行）"
                 f"解析标准编码并写入当前数据库「{Path(self.ctx.db.db_path).name}」："
             ),
-            detail_text="系统将在后台线程自动提取每行的标准编码、版本标签与分集信息并创建导入批次记录。",
+            detail_text="系统将在后台线程自动提取每行的标准编码并创建导入批次记录。",
             confirm_mode=True,
             confirm_label="确认写入总库",
             parent=self,
@@ -722,7 +784,6 @@ class TablesMergeTabMixin:
         parser_engine = self.ctx.parser
         source_name = snapshot.name or "多表合并入库"
 
-        # Prefer "_标准编码"/"标准编码" when present, while keeping fallback scanning enabled for blank cells!
         preferred_code_col: Optional[str] = None
         for cand in ("_标准编码", "标准编码"):
             if cand in snapshot.headers:
@@ -745,7 +806,6 @@ class TablesMergeTabMixin:
                     source_name=source_name,
                     fallback_scan_all=True,
                 )
-            # Legacy signature: code_column=None already prefers _CODE_COL_HINTS with scan_all=True
             return import_table_to_database(
                 snapshot,
                 db_repo,
