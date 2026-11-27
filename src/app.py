@@ -27,14 +27,18 @@ if not getattr(sys, "frozen", False):
         sys.path.insert(0, str(_ROOT))
 
 from PySide6.QtCore import QLockFile, QObject, Qt, QThread, Signal
-from PySide6.QtGui import QFont, QIcon
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from src.core.config import APP_NAME, ConfigManager
 from src.ui.app_context import AppContext
+from src.ui.delegates import sync_widget_craft_theme
 from src.ui.icon_gen import ensure_app_icon
 from src.ui.main_window import MainWindow
+from src.ui.proxy_style import install_app_style, sync_app_style_theme
+from src.ui.theme import build_stylesheet, get_ui_font
 from src.ui.widgets import ScrollableDetailDialog
+from src.ui.win32_style import install_win32_window_styler, sync_win32_theme
 
 _CRASH_LOG_PATH: Optional[Path] = None
 _FAULT_LOG_HANDLE: Optional[IO[str]] = None
@@ -251,6 +255,22 @@ def _acquire_single_instance_lock(data_dir: Path) -> Optional[QLockFile]:
     return None
 
 
+def _sync_global_craft_theme(theme: str) -> None:
+    """Keep AppProxyStyle, Win32 DWM titlebars, and craft delegates/scrollbars in sync."""
+    norm = "dark" if theme == "dark" else "light"
+    sync_app_style_theme(norm)
+    sync_win32_theme(norm)
+    sync_widget_craft_theme(None, norm)
+
+
+def _configure_app_craft(app: QApplication, theme: str = "light") -> None:
+    """Install deterministic Fusion proxy style, refined font stack, and DWM styler."""
+    norm = "dark" if theme == "dark" else "light"
+    install_app_style(app, theme=norm)
+    app.setFont(get_ui_font(9.5))
+    install_win32_window_styler(app, theme=norm)
+
+
 def _run_smoke_test(
     app: QApplication,
     data_dir_arg: str = "",
@@ -311,6 +331,8 @@ def _run_smoke_test(
         cfg_mgr.save()
 
         ctx = AppContext(config_manager=cfg_mgr)
+        _sync_global_craft_theme(ctx.config.theme)
+        ctx.theme_changed.connect(_sync_global_craft_theme)
         window = MainWindow(ctx)
         app.processEvents()
         window.close()
@@ -370,7 +392,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     app = existing_app if isinstance(existing_app, QApplication) else QApplication(qt_argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("DataDedupTool")
-    app.setFont(QFont("Microsoft YaHei UI", 10))
+
+    initial_theme = args.theme if args.theme in ("light", "dark") else "light"
+    _configure_app_craft(app, theme=initial_theme)
 
     _attach_qt_crash_bridge(app)
 
@@ -392,6 +416,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     cfg_mgr = ConfigManager(data_dir=Path(args.data_dir).resolve() if args.data_dir else None)
     _configure_crash_logging(cfg_mgr.data_dir)
+
+    effective_theme = args.theme if args.theme in ("light", "dark") else cfg_mgr.config.theme
+    _sync_global_craft_theme(effective_theme)
+    app.setStyleSheet(build_stylesheet(effective_theme))
 
     instance_lock = _acquire_single_instance_lock(cfg_mgr.data_dir)
     if instance_lock is None:
@@ -415,6 +443,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         cfg_mgr.save()
 
         ctx = AppContext(config_manager=cfg_mgr)
+        _sync_global_craft_theme(ctx.config.theme)
+        ctx.theme_changed.connect(_sync_global_craft_theme)
         window = MainWindow(ctx)
         window.show()
 
