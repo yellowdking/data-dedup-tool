@@ -2,7 +2,8 @@
 
 Supports arbitrary headers/rows, instant substring search filtering,
 finite numeric-aware column sorting with persistent selection preservation,
-and theme-cached semantic row tinting adapted for both Light and Dark themes.
+Option B dynamic theme row tinting, inline hover-copy roles on code columns,
+and seamless compatibility with ``TableHeaderManager.attach_dynamic()``.
 """
 
 from __future__ import annotations
@@ -14,52 +15,33 @@ from typing import TYPE_CHECKING, Any, Optional
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt
 from PySide6.QtGui import QBrush, QColor, QFont
 
+from src.ui.theme import get_palette
+
+try:
+    from src.ui.delegates import ROLE_COPY_TEXT
+except ImportError:
+    ROLE_COPY_TEXT = int(Qt.ItemDataRole.UserRole) + 41
+
 if TYPE_CHECKING:
     from src.core.table_data import DataTable
-
-
-# Subtle semantic row background & key-column foreground colors per theme
-_LIGHT_ROW_TINTS: dict[str, str] = {
-    "duplicate": "#FEF3C7",
-    "cross_dup": "#FEF3C7",
-    "intra_dup": "#F3E8FF",
-    "intersection": "#DCFCE7",
-    "dropped": "#FEE2E2",
-    "info": "#DBEAFE",
-}
-
-_DARK_ROW_TINTS: dict[str, str] = {
-    "duplicate": "#3B2809",
-    "cross_dup": "#3B2809",
-    "intra_dup": "#2D1B4E",
-    "intersection": "#0B3B2C",
-    "dropped": "#3F1219",
-    "info": "#172E54",
-}
-
-_LIGHT_KEY_FG: dict[str, str] = {
-    "duplicate": "#B45309",
-    "cross_dup": "#B45309",
-    "intra_dup": "#6D28D9",
-    "intersection": "#047857",
-    "dropped": "#B91C1C",
-    "info": "#1D4ED8",
-    "default": "#2563EB",
-}
-
-_DARK_KEY_FG: dict[str, str] = {
-    "duplicate": "#FBBF24",
-    "cross_dup": "#FBBF24",
-    "intra_dup": "#C4B5FD",
-    "intersection": "#34D399",
-    "dropped": "#F87171",
-    "info": "#60A5FA",
-    "default": "#60A5FA",
-}
 
 # Fast numeric validators rejecting NaN, Inf, malformed commas (e.g. ",123"), and plain text
 _RE_PLAIN_NUM = re.compile(r"^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?$")
 _RE_COMMA_NUM = re.compile(r"^[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?$")
+
+
+def _make_mono_font(point_size: float = 9.5, *, bold: bool = True) -> QFont:
+    try:
+        from src.ui.theme import get_mono_font
+
+        weight = QFont.Weight.DemiBold if bold else QFont.Weight.Normal
+        return get_mono_font(point_size=point_size, weight=weight)
+    except Exception:
+        font = QFont("Cascadia Mono", int(round(point_size)))
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setFamilies(["Cascadia Mono", "JetBrains Mono", "Consolas", "monospace"])
+        font.setBold(bold)
+        return font
 
 
 def _try_float(text: str) -> Optional[float]:
@@ -122,24 +104,54 @@ class DynamicTableModel(QAbstractTableModel):
         self._row_tints: dict[int, str] = {}
         self._highlight_columns: set[int] = set()
         self._mono_columns: set[int] = set()
+        self._copy_columns: set[int] = set()
         self._center_columns: set[int] = set()
         self._sort_col: int = -1
         self._sort_order: Qt.SortOrder = Qt.SortOrder.AscendingOrder
 
-        self._mono_font = QFont("Consolas", 10)
-        self._mono_font.setBold(True)
+        self._mono_font = _make_mono_font(10, bold=True)
 
         self._bg_brushes: dict[str, QBrush] = {}
         self._fg_brushes: dict[str, QBrush] = {}
         self._rebuild_theme_brushes()
 
     # ------------------------------------------------------------------
-    # Theme brush cache
+    # Dynamic Option B theme brush cache
     # ------------------------------------------------------------------
 
     def _rebuild_theme_brushes(self) -> None:
-        bg_palette = _DARK_ROW_TINTS if self._theme == "dark" else _LIGHT_ROW_TINTS
-        fg_palette = _DARK_KEY_FG if self._theme == "dark" else _LIGHT_KEY_FG
+        p = get_palette(self._theme)
+        is_dark = self._theme == "dark"
+
+        bg_warning = p.get("warning_soft", "#261E0F" if is_dark else "#FFFBEB")
+        bg_purple = p.get("purple_soft", "#201833" if is_dark else "#F5F3FF")
+        bg_success = p.get("row_tint_matched", p.get("success_soft", "#111E17" if is_dark else "#F6FBF7"))
+        bg_danger = p.get("row_tint_missing", p.get("danger_soft", "#221417" if is_dark else "#FEF7F7"))
+        bg_info = p.get("accent_soft", "#1D2038" if is_dark else "#EFF0FC")
+
+        fg_warning = p.get("warning", "#FBBF24" if is_dark else "#B45309")
+        fg_purple = p.get("purple", "#A78BFA" if is_dark else "#6D28D9")
+        fg_success = p.get("success", "#4ADE80" if is_dark else "#15803D")
+        fg_danger = p.get("danger", "#FB7185" if is_dark else "#B91C1C")
+        fg_accent = p.get("accent", "#7C86E8" if is_dark else "#5E6AD2")
+
+        bg_palette = {
+            "duplicate": bg_warning,
+            "cross_dup": bg_warning,
+            "intra_dup": bg_purple,
+            "intersection": bg_success,
+            "dropped": bg_danger,
+            "info": bg_info,
+        }
+        fg_palette = {
+            "duplicate": fg_warning,
+            "cross_dup": fg_warning,
+            "intra_dup": fg_purple,
+            "intersection": fg_success,
+            "dropped": fg_danger,
+            "info": fg_accent,
+            "default": fg_accent,
+        }
         self._bg_brushes = {k: QBrush(QColor(v)) for k, v in bg_palette.items()}
         self._fg_brushes = {k: QBrush(QColor(v)) for k, v in fg_palette.items()}
 
@@ -170,6 +182,7 @@ class DynamicTableModel(QAbstractTableModel):
         highlight_columns: Optional[set[int]] = None,
         mono_columns: Optional[set[int]] = None,
         center_columns: Optional[set[int]] = None,
+        copy_columns: Optional[set[int]] = None,
         *,
         reset_filter: bool = True,
     ) -> None:
@@ -184,6 +197,7 @@ class DynamicTableModel(QAbstractTableModel):
             highlight_columns=highlight_columns,
             mono_columns=mono_columns,
             center_columns=center_columns,
+            copy_columns=copy_columns,
             reset_filter=reset_filter,
         )
 
@@ -195,6 +209,7 @@ class DynamicTableModel(QAbstractTableModel):
         highlight_columns: Optional[set[int]] = None,
         mono_columns: Optional[set[int]] = None,
         center_columns: Optional[set[int]] = None,
+        copy_columns: Optional[set[int]] = None,
         *,
         reset_filter: bool = True,
     ) -> None:
@@ -223,6 +238,9 @@ class DynamicTableModel(QAbstractTableModel):
         self._row_tints = dict(row_tints) if row_tints else {}
         self._highlight_columns = set(highlight_columns) if highlight_columns else set()
         self._mono_columns = set(mono_columns) if mono_columns else set()
+        self._copy_columns = (
+            set(copy_columns) if copy_columns is not None else set(self._mono_columns)
+        )
         self._center_columns = set(center_columns) if center_columns else set()
         self._sort_col = -1
         self._sort_order = Qt.SortOrder.AscendingOrder
@@ -242,6 +260,7 @@ class DynamicTableModel(QAbstractTableModel):
         self._row_tints = {}
         self._highlight_columns = set()
         self._mono_columns = set()
+        self._copy_columns = set()
         self._center_columns = set()
         self._sort_col = -1
         self._sort_order = Qt.SortOrder.AscendingOrder
@@ -375,6 +394,13 @@ class DynamicTableModel(QAbstractTableModel):
         row_cells = self._rows[orig_row]
         value = row_cells[col] if col < len(row_cells) else ""
 
+        if role == ROLE_COPY_TEXT:
+            if col in self._copy_columns:
+                cleaned = value.strip()
+                if cleaned and cleaned != "-":
+                    return cleaned
+            return None
+
         if role == Qt.ItemDataRole.DisplayRole:
             if "\n" in value:
                 return value.replace("\r\n", " ").replace("\n", " ↵ ")
@@ -418,6 +444,8 @@ class DynamicTableModel(QAbstractTableModel):
             self._sort_col = -1
             return
         if column < 0:
+            if self._sort_col < 0:
+                return
             self._sort_col = -1
             self._sort_order = Qt.SortOrder.AscendingOrder
             old_persistent = self.persistentIndexList()
