@@ -23,12 +23,15 @@ APP_DIR_NAME = "DataDedupTool"
 DEFAULT_COMPANION_EXTENSIONS: List[str] = list(DEFAULT_COMPANION_EXTENSIONS_LIST)
 
 _VALID_THEMES = {"light", "dark", "system"}
+_VALID_DUPLICATES_VIEW_MODES = {"flat", "grouped"}
 _VALID_DEDUP_STRATEGIES = {
     "keep_earliest",
     "keep_latest",
     "keep_highest_tag_score",
     "keep_longest_name",
 }
+_TABLE_COL_MIN_WIDTH = 36
+_TABLE_COL_MAX_WIDTH = 1600
 _PORTABLE_PATH_FIELDS = (
     "current_db_path",
     "custom_rules_path",
@@ -180,6 +183,68 @@ def _safe_str(value: Any, default: str = "") -> str:
     return default
 
 
+def _safe_str_list(value: Any) -> List[str]:
+    """Parse a JSON list of non-empty stripped strings, preserving first-seen order."""
+    if not isinstance(value, list):
+        return []
+    result: List[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        cleaned = item.strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            result.append(cleaned)
+    return result
+
+
+@dataclass
+class TableLayoutState:
+    """Persistent per-table column visibility, visual order, widths, and sort state."""
+
+    visible_cols: List[str] = field(default_factory=list)
+    column_order: List[str] = field(default_factory=list)
+    column_widths: Dict[str, int] = field(default_factory=dict)
+    sort_col: str = ""
+    sort_desc: bool = False
+    known_cols: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize layout state to a plain JSON-compatible dictionary."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "TableLayoutState":
+        """Create a ``TableLayoutState`` with per-field fault tolerance."""
+        if not isinstance(data, dict):
+            return cls()
+
+        raw_widths = data.get("column_widths")
+        widths: Dict[str, int] = {}
+        if isinstance(raw_widths, dict):
+            for raw_key, raw_val in raw_widths.items():
+                if not isinstance(raw_key, str):
+                    continue
+                key = raw_key.strip()
+                if not key or raw_val is None or isinstance(raw_val, bool):
+                    continue
+                try:
+                    width = int(raw_val)
+                except (TypeError, ValueError):
+                    continue
+                widths[key] = max(_TABLE_COL_MIN_WIDTH, min(_TABLE_COL_MAX_WIDTH, width))
+
+        return cls(
+            visible_cols=_safe_str_list(data.get("visible_cols")),
+            column_order=_safe_str_list(data.get("column_order")),
+            column_widths=widths,
+            sort_col=_safe_str(data.get("sort_col"), ""),
+            sort_desc=_safe_bool(data.get("sort_desc"), False),
+            known_cols=_safe_str_list(data.get("known_cols")),
+        )
+
+
 @dataclass
 class WindowGeometry:
     """Stored desktop window dimensions and position."""
@@ -225,6 +290,9 @@ class AppConfig:
     default_import_dir: str = ""
     default_export_dir: str = ""
     window_geometry: WindowGeometry = field(default_factory=WindowGeometry)
+    table_layouts: Dict[str, TableLayoutState] = field(default_factory=dict)
+    duplicates_view_mode: str = "flat"
+    show_advanced_fields: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize configuration to a plain JSON-compatible dictionary."""
@@ -277,6 +345,21 @@ class AppConfig:
             else "keep_highest_tag_score"
         )
 
+        raw_layouts = data.get("table_layouts")
+        table_layouts: Dict[str, TableLayoutState] = {}
+        if isinstance(raw_layouts, dict):
+            for raw_tid, raw_state in raw_layouts.items():
+                if not isinstance(raw_tid, str) or not isinstance(raw_state, dict):
+                    continue
+                tid = raw_tid.strip()
+                if tid:
+                    table_layouts[tid] = TableLayoutState.from_dict(raw_state)
+
+        raw_dup_mode = _safe_str(data.get("duplicates_view_mode"), "flat").lower()
+        dup_mode = (
+            raw_dup_mode if raw_dup_mode in _VALID_DUPLICATES_VIEW_MODES else "flat"
+        )
+
         return cls(
             current_db_path=_safe_str(data.get("current_db_path"), ""),
             recent_db_paths=recent[:max_recent],
@@ -291,6 +374,9 @@ class AppConfig:
             default_import_dir=_safe_str(data.get("default_import_dir"), ""),
             default_export_dir=_safe_str(data.get("default_export_dir"), ""),
             window_geometry=WindowGeometry.from_dict(data.get("window_geometry")),
+            table_layouts=table_layouts,
+            duplicates_view_mode=dup_mode,
+            show_advanced_fields=_safe_bool(data.get("show_advanced_fields"), False),
         )
 
 
@@ -531,6 +617,30 @@ class ConfigManager:
         if qt_geometry_b64 is not None:
             geom.qt_geometry_b64 = qt_geometry_b64
         return geom
+
+    def get_table_layout(self, table_id: str) -> Optional[TableLayoutState]:
+        """Return stored layout state for ``table_id``, if any."""
+        return self.config.table_layouts.get(table_id)
+
+    def set_table_layout(self, table_id: str, state: TableLayoutState) -> None:
+        """Store or overwrite the layout state for ``table_id`` in memory."""
+        tid = (table_id or "").strip()
+        if tid:
+            self.config.table_layouts[tid] = state
+
+    def reset_table_layouts(
+        self,
+        table_id: Optional[str] = None,
+        *,
+        save: bool = False,
+    ) -> None:
+        """Clear persisted table layouts (for one table or all tables)."""
+        if table_id is None:
+            self.config.table_layouts.clear()
+        else:
+            self.config.table_layouts.pop(table_id, None)
+        if save:
+            self.save()
 
     def reset_to_defaults(self) -> AppConfig:
         """Reset settings to factory defaults while keeping data_dir paths."""

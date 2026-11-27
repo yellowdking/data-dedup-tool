@@ -20,6 +20,7 @@ class AppContext(QObject):
     db_switched = Signal(str)
     rules_changed = Signal()
     settings_changed = Signal()
+    table_layouts_reset = Signal()
     theme_changed = Signal(str)
     toast_requested = Signal(str, str)  # (message, level)
     status_message = Signal(str)
@@ -104,11 +105,23 @@ class AppContext(QObject):
         self.db.auto_backup = bool(self.config.auto_backup)
         self.db.backup_keep_count = max(1, int(self.config.backup_keep_count))
 
+    def reset_all_table_layouts(self) -> None:
+        """Reset every persisted table layout to factory defaults and notify all views."""
+        self.config_manager.reset_table_layouts()
+        self.config_manager.save()
+        self.table_layouts_reset.emit()
+
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         try:
+            try:
+                from src.ui.table_header import TableHeaderManager
+
+                TableHeaderManager.flush_all()
+            except Exception:
+                pass
             self.config_manager.save()
         finally:
             self.db.close()
