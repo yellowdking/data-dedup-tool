@@ -1,15 +1,65 @@
-"""High-performance virtualized Qt6 table models for 数据查重程序."""
+"""High-performance virtualized Qt6 table models for 数据查重程序.
+
+Exports:
+- ``DuplicateTableModel`` & ``DUPLICATE_COLUMN_SPECS`` (implemented in
+  ``table_duplicate_model.py`` and re-exported here)
+- ``RecordTableModel`` (View 1: 数据总库)
+- ``PreviewTableModel`` (View 2: 批量导入)
+- ``CompareTableModel`` (View 3 Mode A: 查当前总库)
+"""
 
 from __future__ import annotations
 
 from typing import Any, Callable, Optional
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QBrush, QColor, QFont
 
 from src.core.models import DataRecord, ParseResult
+from src.ui.table_duplicate_model import (
+    DUPLICATE_COLUMN_SPECS,
+    ROLE_BADGE,
+    ROLE_COPY_TEXT,
+    ROLE_GROUP_COLLAPSED,
+    ROLE_GROUP_DIVIDER,
+    ROLE_GROUP_HEADER,
+    build_duplicate_table_model_class,
+)
+from src.ui.table_header import ColumnSpec
 from src.ui.theme import get_palette
 from src.ui.widgets import format_file_size
+
+__all__ = [
+    "DUPLICATE_COLUMN_SPECS",
+    "ROLE_BADGE",
+    "ROLE_COPY_TEXT",
+    "ROLE_GROUP_COLLAPSED",
+    "ROLE_GROUP_DIVIDER",
+    "ROLE_GROUP_HEADER",
+    "DuplicateTableModel",
+    "RecordTableModel",
+    "PreviewTableModel",
+    "CompareTableModel",
+    "_ThemedTableModelMixin",
+    "_make_mono_font",
+    "_sort_with_persistent_indexes",
+    "_split_manual_code",
+]
+
+
+def _make_mono_font(point_size: float = 9.5, *, bold: bool = True) -> QFont:
+    """Create a crisp tabular monospace font synced with theme.get_mono_font."""
+    try:
+        from src.ui.theme import get_mono_font
+
+        weight = QFont.Weight.DemiBold if bold else QFont.Weight.Normal
+        return get_mono_font(point_size=point_size, weight=weight)
+    except Exception:
+        font = QFont("Cascadia Mono", int(round(point_size)))
+        font.setStyleHint(QFont.StyleHint.Monospace)
+        font.setFamilies(["Cascadia Mono", "JetBrains Mono", "Consolas", "monospace"])
+        font.setBold(bold)
+        return font
 
 
 def _split_manual_code(code: str) -> tuple[str, str]:
@@ -20,8 +70,7 @@ def _split_manual_code(code: str) -> tuple[str, str]:
     """
     if "-" in code:
         left, right = code.rsplit("-", 1)
-        left = left.strip()
-        right = right.strip()
+        left, right = left.strip(), right.strip()
         if left and right:
             return left, right
     return "", code
@@ -44,10 +93,9 @@ def _sort_with_persistent_indexes(
         for idx in old_persistent:
             if idx.isValid() and 0 <= idx.row() < len(old_ids):
                 target_row = new_pos.get(old_ids[idx.row()], -1)
-                if target_row >= 0:
-                    new_persistent.append(model.index(target_row, idx.column()))
-                else:
-                    new_persistent.append(QModelIndex())
+                new_persistent.append(
+                    model.index(target_row, idx.column()) if target_row >= 0 else QModelIndex()
+                )
             else:
                 new_persistent.append(QModelIndex())
         model.changePersistentIndexList(old_persistent, new_persistent)
@@ -55,14 +103,20 @@ def _sort_with_persistent_indexes(
 
 
 class _ThemedTableModelMixin:
-    """Shared Light/Dark theme palette colors for QAbstractTableModel subclasses."""
+    """Shared Light/Dark Option B palette colors for QAbstractTableModel subclasses."""
 
     _theme: str
     _color_accent: QColor
     _color_success: QColor
     _color_warning: QColor
+    _color_danger: QColor
     _color_purple: QColor
     _color_muted: QColor
+    _color_primary: QColor
+    _color_secondary: QColor
+    _bg_group_band: QBrush
+    _bg_checked: QBrush
+    _bg_group_header: QBrush
 
     def _init_theme_colors(self, theme: str = "light") -> None:
         self._theme = "dark" if theme == "dark" else "light"
@@ -70,14 +124,29 @@ class _ThemedTableModelMixin:
 
     def _refresh_theme_colors(self) -> None:
         p = get_palette(self._theme)
-        self._color_accent = QColor(p["accent"])
-        self._color_success = QColor(p["success"])
-        self._color_warning = QColor(p["warning"])
-        self._color_purple = QColor(p["purple"])
-        self._color_muted = QColor(p["text_muted"])
+        is_dark = self._theme == "dark"
+        self._color_accent = QColor(p.get("accent", "#7C86E8" if is_dark else "#5E6AD2"))
+        self._color_success = QColor(p.get("success", "#4ADE80" if is_dark else "#15803D"))
+        self._color_warning = QColor(p.get("warning", "#FBBF24" if is_dark else "#B45309"))
+        self._color_danger = QColor(p.get("danger", "#FB7185" if is_dark else "#B91C1C"))
+        self._color_purple = QColor(p.get("purple", "#A78BFA" if is_dark else "#6D28D9"))
+        self._color_muted = QColor(p.get("text_muted", "#63636E" if is_dark else "#A1A1AA"))
+        self._color_primary = QColor(p.get("text_primary", "#F4F4F5" if is_dark else "#09090B"))
+        self._color_secondary = QColor(
+            p.get("text_secondary", "#A1A1AA" if is_dark else "#52525B")
+        )
+        self._bg_group_band = QBrush(
+            QColor(p.get("bg_group_band", "#13151A" if is_dark else "#FAFAFB"))
+        )
+        self._bg_checked = QBrush(
+            QColor(p.get("row_tint_checked", "#261418" if is_dark else "#FEF2F2"))
+        )
+        self._bg_group_header = QBrush(
+            QColor(p.get("bg_surface_alt", "#1C1F26" if is_dark else "#F4F4F5"))
+        )
 
     def set_theme(self, theme: str) -> None:
-        """Update model foreground colors for Light or Dark mode."""
+        """Update model foreground/background colors for Light or Dark mode."""
         normalized = "dark" if theme == "dark" else "light"
         if normalized == self._theme:
             return
@@ -89,32 +158,43 @@ class _ThemedTableModelMixin:
             self.dataChanged.emit(  # type: ignore[attr-defined]
                 self.index(0, 0),  # type: ignore[attr-defined]
                 self.index(rows - 1, cols - 1),  # type: ignore[attr-defined]
-                [Qt.ItemDataRole.ForegroundRole],
+                [
+                    Qt.ItemDataRole.ForegroundRole,
+                    Qt.ItemDataRole.BackgroundRole,
+                    ROLE_BADGE,
+                ],
             )
+
+
+DuplicateTableModel = build_duplicate_table_model_class(_ThemedTableModelMixin, _make_mono_font)
 
 
 class RecordTableModel(_ThemedTableModelMixin, QAbstractTableModel):
     """Virtualized table model backing View 1 (数据总库)."""
 
-    COLUMNS = [
-        ("标准编码", 125),
-        ("前缀", 72),
-        ("版本标签", 105),
-        ("分集", 66),
-        ("原始文件名", 230),
-        ("来源", 125),
-        ("大小", 82),
-        ("匹配规则", 130),
-        ("入库时间", 135),
+    # Logical indices 0..8 preserved strictly for backward compatibility with existing tests.
+    COLUMN_SPECS: list[ColumnSpec] = [
+        ColumnSpec("code", "标准编码", default_width=142, default_visible=True, min_width=100, lock_visible=True),
+        ColumnSpec("prefix", "前缀", default_width=76, default_visible=False, min_width=56, category="advanced"),
+        ColumnSpec("tags", "版本标签", default_width=110, default_visible=False, min_width=72, category="advanced"),
+        ColumnSpec("part", "分集", default_width=68, default_visible=False, min_width=54, category="advanced"),
+        ColumnSpec("file_name", "原始文件名", default_width=320, default_visible=True, min_width=140, stretch_weight=1.0),
+        ColumnSpec("source", "来源", default_width=160, default_visible=True, min_width=90),
+        ColumnSpec("file_size", "大小", default_width=96, default_visible=True, min_width=72),
+        ColumnSpec("rule", "匹配规则", default_width=130, default_visible=False, min_width=90, category="advanced"),
+        ColumnSpec("created_at", "入库时间", default_width=148, default_visible=True, min_width=110),
+        ColumnSpec("record_id", "ID", default_width=68, default_visible=False, min_width=52, category="advanced"),
+        ColumnSpec("note", "备注", default_width=180, default_visible=False, min_width=90, category="advanced"),
     ]
+
+    COLUMNS: list[tuple[str, int]] = [(s.label, s.default_width) for s in COLUMN_SPECS]
 
     def __init__(self, parent: Optional[Any] = None, theme: str = "light") -> None:
         super().__init__(parent)
         self._init_theme_colors(theme)
         self._records: list[DataRecord] = []
         self._duplicate_codes: set[str] = set()
-        self._mono_font = QFont("Consolas", 10)
-        self._mono_font.setBold(True)
+        self._mono_font = _make_mono_font(10, bold=True)
 
     def set_records(
         self,
@@ -133,22 +213,16 @@ class RecordTableModel(_ThemedTableModelMixin, QAbstractTableModel):
         self.endResetModel()
 
     def record_at(self, row: int) -> Optional[DataRecord]:
-        if 0 <= row < len(self._records):
-            return self._records[row]
-        return None
+        return self._records[row] if 0 <= row < len(self._records) else None
 
     def all_records(self) -> list[DataRecord]:
         return list(self._records)
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
-        if parent.isValid():
-            return 0
-        return len(self._records)
+        return 0 if parent.isValid() else len(self._records)
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
-        if parent.isValid():
-            return 0
-        return len(self.COLUMNS)
+        return 0 if parent.isValid() else len(self.COLUMN_SPECS)
 
     def headerData(
         self,
@@ -157,40 +231,36 @@ class RecordTableModel(_ThemedTableModelMixin, QAbstractTableModel):
         role: int = Qt.ItemDataRole.DisplayRole,
     ) -> Any:
         if role == Qt.ItemDataRole.DisplayRole:
-            if orientation == Qt.Orientation.Horizontal and 0 <= section < len(self.COLUMNS):
-                return self.COLUMNS[section][0]
+            if orientation == Qt.Orientation.Horizontal and 0 <= section < len(self.COLUMN_SPECS):
+                return self.COLUMN_SPECS[section].label
             if orientation == Qt.Orientation.Vertical:
                 return str(section + 1)
         return None
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
-        if not index.isValid():
+        if not index.isValid() or not (0 <= index.row() < len(self._records)):
             return None
-        row = index.row()
+        rec = self._records[index.row()]
         col = index.column()
-        if not (0 <= row < len(self._records)):
-            return None
-        rec = self._records[row]
+
+        if role == ROLE_COPY_TEXT:
+            return rec.canonical_code if col == 0 and rec.canonical_code else None
 
         if role == Qt.ItemDataRole.DisplayRole:
-            if col == 0:
-                return rec.canonical_code
-            if col == 1:
-                return rec.prefix or "-"
-            if col == 2:
-                return " / ".join(rec.tags) if rec.tags else "-"
-            if col == 3:
-                return rec.part or "-"
-            if col == 4:
-                return rec.file_name or rec.raw_text
-            if col == 5:
-                return rec.source_name or rec.source_type
-            if col == 6:
-                return format_file_size(rec.file_size)
-            if col == 7:
-                return rec.matched_rule or "-"
-            if col == 8:
-                return rec.created_at[:19] if rec.created_at else "-"
+            vals = (
+                rec.canonical_code,
+                rec.prefix or "-",
+                " / ".join(rec.tags) if rec.tags else "-",
+                rec.part or "-",
+                rec.file_name or rec.raw_text,
+                rec.source_name or rec.source_type,
+                format_file_size(rec.file_size),
+                rec.matched_rule or "-",
+                rec.created_at[:19] if rec.created_at else "-",
+                str(rec.id) if rec.id is not None else "-",
+                rec.note or "-",
+            )
+            return vals[col] if 0 <= col < len(vals) else None
 
         if role == Qt.ItemDataRole.FontRole and col == 0:
             return self._mono_font
@@ -202,11 +272,12 @@ class RecordTableModel(_ThemedTableModelMixin, QAbstractTableModel):
                 return self._color_accent
             if col == 3 and rec.part:
                 return self._color_purple
+            if col in (8, 9):
+                return self._color_muted
 
         if role == Qt.ItemDataRole.TextAlignmentRole:
-            if col in (1, 3, 6):
-                return int(Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
-            return int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            align = Qt.AlignmentFlag.AlignCenter if col in (1, 3, 6, 9) else Qt.AlignmentFlag.AlignLeft
+            return int(align | Qt.AlignmentFlag.AlignVCenter)
 
         if role == Qt.ItemDataRole.ToolTipRole:
             parts = [
@@ -230,7 +301,8 @@ class RecordTableModel(_ThemedTableModelMixin, QAbstractTableModel):
         column: int,
         order: Qt.SortOrder = Qt.SortOrder.AscendingOrder,
     ) -> None:
-        reverse = order == Qt.SortOrder.DescendingOrder
+        if column < 0:
+            return
         key_funcs = {
             0: lambda r: (r.canonical_code or "").lower(),
             1: lambda r: (r.prefix or "").lower(),
@@ -238,22 +310,50 @@ class RecordTableModel(_ThemedTableModelMixin, QAbstractTableModel):
             3: lambda r: (r.part or "").lower(),
             4: lambda r: (r.file_name or r.raw_text or "").lower(),
             5: lambda r: (r.source_name or "").lower(),
-            6: lambda r: r.file_size,
+            6: lambda r: int(r.file_size or 0),
             7: lambda r: (r.matched_rule or "").lower(),
             8: lambda r: r.created_at or "",
+            9: lambda r: int(r.id or 0),
+            10: lambda r: (r.note or "").lower(),
         }
-        key_fn = key_funcs.get(column, key_funcs[0])
-        _sort_with_persistent_indexes(self, self._records, key_fn, reverse)
+        _sort_with_persistent_indexes(
+            self, self._records, key_funcs.get(column, key_funcs[0]), order == Qt.SortOrder.DescendingOrder
+        )
 
 
 class PreviewTableModel(_ThemedTableModelMixin, QAbstractTableModel):
-    """Virtualized table model for Batch Import Preview tabs.
-
-    Supports editable canonical code on the 'unrecognized' tab so users can
-    manually fix obscure filenames directly inside the preview table.
-    """
+    """Virtualized table model for Batch Import Preview tabs with inline code fix."""
 
     code_manually_fixed = Signal(int, str)
+
+    @classmethod
+    def specs_for_mode(cls, mode: str) -> list[ColumnSpec]:
+        if mode == "db_dup":
+            return [
+                ColumnSpec("code", "标准编码", default_width=142, default_visible=True, min_width=100, lock_visible=True),
+                ColumnSpec("file_name", "本次文件", default_width=240, default_visible=True, min_width=120, stretch_weight=0.5),
+                ColumnSpec("existing", "库内已有记录", default_width=260, default_visible=True, min_width=130, stretch_weight=0.5),
+                ColumnSpec("tags", "版本标签", default_width=110, default_visible=False, min_width=72, category="advanced"),
+                ColumnSpec("part", "分集", default_width=68, default_visible=False, min_width=54, category="advanced"),
+                ColumnSpec("source", "来源", default_width=155, default_visible=True, min_width=90),
+            ]
+        if mode == "unrecognized":
+            return [
+                ColumnSpec("code", "手动修正编码 (双击输入)", default_width=175, default_visible=True, min_width=120, lock_visible=True),
+                ColumnSpec("file_name", "原始文本 / 文件名", default_width=290, default_visible=True, min_width=140, stretch_weight=1.0),
+                ColumnSpec("parent_dir", "上级目录", default_width=160, default_visible=False, min_width=90, category="advanced"),
+                ColumnSpec("source", "来源", default_width=150, default_visible=True, min_width=90),
+                ColumnSpec("note", "说明", default_width=185, default_visible=True, min_width=110),
+            ]
+        return [
+            ColumnSpec("code", "标准编码", default_width=142, default_visible=True, min_width=100, lock_visible=True),
+            ColumnSpec("prefix", "前缀", default_width=76, default_visible=False, min_width=56, category="advanced"),
+            ColumnSpec("tags", "版本标签", default_width=110, default_visible=False, min_width=72, category="advanced"),
+            ColumnSpec("part", "分集", default_width=68, default_visible=False, min_width=54, category="advanced"),
+            ColumnSpec("file_name", "原始文件名 / 文本", default_width=320, default_visible=True, min_width=140, stretch_weight=1.0),
+            ColumnSpec("rule", "匹配规则", default_width=130, default_visible=False, min_width=90, category="advanced"),
+            ColumnSpec("source", "来源", default_width=160, default_visible=True, min_width=90),
+        ]
 
     def __init__(
         self,
@@ -265,15 +365,12 @@ class PreviewTableModel(_ThemedTableModelMixin, QAbstractTableModel):
         self._init_theme_colors(theme)
         self._mode = mode  # "new" | "db_dup" | "batch_dup" | "unrecognized"
         self._rows: list[Any] = []
-        self._mono_font = QFont("Consolas", 10)
-        self._mono_font.setBold(True)
+        self._mono_font = _make_mono_font(10, bold=True)
+        self.COLUMN_SPECS: list[ColumnSpec] = self.specs_for_mode(mode)
+        self._headers: list[str] = [s.label for s in self.COLUMN_SPECS]
 
-        if mode == "db_dup":
-            self._headers = ["标准编码", "本次文件", "库内已有记录", "标签", "分集", "来源"]
-        elif mode == "unrecognized":
-            self._headers = ["手动修正编码 (双击输入)", "原始文本 / 文件名", "上级目录", "来源", "说明"]
-        else:
-            self._headers = ["标准编码", "前缀", "标签", "分集", "原始文件名 / 文本", "匹配规则", "来源"]
+    def column_specs(self) -> list[ColumnSpec]:
+        return list(self.COLUMN_SPECS)
 
     def set_rows(self, rows: list[Any]) -> None:
         self.beginResetModel()
@@ -284,9 +381,7 @@ class PreviewTableModel(_ThemedTableModelMixin, QAbstractTableModel):
         return self._rows
 
     def row_at(self, row: int) -> Optional[Any]:
-        if 0 <= row < len(self._rows):
-            return self._rows[row]
-        return None
+        return self._rows[row] if 0 <= row < len(self._rows) else None
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self._rows)
@@ -324,66 +419,59 @@ class PreviewTableModel(_ThemedTableModelMixin, QAbstractTableModel):
             and role == Qt.ItemDataRole.EditRole
             and index.isValid()
             and index.column() == 0
+            and 0 <= index.row() < len(self._rows)
         ):
             row = index.row()
-            if 0 <= row < len(self._rows):
-                new_code = str(value or "").strip().upper()
-                item: ParseResult = self._rows[row]
-                item.canonical_code = new_code
-                item.recognized = bool(new_code)
-                if new_code:
-                    item.matched_rule = "手动修正"
-                    item.confidence = 1.0
-                    prefix, number = _split_manual_code(new_code)
-                    item.prefix = prefix
-                    item.number = number
-                else:
-                    item.matched_rule = ""
-                    item.confidence = 0.0
-                    item.prefix = ""
-                    item.number = ""
+            new_code = str(value or "").strip().upper()
+            item: ParseResult = self._rows[row]
+            item.canonical_code = new_code
+            item.recognized = bool(new_code)
+            if new_code:
+                item.matched_rule = "手动修正"
+                item.confidence = 1.0
+                item.prefix, item.number = _split_manual_code(new_code)
+            else:
+                item.matched_rule = ""
+                item.confidence = 0.0
+                item.prefix = ""
+                item.number = ""
 
-                left = self.index(row, 0)
-                right = self.index(row, self.columnCount() - 1)
-                self.dataChanged.emit(
-                    left,
-                    right,
-                    [
-                        Qt.ItemDataRole.DisplayRole,
-                        Qt.ItemDataRole.EditRole,
-                        Qt.ItemDataRole.ForegroundRole,
-                        Qt.ItemDataRole.FontRole,
-                    ],
-                )
-                self.code_manually_fixed.emit(row, new_code)
-                return True
+            self.dataChanged.emit(
+                self.index(row, 0),
+                self.index(row, self.columnCount() - 1),
+                [
+                    Qt.ItemDataRole.DisplayRole,
+                    Qt.ItemDataRole.EditRole,
+                    Qt.ItemDataRole.ForegroundRole,
+                    Qt.ItemDataRole.FontRole,
+                    ROLE_COPY_TEXT,
+                ],
+            )
+            self.code_manually_fixed.emit(row, new_code)
+            return True
         return False
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
-        if not index.isValid():
+        if not index.isValid() or not (0 <= index.row() < len(self._rows)):
             return None
         row, col = index.row(), index.column()
-        if not (0 <= row < len(self._rows)):
-            return None
 
         if self._mode == "db_dup":
             item, existing = self._rows[row]
+            if role == ROLE_COPY_TEXT:
+                return item.canonical_code if col == 0 and item.canonical_code else None
             if role == Qt.ItemDataRole.DisplayRole:
-                if col == 0:
-                    return item.canonical_code
-                if col == 1:
-                    return item.file_name or item.raw_text
-                if col == 2:
-                    first = existing[0].file_name or existing[0].raw_text if existing else ""
-                    if len(existing) > 1:
-                        return f"共 {len(existing)} 条：{first} ..."
-                    return first
-                if col == 3:
-                    return " / ".join(item.tags) if item.tags else "-"
-                if col == 4:
-                    return item.part or "-"
-                if col == 5:
-                    return item.source_name or item.source_type
+                first = existing[0].file_name or existing[0].raw_text if existing else ""
+                existing_txt = f"共 {len(existing)} 条：{first} ..." if len(existing) > 1 else first
+                vals = (
+                    item.canonical_code,
+                    item.file_name or item.raw_text,
+                    existing_txt,
+                    " / ".join(item.tags) if item.tags else "-",
+                    item.part or "-",
+                    item.source_name or item.source_type,
+                )
+                return vals[col] if 0 <= col < len(vals) else None
             if role == Qt.ItemDataRole.FontRole and col == 0:
                 return self._mono_font
             if role == Qt.ItemDataRole.ForegroundRole and col == 0:
@@ -398,23 +486,21 @@ class PreviewTableModel(_ThemedTableModelMixin, QAbstractTableModel):
         item: ParseResult = self._rows[row]
 
         if self._mode == "unrecognized":
+            if role == ROLE_COPY_TEXT:
+                return item.canonical_code if col == 0 and item.canonical_code else None
             if role in (Qt.ItemDataRole.DisplayRole, Qt.ItemDataRole.EditRole):
-                if col == 0:
-                    return (
-                        item.canonical_code
-                        if item.canonical_code
-                        else ("" if role == Qt.ItemDataRole.EditRole else "（双击填写编码）")
-                    )
-                if col == 1:
-                    return item.file_name or item.raw_text
-                if col == 2:
-                    return item.parent_dir or "-"
-                if col == 3:
-                    return item.source_name or item.source_type
-                if col == 4:
-                    if item.canonical_code:
-                        return "已手动修正，可随本批入库"
-                    return item.note or "未匹配内置或自定义规则"
+                code_txt = (
+                    item.canonical_code
+                    if item.canonical_code
+                    else ("" if role == Qt.ItemDataRole.EditRole else "（双击填写编码）")
+                )
+                note_txt = (
+                    "已手动修正，可随本批入库"
+                    if item.canonical_code
+                    else (item.note or "未匹配内置或自定义规则")
+                )
+                vals = (code_txt, item.file_name or item.raw_text, item.parent_dir or "-", item.source_name or item.source_type, note_txt)
+                return vals[col] if 0 <= col < len(vals) else None
             if role == Qt.ItemDataRole.ForegroundRole and col == 0:
                 return self._color_success if item.canonical_code else self._color_muted
             if role == Qt.ItemDataRole.FontRole and col == 0 and item.canonical_code:
@@ -423,23 +509,21 @@ class PreviewTableModel(_ThemedTableModelMixin, QAbstractTableModel):
                 return f"原始文本: {item.raw_text}\n清洗后: {item.cleaned_text or '-'}\n路径: {item.full_path or '-'}"
             return None
 
-        # mode == "new" or "batch_dup"
+        if role == ROLE_COPY_TEXT:
+            return item.canonical_code if col == 0 and item.canonical_code else None
         if role == Qt.ItemDataRole.DisplayRole:
-            if col == 0:
-                return item.canonical_code
-            if col == 1:
-                return item.prefix or "-"
-            if col == 2:
-                return " / ".join(item.tags) if item.tags else "-"
-            if col == 3:
-                return item.part or "-"
-            if col == 4:
-                return item.file_name or item.raw_text
-            if col == 5:
-                suffix = " (目录回退)" if item.from_parent else ""
-                return f"{item.matched_rule}{suffix}" if item.matched_rule else "-"
-            if col == 6:
-                return item.source_name or item.source_type
+            suffix = " (目录回退)" if item.from_parent else ""
+            rule_txt = f"{item.matched_rule}{suffix}" if item.matched_rule else "-"
+            vals = (
+                item.canonical_code,
+                item.prefix or "-",
+                " / ".join(item.tags) if item.tags else "-",
+                item.part or "-",
+                item.file_name or item.raw_text,
+                rule_txt,
+                item.source_name or item.source_type,
+            )
+            return vals[col] if 0 <= col < len(vals) else None
         if role == Qt.ItemDataRole.FontRole and col == 0:
             return self._mono_font
         if role == Qt.ItemDataRole.ForegroundRole:
@@ -460,16 +544,15 @@ class PreviewTableModel(_ThemedTableModelMixin, QAbstractTableModel):
         column: int,
         order: Qt.SortOrder = Qt.SortOrder.AscendingOrder,
     ) -> None:
-        reverse = order == Qt.SortOrder.DescendingOrder
+        if column < 0:
+            return
         if self._mode == "db_dup":
             key_funcs = {
                 0: lambda pair: (pair[0].canonical_code or "").lower(),
                 1: lambda pair: (pair[0].file_name or pair[0].raw_text or "").lower(),
                 2: lambda pair: (
                     len(pair[1]),
-                    (pair[1][0].file_name or pair[1][0].raw_text or "").lower()
-                    if pair[1]
-                    else "",
+                    (pair[1][0].file_name or pair[1][0].raw_text or "").lower() if pair[1] else "",
                 ),
                 3: lambda pair: " / ".join(pair[0].tags).lower(),
                 4: lambda pair: (pair[0].part or "").lower(),
@@ -477,28 +560,48 @@ class PreviewTableModel(_ThemedTableModelMixin, QAbstractTableModel):
             }
         elif self._mode == "unrecognized":
             key_funcs = {
-                0: lambda item: (item.canonical_code or "").lower(),
-                1: lambda item: (item.file_name or item.raw_text or "").lower(),
-                2: lambda item: (item.parent_dir or "").lower(),
-                3: lambda item: (item.source_name or item.source_type or "").lower(),
-                4: lambda item: ("已手动修正" if item.canonical_code else (item.note or "")).lower(),
+                0: lambda it: (it.canonical_code or "").lower(),
+                1: lambda it: (it.file_name or it.raw_text or "").lower(),
+                2: lambda it: (it.parent_dir or "").lower(),
+                3: lambda it: (it.source_name or it.source_type or "").lower(),
+                4: lambda it: ("已手动修正" if it.canonical_code else (it.note or "")).lower(),
             }
         else:
             key_funcs = {
-                0: lambda item: (item.canonical_code or "").lower(),
-                1: lambda item: (item.prefix or "").lower(),
-                2: lambda item: " / ".join(item.tags).lower(),
-                3: lambda item: (item.part or "").lower(),
-                4: lambda item: (item.file_name or item.raw_text or "").lower(),
-                5: lambda item: (item.matched_rule or "").lower(),
-                6: lambda item: (item.source_name or item.source_type or "").lower(),
+                0: lambda it: (it.canonical_code or "").lower(),
+                1: lambda it: (it.prefix or "").lower(),
+                2: lambda it: " / ".join(it.tags).lower(),
+                3: lambda it: (it.part or "").lower(),
+                4: lambda it: (it.file_name or it.raw_text or "").lower(),
+                5: lambda it: (it.matched_rule or "").lower(),
+                6: lambda it: (it.source_name or it.source_type or "").lower(),
             }
-        key_fn = key_funcs.get(column, key_funcs[0])
-        _sort_with_persistent_indexes(self, self._rows, key_fn, reverse)
+        _sort_with_persistent_indexes(
+            self, self._rows, key_funcs.get(column, key_funcs[0]), order == Qt.SortOrder.DescendingOrder
+        )
 
 
 class CompareTableModel(_ThemedTableModelMixin, QAbstractTableModel):
-    """Virtualized table model for View 3 (快速查重 — DB Compare & A-vs-B)."""
+    """Virtualized table model for View 3 (快速查重 — DB Compare)."""
+
+    @classmethod
+    def specs_for_mode(cls, with_matches: bool) -> list[ColumnSpec]:
+        if with_matches:
+            return [
+                ColumnSpec("code", "标准编码", default_width=142, default_visible=True, min_width=100, lock_visible=True),
+                ColumnSpec("input_item", "输入项", default_width=240, default_visible=True, min_width=120, stretch_weight=0.5),
+                ColumnSpec("existing", "库内已有记录", default_width=260, default_visible=True, min_width=130, stretch_weight=0.5),
+                ColumnSpec("tags", "版本标签", default_width=110, default_visible=False, min_width=72, category="advanced"),
+                ColumnSpec("part", "分集", default_width=68, default_visible=False, min_width=54, category="advanced"),
+            ]
+        return [
+            ColumnSpec("code", "标准编码", default_width=142, default_visible=True, min_width=100, lock_visible=True),
+            ColumnSpec("prefix", "前缀", default_width=76, default_visible=False, min_width=56, category="advanced"),
+            ColumnSpec("tags", "版本标签", default_width=110, default_visible=False, min_width=72, category="advanced"),
+            ColumnSpec("part", "分集", default_width=68, default_visible=False, min_width=54, category="advanced"),
+            ColumnSpec("file_name", "文件名 / 原始文本", default_width=320, default_visible=True, min_width=140, stretch_weight=1.0),
+            ColumnSpec("source", "来源", default_width=160, default_visible=True, min_width=90),
+        ]
 
     def __init__(
         self,
@@ -510,12 +613,12 @@ class CompareTableModel(_ThemedTableModelMixin, QAbstractTableModel):
         self._init_theme_colors(theme)
         self._with_matches = with_matches
         self._rows: list[Any] = []
-        self._mono_font = QFont("Consolas", 10)
-        self._mono_font.setBold(True)
-        if with_matches:
-            self._headers = ["标准编码", "输入项", "库内已有记录", "标签", "分集"]
-        else:
-            self._headers = ["标准编码", "前缀", "标签", "分集", "文件名 / 原始文本", "来源"]
+        self._mono_font = _make_mono_font(10, bold=True)
+        self.COLUMN_SPECS: list[ColumnSpec] = self.specs_for_mode(with_matches)
+        self._headers: list[str] = [s.label for s in self.COLUMN_SPECS]
+
+    def column_specs(self) -> list[ColumnSpec]:
+        return list(self.COLUMN_SPECS)
 
     def set_rows(self, rows: list[Any]) -> None:
         self.beginResetModel()
@@ -526,9 +629,7 @@ class CompareTableModel(_ThemedTableModelMixin, QAbstractTableModel):
         return list(self._rows)
 
     def row_at(self, row: int) -> Optional[Any]:
-        if 0 <= row < len(self._rows):
-            return self._rows[row]
-        return None
+        return self._rows[row] if 0 <= row < len(self._rows) else None
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self._rows)
@@ -550,28 +651,28 @@ class CompareTableModel(_ThemedTableModelMixin, QAbstractTableModel):
         return None
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
-        if not index.isValid():
+        if not index.isValid() or not (0 <= index.row() < len(self._rows)):
             return None
         row, col = index.row(), index.column()
-        if not (0 <= row < len(self._rows)):
-            return None
 
         if self._with_matches:
             item, matches = self._rows[row]
+            if role == ROLE_COPY_TEXT:
+                return item.canonical_code if col == 0 and item.canonical_code else None
             if role == Qt.ItemDataRole.DisplayRole:
-                if col == 0:
-                    return item.canonical_code
-                if col == 1:
-                    return item.file_name or item.raw_text
-                if col == 2:
-                    if not matches:
-                        return "-"
+                if not matches:
+                    m_txt = "-"
+                else:
                     first = matches[0].file_name or matches[0].raw_text
-                    return f"共 {len(matches)} 条：{first}" if len(matches) > 1 else first
-                if col == 3:
-                    return " / ".join(item.tags) if item.tags else "-"
-                if col == 4:
-                    return item.part or "-"
+                    m_txt = f"共 {len(matches)} 条：{first}" if len(matches) > 1 else first
+                vals = (
+                    item.canonical_code,
+                    item.file_name or item.raw_text,
+                    m_txt,
+                    " / ".join(item.tags) if item.tags else "-",
+                    item.part or "-",
+                )
+                return vals[col] if 0 <= col < len(vals) else None
             if role == Qt.ItemDataRole.FontRole and col == 0:
                 return self._mono_font
             if role == Qt.ItemDataRole.ForegroundRole and col == 0:
@@ -579,19 +680,18 @@ class CompareTableModel(_ThemedTableModelMixin, QAbstractTableModel):
             return None
 
         item: ParseResult = self._rows[row]
+        if role == ROLE_COPY_TEXT:
+            return item.canonical_code if col == 0 and item.canonical_code else None
         if role == Qt.ItemDataRole.DisplayRole:
-            if col == 0:
-                return item.canonical_code or "（未识别）"
-            if col == 1:
-                return item.prefix or "-"
-            if col == 2:
-                return " / ".join(item.tags) if item.tags else "-"
-            if col == 3:
-                return item.part or "-"
-            if col == 4:
-                return item.file_name or item.raw_text
-            if col == 5:
-                return item.source_name or item.source_type
+            vals = (
+                item.canonical_code or "（未识别）",
+                item.prefix or "-",
+                " / ".join(item.tags) if item.tags else "-",
+                item.part or "-",
+                item.file_name or item.raw_text,
+                item.source_name or item.source_type,
+            )
+            return vals[col] if 0 <= col < len(vals) else None
         if role == Qt.ItemDataRole.FontRole and col == 0 and item.canonical_code:
             return self._mono_font
         if role == Qt.ItemDataRole.ForegroundRole and col == 0:
@@ -603,28 +703,28 @@ class CompareTableModel(_ThemedTableModelMixin, QAbstractTableModel):
         column: int,
         order: Qt.SortOrder = Qt.SortOrder.AscendingOrder,
     ) -> None:
-        reverse = order == Qt.SortOrder.DescendingOrder
+        if column < 0:
+            return
         if self._with_matches:
             key_funcs = {
                 0: lambda pair: (pair[0].canonical_code or "").lower(),
                 1: lambda pair: (pair[0].file_name or pair[0].raw_text or "").lower(),
                 2: lambda pair: (
                     len(pair[1]),
-                    (pair[1][0].file_name or pair[1][0].raw_text or "").lower()
-                    if pair[1]
-                    else "",
+                    (pair[1][0].file_name or pair[1][0].raw_text or "").lower() if pair[1] else "",
                 ),
                 3: lambda pair: " / ".join(pair[0].tags).lower(),
                 4: lambda pair: (pair[0].part or "").lower(),
             }
         else:
             key_funcs = {
-                0: lambda item: (item.canonical_code or "").lower(),
-                1: lambda item: (item.prefix or "").lower(),
-                2: lambda item: " / ".join(item.tags).lower(),
-                3: lambda item: (item.part or "").lower(),
-                4: lambda item: (item.file_name or item.raw_text or "").lower(),
-                5: lambda item: (item.source_name or item.source_type or "").lower(),
+                0: lambda it: (it.canonical_code or "").lower(),
+                1: lambda it: (it.prefix or "").lower(),
+                2: lambda it: " / ".join(it.tags).lower(),
+                3: lambda it: (it.part or "").lower(),
+                4: lambda it: (it.file_name or it.raw_text or "").lower(),
+                5: lambda it: (it.source_name or it.source_type or "").lower(),
             }
-        key_fn = key_funcs.get(column, key_funcs[0])
-        _sort_with_persistent_indexes(self, self._rows, key_fn, reverse)
+        _sort_with_persistent_indexes(
+            self, self._rows, key_funcs.get(column, key_funcs[0]), order == Qt.SortOrder.DescendingOrder
+        )
